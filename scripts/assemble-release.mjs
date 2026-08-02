@@ -4,17 +4,21 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   rmSync,
   statSync,
   utimesSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { unzipSync, zipSync } from 'fflate'
@@ -700,13 +704,34 @@ function releaseTimestamp() {
   const raw = process.env.SOURCE_DATE_EPOCH ?? ''
   if (!/^[1-9][0-9]*$/u.test(raw)) fail('SOURCE_DATE_EPOCH must be a positive integer')
   const seconds = Number(raw)
-  if (!Number.isSafeInteger(seconds)) fail('SOURCE_DATE_EPOCH is outside the safe integer range')
+  if (!Number.isSafeInteger(seconds) || seconds > 0xffffffff) {
+    fail('SOURCE_DATE_EPOCH is outside the portable archive timestamp range')
+  }
   const timestamp = new Date(seconds * 1000)
   const year = timestamp.getUTCFullYear()
   if (Number.isNaN(timestamp.getTime()) || year < 1980 || year > 2107) {
     fail('SOURCE_DATE_EPOCH is outside the portable ZIP timestamp range')
   }
   return timestamp
+}
+
+function normalizeGzipTimestamp(path, timestamp) {
+  const descriptor = openSync(path, 'r+')
+  const header = Buffer.alloc(10)
+  try {
+    if (
+      readSync(descriptor, header, 0, header.length, 0) !== header.length ||
+      header[0] !== 0x1f ||
+      header[1] !== 0x8b ||
+      header[2] !== 0x08
+    ) {
+      fail('tar compressor did not produce a valid gzip header')
+    }
+    header.writeUInt32LE(Math.floor(timestamp.getTime() / 1000), 4)
+    if (writeSync(descriptor, header, 4, 4, 4) !== 4) fail('could not normalize gzip timestamp')
+  } finally {
+    closeSync(descriptor)
+  }
 }
 
 function tarOwnershipArguments() {
@@ -749,6 +774,7 @@ function createArchive(packageDirectory, outputDirectory, packageName, extension
       },
     )
     if (result.status !== 0) fail(`tar creation failed: ${result.stderr}`)
+    normalizeGzipTimestamp(archivePath, timestamp)
   }
   ensureRegularSource(archivePath, 'final release archive')
   return archivePath
