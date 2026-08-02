@@ -387,11 +387,9 @@ mod tests {
         assert!(visible.contains("完成"));
         assert!(visible.contains("文档"));
         assert!(output.lines.len() >= 2, "physical newlines must survive");
-        assert!(
-            output.lines[0].content.spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::DIM)
+        assert_eq!(
+            output.lines[0].content.spans[0].style,
+            Theme::current().muted(),
         );
         assert_eq!(
             derive_selection_text(&output.lines[0]).trim(),
@@ -437,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_launch_preserves_diamond_label_suffix_header_and_dim_rest() {
+    fn cloud_launch_preserves_diamond_label_suffix_header_and_muted_rest() {
         let block = LocalCommandOutputBlock::new(concat!(
             "<local-command-stdout>",
             "◇ 云端任务 · 正在启动\n第一行\n第二行",
@@ -457,11 +455,9 @@ mod tests {
                 .contains(Modifier::BOLD),
         );
         assert_eq!(output.lines[0].content.spans[2].content, " · 正在启动");
-        assert!(
-            output.lines[0].content.spans[2]
-                .style
-                .add_modifier
-                .contains(Modifier::DIM),
+        assert_eq!(
+            output.lines[0].content.spans[2].style,
+            Theme::current().muted(),
         );
         assert_eq!(text_lines(&output)[1..], ["  ⎿  第一行", "     第二行"]);
         assert_eq!(

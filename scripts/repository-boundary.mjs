@@ -134,6 +134,8 @@ const forbiddenExactPaths = new Set([
   'src/utils/plugins/presentationAssets.ts',
 ])
 const forbiddenPath = /(?:^|\/)(?:gui|tauri|app[-_]?server|ink)(?:\/|\.|$)/iu
+const forbiddenNonSourceDirectory =
+  /(?:^|\/)(?:\.claude|archives?|docs|documentation|plans?|proposals?|roadmaps?)(?:\/|$)/iu
 const forbiddenRootDocument = /^(?:ACOSMI|AGENTS|AUDIT[^/]*|CLAUDE|CRABCODE|MIGRATION[^/]*|ONBOARDING|PLAN[^/]*)\.(?:md|json|ya?ml)$/iu
 const forbiddenArtifact = /\.(?:7z|app|dll|dmg|docx?|exe|gz|pdf|pkg|pptx?|rar|so|tar|tgz|xlsx?|zip)$/iu
 
@@ -151,6 +153,9 @@ for (const path of tracked) {
   }
   if (forbiddenExactPaths.has(path)) fail(`forbidden non-TUI file is tracked: ${path}`)
   if (forbiddenPath.test(path)) fail(`GUI/AppServer/Ink path is tracked: ${path}`)
+  if (forbiddenNonSourceDirectory.test(path)) {
+    fail(`internal/non-source directory is tracked: ${path}`)
+  }
   if (/(?:^|\/)(?:AGENTS|CLAUDE)\.md$/iu.test(path)) {
     fail(`agent-project instruction file is tracked: ${path}`)
   }
