@@ -90,7 +90,7 @@ The TypeScript and Go code are therefore supported production transition impleme
 
 ## Build from source
 
-Prebuilt-package users do not need these tools. Source development requires Bun 1.3.11+, Rust 1.88+, the Go version declared in `components/oauthapi-llm/go.mod`, and Git:
+Prebuilt-package users do not need these tools. Source development requires Bun 1.3.11+, Rust 1.92+, the Go version declared in `components/oauthapi-llm/go.mod`, and Git:
 
 ```bash
 git clone https://github.com/acosmi/CrabCode-TUI.git

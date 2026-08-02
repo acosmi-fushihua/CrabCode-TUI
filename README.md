@@ -92,7 +92,7 @@ CrabCode 的改动包括白标、回环面收敛、固定账户路由、地区/�
 
 ## 从源码构建
 
-预编译包的普通用户不需要以下工具。源码开发需要 Bun 1.3.11+、Rust 1.88+、`components/oauthapi-llm/go.mod` 指定的 Go 版本和 Git：
+预编译包的普通用户不需要以下工具。源码开发需要 Bun 1.3.11+、Rust 1.92+、`components/oauthapi-llm/go.mod` 指定的 Go 版本和 Git：
 
 ```bash
 git clone https://github.com/acosmi/CrabCode-TUI.git
