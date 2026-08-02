@@ -41,7 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: components/oauthapi-llm/go.mod
+          cache-dependency-path: components/oauthapi-llm/go.sum
       - run: go test -C components/oauthapi-llm ./...
