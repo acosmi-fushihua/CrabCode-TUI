@@ -2432,6 +2432,16 @@ describe("Account Bridge supply chain", () => {
     const binDir = join(root, "bin");
     const metadataDir = join(binDir, "account-bridge");
     await fs.mkdir(metadataDir, { recursive: true });
+    const artifactSigner = generateKeyPairSync("ed25519");
+    const artifactSpki = artifactSigner.publicKey.export({
+      format: "der",
+      type: "spki",
+    });
+    const artifactPublicKeyBytes = artifactSpki.subarray(artifactSpki.length - 32);
+    const artifactPublicKey = artifactPublicKeyBytes.toString("base64url");
+    const provenanceKeySha256 = createHash("sha256")
+      .update(artifactPublicKeyBytes)
+      .digest("hex");
     const pluginDir = join(metadataDir, "plugins");
     await fs.mkdir(pluginDir, { recursive: true });
     const binaryName = process.platform === "win32" ? "oauthapi-llm.exe" : "oauthapi-llm";
@@ -2449,35 +2459,48 @@ describe("Account Bridge supply chain", () => {
       join(pluginDir, "gemini-cli-LICENSE"),
       fixedPluginLicense,
     );
-    const notarization = Buffer.from(
+    const mainCodeDirectorySha256 = "c".repeat(64);
+    const helperCodeDirectorySha256 = "d".repeat(64);
+    const pluginCodeDirectorySha256 = "e".repeat(64);
+    const sealEvidence = Buffer.from(
       JSON.stringify({
         schemaVersion: 1,
-        status: "Accepted",
-        submissionId: "12345678-1234-1234-1234-123456789abc",
+        scheme: "apple-ad-hoc",
+        authenticity: "ed25519-provenance",
+        provenanceKeySha256,
+        notarization: "not-applicable",
         artifacts: [
           {
             path: `bin/${binaryName}`,
             sha256: createHash("sha256").update(binary).digest("hex"),
+            codeDirectorySha256: mainCodeDirectorySha256,
           },
           {
             path: "bin/oauthapi-plugin-host",
             sha256: createHash("sha256").update(helper).digest("hex"),
+            codeDirectorySha256: helperCodeDirectorySha256,
+            entitlements: [
+              "com.apple.security.cs.disable-library-validation",
+            ],
           },
           {
             path: "plugins/gemini-cli.dylib",
             sha256: createHash("sha256").update(plugin).digest("hex"),
+            codeDirectorySha256: pluginCodeDirectorySha256,
           },
         ],
       }),
     );
-    await fs.writeFile(join(metadataDir, "notarization.json"), notarization);
+    await fs.writeFile(join(metadataDir, "codesign-evidence.json"), sealEvidence);
+    const sealEvidenceSha256 = createHash("sha256")
+      .update(sealEvidence)
+      .digest("hex");
     const platformSignature = {
-      scheme: "apple-developer-id",
-      signerIdSha256: "e".repeat(64),
+      scheme: "apple-ad-hoc",
       detachedSignature: null,
-      notarizationEvidenceSha256: createHash("sha256")
-        .update(notarization)
-        .digest("hex"),
+      provenanceKeySha256,
+      codeDirectorySha256: mainCodeDirectorySha256,
+      sealEvidenceSha256,
     };
     const runtimeHelpers = [
       {
@@ -2485,12 +2508,11 @@ describe("Account Bridge supply chain", () => {
         path: "bin/oauthapi-plugin-host",
         sha256: createHash("sha256").update(helper).digest("hex"),
         platformSignature: {
-          scheme: "apple-developer-id",
-          signerIdSha256: "e".repeat(64),
+          scheme: "apple-ad-hoc",
           detachedSignature: null,
-          notarizationEvidenceSha256: createHash("sha256")
-            .update(notarization)
-            .digest("hex"),
+          provenanceKeySha256,
+          codeDirectorySha256: helperCodeDirectorySha256,
+          sealEvidenceSha256,
         },
       },
     ];
@@ -2516,7 +2538,13 @@ describe("Account Bridge supply chain", () => {
         path: "plugins/gemini-cli-LICENSE",
         sha256: createHash("sha256").update(fixedPluginLicense).digest("hex"),
       },
-      platformSignature,
+      platformSignature: {
+        scheme: "apple-ad-hoc",
+        detachedSignature: null,
+        provenanceKeySha256,
+        codeDirectorySha256: pluginCodeDirectorySha256,
+        sealEvidenceSha256,
+      },
     };
     const notice = Buffer.from("NOTICE");
     const thirdPartyNotices = Buffer.from("THIRD_PARTY_NOTICES.md");
@@ -2759,14 +2787,6 @@ describe("Account Bridge supply chain", () => {
       .digest("hex");
     provenance.materials.signatureEvidence.sha256 =
       provenance.signatureEvidenceSha256;
-    const artifactSigner = generateKeyPairSync("ed25519");
-    const artifactSpki = artifactSigner.publicKey.export({
-      format: "der",
-      type: "spki",
-    });
-    const artifactPublicKey = artifactSpki
-      .subarray(artifactSpki.length - 32)
-      .toString("base64url");
     const writeSignedProvenance = async (): Promise<void> => {
       const raw = Buffer.from(JSON.stringify(provenance));
       await fs.writeFile(join(metadataDir, "provenance.json"), raw);

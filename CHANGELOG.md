@@ -14,6 +14,9 @@
 - Added native five-platform release archives, fail-closed installers,
   SHA-256 and per-file manifests, dependency license collection, signed
   Account Bridge verification, and GitHub build provenance.
+- Repaired the macOS Account Bridge code seals, added a native plugin-load
+  smoke test and codesign gate, and replaced inaccurate notarization metadata
+  with release-scoped Ed25519 provenance plus explicit ad-hoc seal evidence.
 
 ---
 
@@ -27,3 +30,5 @@
   目标、GUI 下载与明确区分的 GO 会员/线上服务条款。
 - 新增五平台原生发行包、失败关闭安装器、SHA-256 与逐文件清单、依赖许可收集、
   Account Bridge 签名验证和 GitHub 构建来源证明。
+- 修复 macOS Account Bridge 代码封印，补充原生插件加载冒烟测试与 codesign 闸门；
+  以发行版专用 Ed25519 来源签名和明确的 ad-hoc 封印证据替代不准确的公证声明。
