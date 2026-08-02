@@ -57,9 +57,9 @@ for CrabCode's native terminal client. The material changes are:
 - remove stale platform compile-error cfg checks and apply warning/style-only
   compatibility adjustments required by the current Rust toolchain;
 - align the standalone patched crate's declared minimum Rust version with the
-  product workspace's explicit Rust 1.88 baseline; its locked all-target
-  dependency graph is compiled in the Rust 1.88 test lane instead of retaining
-  Crossterm 0.28.1's unverified upstream 1.63 declaration;
+  product workspace's explicit Rust 1.92 baseline; the product's locked
+  dependency graph is compiled by Rust 1.92 CI instead of retaining Crossterm
+  0.28.1's unverified upstream 1.63 declaration;
 - add local workspace metadata so the vendored crate can be tested
   independently inside this repository.
 
