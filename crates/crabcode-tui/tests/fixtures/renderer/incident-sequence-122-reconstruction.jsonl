@@ -1,0 +1,11 @@
+{"type":"stream_event","uuid":"incident-0","event":{"type":"message_start","message":{"id":"msg_9010afc7-1fcc-4884-9565-7c7bba57cc71"}}}
+{"type":"stream_event","uuid":"incident-1","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}
+{"type":"stream_event","uuid":"incident-2","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好的，我并行测试这两个能力。"}}}
+{"type":"stream_event","uuid":"incident-3","event":{"type":"content_block_stop","index":0}}
+{"type":"stream_event","uuid":"incident-4","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1ab6529fc7b44f529dc27b6b","name":"Agent","input":{}}}}
+{"type":"stream_event","uuid":"incident-5","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"测试子代理联网检索\"}"}}}
+{"type":"stream_event","uuid":"incident-6","event":{"type":"content_block_stop","index":1}}
+{"type":"stream_event","uuid":"incident-7","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_c1e8bd6aec0b4a4884d34278","name":"web_search","input":{}}}}
+{"type":"stream_event","uuid":"incident-8","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"CrabCode CLI Rust TUI 2026\"}"}}}
+{"type":"stream_event","uuid":"incident-9","event":{"type":"content_block_stop","index":1}}
+{"type":"stream_event","uuid":"incident-10","event":{"type":"message_stop"}}

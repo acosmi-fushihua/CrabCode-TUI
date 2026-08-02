@@ -1,0 +1,91 @@
+[package]
+name = "crabcode-tui"
+description = "Native Rust terminal UI for CrabCode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Compiles deterministic fault seams used only by the PTY lifecycle suite.
+# Release/default builds do not contain the environment-variable hook.
+terminal-lifecycle-tests = []
+
+[lints]
+workspace = true
+
+[lib]
+name = "crabcode_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crabcode-tui"
+path = "src/main.rs"
+
+[dependencies]
+acosmi-daemon-launcher = { path = "../acosmi-daemon-launcher" }
+acosmi-index = { path = "../acosmi-index" }
+anyhow = { workspace = true }
+anstyle = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+crabcode-mermaid = { path = "../crabcode-mermaid" }
+crabcode-markdown-renderer = { package = "crabcode-markdown", path = "../crabcode-markdown" }
+crabcode-pager-render = { path = "../crabcode-pager-render" }
+crabcode-ratatui-inline = { path = "../crabcode-ratatui-inline" }
+crossterm = { workspace = true, features = ["bracketed-paste"] }
+image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
+indexmap = { workspace = true }
+dirs = { workspace = true }
+linkify = { workspace = true }
+pulldown-cmark = { workspace = true }
+ratatui = { workspace = true, features = [
+    "crossterm",
+    "unstable-backend-writer",
+    "unstable-widget-ref",
+] }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+supports-color = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+two-face = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-normalization = "0.1.25"
+unicode-width = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+wait-timeout = { workspace = true }
+vte = "0.15.0"
+which = { workspace = true }
+crabcode-ratatui-textarea = { path = "../crabcode-ratatui-textarea" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true, features = ["fs", "poll", "term"] }
+signal-hook = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+arboard = { workspace = true }
+
+[dev-dependencies]
+crabcode-pager-render = { path = "../crabcode-pager-render", features = ["test-support"] }
+portable-pty = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["term"] }

@@ -1,0 +1,14 @@
+[package]
+name = "crabcode-markdown-core"
+description = "Headless Markdown analysis shared by CrabCode terminal presentation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+pulldown-cmark = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,258 @@
+import { describe, expect, spyOn, test } from 'bun:test'
+import { createHash } from 'node:crypto'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import stripAnsi from 'strip-ansi'
+
+import * as analytics from '../../src/services/analytics/index.js'
+import { env } from '../../src/utils/env.js'
+import * as model from '../../src/utils/model/model.js'
+import * as settings from '../../src/utils/settings/settings.js'
+
+const REPO_ROOT = join(import.meta.dir, '..', '..')
+
+function source(path: string): string {
+  return readFileSync(join(REPO_ROOT, path), 'utf8')
+}
+
+function sha256(path: string): string {
+  return createHash('sha256').update(source(path)).digest('hex')
+}
+
+describe('direct TUI fixed local actions', () => {
+  test('routes clear/reset/new through the byte-exact fixed transaction owner', async () => {
+    const catalog = await import('../../src/cli/headlessCommands.js')
+    catalog.clearHeadlessCommandMemoizationCaches()
+    const commands = await catalog.getDirectTuiCommands(process.cwd())
+    const command = commands.find(candidate => candidate.name === 'clear')
+    expect(command?.type).toBe('local')
+    expect(command?.aliases).toEqual(['reset', 'new'])
+    if (!command || command.type !== 'local') {
+      throw new Error('direct clear command is absent')
+    }
+
+    const transaction = await import(
+      '../../src/commands/clear/conversation.js'
+    )
+    const clearSpy = spyOn(
+      transaction,
+      'clearConversation',
+    ).mockResolvedValue()
+    const context = { marker: 'direct-clear-context' }
+    try {
+      const action = await command.load()
+      await expect(action.call('', context as never)).resolves.toEqual({
+        type: 'text',
+        value: '',
+      })
+      expect(clearSpy).toHaveBeenCalledTimes(1)
+      expect(clearSpy).toHaveBeenCalledWith(context)
+    } finally {
+      clearSpy.mockRestore()
+    }
+
+    expect(sha256('src/commands/clear/clear.ts')).toBe(
+      'eab6a857043fbf2e42605bd70d4423d6ac19e9b98ce4463cfaebc01d8be01b07',
+    )
+    expect(sha256('src/commands/clear/conversation.ts')).toBe(
+      'b6743eae3eb8fa75af953d7482f5133d42b3b39317294a7020ebadd961aa2aa7',
+    )
+    const conversation = source('src/commands/clear/conversation.ts')
+    expect(conversation).toContain(
+      'regenerateSessionId({ setCurrentAsParent: true })',
+    )
+    expect(conversation).toContain("processSessionStartHooks('clear')")
+    expect(conversation).not.toContain('resetAppServerSession')
+    expect(conversation).not.toMatch(/appServer/i)
+
+    const caches = source('src/commands/clear/caches.ts')
+    expect(caches).toContain(
+      "from '../../utils/swarm/permissionCallbackRegistry.js'",
+    )
+    expect(caches).not.toContain("from '../../hooks/")
+  })
+
+  test('QueryEngine emits the regenerated clear session id on the real local-command envelope path', async () => {
+    const auditRoot = mkdtempSync(
+      join(tmpdir(), 'crabcode-clear-query-engine-'),
+    )
+    const configDir = join(auditRoot, 'config')
+    const homeDir = join(auditRoot, 'home')
+    mkdirSync(configDir, { recursive: true })
+    mkdirSync(homeDir, { recursive: true })
+    writeFileSync(
+      join(configDir, '.crabcode.json'),
+      JSON.stringify({
+        theme: 'dark',
+        hasCompletedOnboarding: true,
+      }),
+    )
+    writeFileSync(
+      join(configDir, 'settings.json'),
+      JSON.stringify({
+        autoMemoryEnabled: false,
+        disableAllHooks: true,
+      }),
+    )
+
+    try {
+      const child = Bun.spawn({
+        cmd: [
+          process.execPath,
+          join(
+            REPO_ROOT,
+            'tests/fixtures/direct-tui-clear-query-engine.ts',
+          ),
+        ],
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          HOME: homeDir,
+          CRABCODE_CONFIG_DIR: configDir,
+          CRABCODE_DISABLE_AUTO_MEMORY: '1',
+          CRABCODE_DISABLE_TELEMETRY: '1',
+          DISABLE_BACKGROUND_TASKS: '1',
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ])
+      expect(exitCode, stderr).toBe(0)
+      const evidence = JSON.parse(
+        stdout.trim().split('\n').at(-1) ?? '',
+      ) as {
+        oldSessionId: string
+        newSessionId: string
+        envelopes: Array<{
+          type: string
+          subtype?: string
+          session_id?: string
+        }>
+      }
+      expect(evidence.newSessionId).not.toBe(evidence.oldSessionId)
+      expect(evidence.envelopes[0]).toMatchObject({
+        type: 'system',
+        subtype: 'init',
+        session_id: evidence.newSessionId,
+      })
+      expect(evidence.envelopes.at(-1)).toMatchObject({
+        type: 'result',
+        subtype: 'success',
+        session_id: evidence.newSessionId,
+      })
+      expect(
+        evidence.envelopes
+          .filter(envelope => envelope.session_id !== undefined)
+          .every(
+            envelope =>
+              envelope.session_id === evidence.newSessionId,
+          ),
+      ).toBe(true)
+    } finally {
+      rmSync(auditRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('preserves smallmodel display, set, reset, and telemetry behavior without JSX', async () => {
+    const currentModel = spyOn(
+      model,
+      'getSmallFastModel',
+    ).mockReturnValue('small-current')
+    const update = spyOn(
+      settings,
+      'updateSettingsForSource',
+    ).mockReturnValue({ error: null })
+    const log = spyOn(analytics, 'logEvent').mockImplementation(() => {})
+    try {
+      const action = await import(
+        '../../src/commands/smallmodel/smallmodel.js'
+      )
+
+      expect(stripAnsi(action.executeSmallModelCommand('').value)).toBe(
+        'Small model: small-current',
+      )
+      expect(
+        stripAnsi(action.executeSmallModelCommand(' status ').value),
+      ).toBe('Small model: small-current')
+      expect(update).not.toHaveBeenCalled()
+
+      expect(
+        stripAnsi(
+          action.executeSmallModelCommand(' custom-small-model ').value,
+        ),
+      ).toBe('Small model set to custom-small-model')
+      expect(update).toHaveBeenLastCalledWith('userSettings', {
+        smallModel: 'custom-small-model',
+      })
+      expect(log).toHaveBeenCalledWith('tengu_smallmodel_set', {})
+
+      currentModel.mockReturnValue('fallback-after-reset')
+      expect(
+        stripAnsi(action.executeSmallModelCommand('reset').value),
+      ).toBe('Small model reset to SDK default (fallback-after-reset)')
+      expect(update).toHaveBeenLastCalledWith('userSettings', {
+        smallModel: undefined,
+      })
+    } finally {
+      currentModel.mockRestore()
+      update.mockRestore()
+      log.mockRestore()
+    }
+
+    const actionSource = source(
+      'src/commands/smallmodel/smallmodel.ts',
+    )
+    expect(actionSource).not.toMatch(/from ['"]react|LocalJSX/)
+  })
+
+  test('preserves terminal-setup completion on the exact private worker adapter', async () => {
+    const previousTerminal = env.terminal
+    env.terminal = 'ghostty'
+    try {
+      const catalog = await import('../../src/cli/headlessCommands.js')
+      catalog.clearHeadlessCommandMemoizationCaches()
+      const commands = await catalog.getDirectTuiCommands(process.cwd())
+      const command = commands.find(
+        candidate => candidate.name === 'terminal-setup',
+      )
+      expect(command?.type).toBe('local')
+      if (!command || command.type !== 'local') {
+        throw new Error('direct terminal-setup command is absent')
+      }
+
+      const action = await command.load()
+      const result = await action.call('', {
+        options: { theme: 'dark' },
+      } as never)
+      expect(result).toEqual({
+        type: 'text',
+        value:
+          'Shift+Enter is natively supported in Ghostty.\n\nNo configuration needed. Just use Shift+Enter to add newlines.',
+      })
+    } finally {
+      env.terminal = previousTerminal
+    }
+
+    const adapter = source('src/commands/terminalSetup/direct.ts')
+    expect(adapter).toContain(
+      "import { call as runTerminalSetup } from './terminalSetup.js'",
+    )
+    expect(adapter).toContain('await runTerminalSetup(onDone, context, args)')
+    expect(adapter).not.toMatch(/appServer/i)
+
+    const action = source('src/commands/terminalSetup/terminalSetup.ts')
+    expect(action).not.toMatch(/from ['\"]react|from ['\"]ink/)
+    expect(action).not.toMatch(/appServer/i)
+  })
+})

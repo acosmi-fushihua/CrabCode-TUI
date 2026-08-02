@@ -1,0 +1,22 @@
+[package]
+name = "acosmi-permission"
+description = "Acosmi 权限引擎（安核）— permission rule engine、readonly 校验、安全扫描"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+acosmi-config = { path = "../acosmi-config" }
+acosmi-shell-parser = { path = "../acosmi-shell-parser" }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serial_test = { workspace = true }
+tempfile = { workspace = true }

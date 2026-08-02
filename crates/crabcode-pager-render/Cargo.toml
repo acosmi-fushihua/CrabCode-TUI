@@ -1,0 +1,63 @@
+[package]
+name = "crabcode-pager-render"
+description = "Backend-independent terminal presentation primitives for CrabCode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+publish = false
+
+[features]
+test-support = []
+
+[dependencies]
+anstyle = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+crabcode-markdown-renderer = { package = "crabcode-markdown", path = "../crabcode-markdown" }
+crabcode-ratatui-textarea = { path = "../crabcode-ratatui-textarea" }
+crossterm = { workspace = true }
+dark-light = "2"
+dirs = { workspace = true }
+derive_more = { version = "2", features = ["deref", "deref_mut"] }
+indexmap = { workspace = true }
+image = { workspace = true, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+linkify = { workspace = true }
+rand = { workspace = true }
+ratatui = { workspace = true, features = ["unstable-widget-ref"] }
+ratatui-core = "0.1"
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+similar = { workspace = true }
+strum = { workspace = true, features = ["derive"] }
+supports-color = { workspace = true }
+syntect = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
+tui-scrollbar = "0.2"
+textwrap = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+urlencoding = { workspace = true }
+vte = "0.15.0"
+url = { workspace = true }
+which = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi"] }
+
+[dev-dependencies]
+insta = "1"
+pretty_assertions = "1"
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

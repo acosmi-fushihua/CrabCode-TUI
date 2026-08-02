@@ -1,0 +1,88 @@
+[package]
+name = "acosmi-memory-orchestrator"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Memory orchestration POC for lock and atomic-write protocol validation"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# W-MEMORY-DREAM-REBUILD v7 P2.x (2026-05-25): orchestrator 通过 path dep
+# 接入 8 个 sibling crate 集成数据管理能力（详 CLAUDE.md §硬约束 #15）。
+# P2.1 叶子层：core (基础数据结构) + parse (markdown 解析入口)。
+# P2.2 加 adapter (TS markdown → Rust struct 解析入口，跨 workspace 引入
+# acosmi-segment 作 transitive dep)。
+acosmi-memory-core = { path = "../acosmi-memory-core" }
+acosmi-memory-parse = { path = "../acosmi-memory-parse" }
+acosmi-memory-adapter = { path = "../acosmi-memory-adapter" }
+acosmi-memory-transaction = { path = "../acosmi-memory-transaction" }
+acosmi-memory-session = { path = "../acosmi-memory-session" }
+acosmi-memory-queue = { path = "../acosmi-memory-queue" }
+acosmi-memory-vfs = { path = "../acosmi-memory-vfs" }
+acosmi-memory-se = { path = "../acosmi-memory-se" }
+acosmi-memory-journal = { path = "../acosmi-memory-journal" }
+acosmi-generation-lease = { path = "../../../crates/acosmi-generation-lease" }
+
+anyhow = "1"
+# W-MEMORY-DATA-COMPLETION A1 (2026-06-20) — multilingual word tokenization for
+# memory text search (se_integration BM25). charabia is already a transitive dep
+# via acosmi-segment (acosmi-memory-se tree); promoted to a DIRECT dep so the
+# orchestrator's text scorer can segment CJK queries/docs (jieba-backed) instead
+# of the old ASCII split that collapsed Chinese into one exact-substring token.
+# Version + features mirror acosmi-segment's pin (resolves to the same 0.9.x in
+# the lock — no new external crate enters the build graph).
+charabia = { version = "0.9.7", default-features = false, features = [
+    "chinese-segmentation",
+    "chinese-normalization",
+] }
+# W-MEMORY-DREAM-REBUILD v7 P3.1 (2026-05-25) — `tier::TierGate` 是 async
+# trait（每 Tier policy P3.2-P3.5 实现）；direct dep 更稳，不依赖
+# acosmi-memory-adapter 等 sibling crate transitive 提供。
+async-trait = "0.1"
+dunce = "1"
+filetime = "0.2"
+fs2 = "0.4"
+log = "0.4"
+# W-MEMORY-DREAM-REBUILD v7 P4.3 (2026-05-25) — fs-event-driven index sync
+# daemon. Cross-platform fs watcher (inotify on Linux, FSEvents on macOS,
+# ReadDirectoryChangesW on Windows). Version pinned to "8" to match the
+# main `crates/` workspace usage (crates/acosmi-app-server/Cargo.toml:50,
+# crates/acosmi-scheduler/Cargo.toml:20).
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sysinfo = "0.38"
+# W-MEMORY-DREAM-REBUILD v7 P3.2 (2026-05-25) — Tier-1 SessionMemoryGate /
+# Processor error types use `thiserror` for ergonomic Error trait impl.
+thiserror = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+
+# Parent-death watcher (2026-06-01): poll CRABCODE_PARENT_PID so the TUI-spawned
+# orchestrator self-terminates when the TUI main process dies abnormally (macOS
+# has no PR_SET_PDEATHSIG). Unix probes via `libc::kill(pid, 0)`; `lib.rs`
+# `is_resource_exhaustion` also reads libc EMFILE/ENFILE — both `#[cfg(unix)]`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows has no `kill(pid, 0)`; `main::parent_pid_is_alive` mirrors
+# `acosmi-app-server::parent_death` and probes existence via
+# `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`. windows-sys 0.59 matches the
+# main `crates/` workspace usage (acosmi-app-server/Cargo.toml) for Cargo dedup.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    # FlushFileBuffers — drain a named-pipe server handle before disconnect so
+    # DisconnectNamedPipe does not discard the client's unread response bytes
+    # (root cause of the Windows one-shot IPC EPIPE; see lib.rs serve loop).
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }

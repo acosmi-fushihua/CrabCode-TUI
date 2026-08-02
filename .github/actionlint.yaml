@@ -1,0 +1,7 @@
+self-hosted-runner:
+  labels:
+    - crabcode-computer-control-attestor
+
+config-variables: null
+
+paths:

@@ -1,0 +1,16 @@
+CrabCode pager rendering primitives
+
+This derivative work includes terminal-rendering source adapted from the xAI
+Grok Build project:
+https://github.com/xai-org/grok-build.git
+
+Upstream copyright:
+Copyright 2023-2026 SpaceXAI
+
+The upstream work is licensed under the Apache License, Version 2.0. A
+byte-identical copy of the fixed source revision's repository license is
+included as LICENSE-Apache-2.0.txt.
+
+CrabCode modifications are identified in PATCHES.md. The fixed upstream
+revision and complete source denominator are recorded in PROVENANCE.md and
+SOURCE_MANIFEST.json.

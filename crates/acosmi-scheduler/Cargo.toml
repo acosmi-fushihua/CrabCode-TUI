@@ -1,0 +1,38 @@
+[package]
+name = "acosmi-scheduler"
+description = "Acosmi 定时任务守护调度器 — cron 解析/文件监视/锁机制"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+uuid = { workspace = true }
+notify = "8"
+libc = { workspace = true }
+# lock::process_start_time 用进程启动时刻做 PID-reuse 防御：陈旧锁回收前要求
+# 记录的 start_time 与当前同 PID 进程的启动时刻一致，否则视为 PID 复用→可回收。
+sysinfo = { workspace = true }
+
+# Windows-only: used by lock::is_pid_alive to detect cross-process lock
+# contention. Without this, `is_pid_alive` returned a compile-time false,
+# making the cross-process scheduler lock useless on Windows (any second
+# daemon would silently recycle a live lock).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

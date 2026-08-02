@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "component": "OAuthAPI-LLM",
+  "componentVersion": "7.2.71-crabcode.5",
+  "protocolVersion": 1,
+  "module": "github.com/acosmi/OAuthAPI-LLM",
+  "upstream": {
+    "repository": "https://github.com/router-for-me/CLIProxyAPI",
+    "release": "v7.2.71",
+    "commit": "5b7f2361ee27d195f6514dde08656f6e4773a9a4",
+    "tree": "b19b97c3f2daeae309363959761b72d3be13f8b3",
+    "licenseSha256": "879792e89cf1bdd6a8d446033ec87e30496f97dcafc4656dc53f641509b346a6"
+  },
+  "auditedCatalog": {
+    "path": "internal/registry/models/models.json",
+    "gitBlob": "a0162db68ed3755819df3e6211e1c82ad25a32e3",
+    "sha256": "1cca5aa8fe32236dfdd0cf0934f14e1ff59920e93a0c1b6d8242b3223c10f5f6"
+  },
+  "fixedPlugins": {
+    "googleGeminiCli": {
+      "repository": "https://github.com/router-for-me/cpa-plugin-gemini-cli",
+      "release": "v1.0.5",
+      "commit": "19d9868ffa24e94a2919ea1d1a761afa634de669",
+      "commitSignature": {
+        "status": "verified",
+        "gpgKeyId": "5C3130A8F5AD576F"
+      },
+      "license": "MIT",
+      "licensePath": "licenses/gemini-cli-LICENSE",
+      "licenseSha256": "6987ff54fdfc6329c6f18ca361386cdd36096294091009be87fe6ab26415dbce",
+      "distributionStatus": "fixed_release_assets_verified",
+      "targets": {
+        "x64-darwin": {
+          "asset": "gemini-cli_1.0.5_darwin_amd64.zip",
+          "archiveSha256": "575c8c5663df54dd6f9132f69795e5297967b5cee0ff500b585f866b1a5cd710",
+          "binary": "gemini-cli.dylib",
+          "binarySha256": "260afc4d58c8f4d3b9be687f009bc08f946c2707d682fa2c73a7bd23d75688bf"
+        },
+        "arm64-darwin": {
+          "asset": "gemini-cli_1.0.5_darwin_arm64.zip",
+          "archiveSha256": "3c771ff57e607b40bf95753e0ad2fb01127a296fe4cbff79b49116cd2327b5bb",
+          "binary": "gemini-cli.dylib",
+          "binarySha256": "4fbac8a964467c477db9975f9ec38e35254ea60fb950b67418a063b2cde20f1b"
+        },
+        "x64-linux": {
+          "asset": "gemini-cli_1.0.5_linux_amd64.zip",
+          "archiveSha256": "b0b202ff9466c6e1f7170577b9a0eb6bd1f5d8069747fce215583faebd3fab73",
+          "binary": "gemini-cli.so",
+          "binarySha256": "de167f1c8a177b71ef23379597f3b8ebb752f9860970bc1e1dce73bab7e46321"
+        },
+        "arm64-linux": {
+          "asset": "gemini-cli_1.0.5_linux_arm64.zip",
+          "archiveSha256": "4e792bd079c2e1bae0134ee5e009317dbff8439d8fbed808aefb84dc44eb098c",
+          "binary": "gemini-cli.so",
+          "binarySha256": "f5cb40a9bfcced2bfede3161ae3f82649846b3a04195523e5e2a0f792b42b826"
+        },
+        "x64-win32": {
+          "asset": "gemini-cli_1.0.5_windows_amd64.zip",
+          "archiveSha256": "e712e4f2a6972b7a692c32fbc8cdf839fcde29428acc9ad98e26ff7212ac24ee",
+          "binary": "gemini-cli.dll",
+          "binarySha256": "c1d849f13270329bff9f4d8ab8ef7507eba57642402beb19c60e66ecc2e40cee"
+        }
+      },
+      "requiredEvidence": [
+        "release-asset-sha256",
+        "extracted-binary-sha256",
+        "license-sha256",
+        "sbom",
+        "provenance"
+      ]
+    }
+  },
+  "importPolicy": {
+    "editableTruth": "components/oauthapi-llm",
+    "nestedGitAllowed": false,
+    "runtimeDownloadsAllowed": false,
+    "buildDownloadsRestrictedToLockedReleaseAssets": true,
+    "pathFallbackAllowed": false,
+    "mirrorDirection": "crabcode-to-acosmi-oauthapi-llm"
+  }
+}

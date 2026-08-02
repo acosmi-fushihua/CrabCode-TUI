@@ -1,0 +1,30 @@
+[package]
+name = "acosmi-index"
+description = "Acosmi 文件索引（索核）— native diff/search/index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# 目录遍历 + gitignore 过滤
+ignore = "0.4"
+# glob 模式匹配
+globset = "0.4"
+# 正则搜索
+regex = "1"
+# diff 算法
+similar = "2"
+# 并行化
+rayon = "1"
+# 大文件内存映射
+memmap2 = "0.9"
+
+[dev-dependencies]
+tempfile = { workspace = true }

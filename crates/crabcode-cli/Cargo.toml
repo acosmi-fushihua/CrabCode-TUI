@@ -1,0 +1,38 @@
+[package]
+name = "crabcode-cli"
+description = "CrabCode 原生 TUI 公开启动器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+autobins = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "crabcode-pure-tui-launcher"
+path = "src/pure_tui_launcher.rs"
+
+[dependencies]
+acosmi-daemon-launcher = { path = "../acosmi-daemon-launcher" }
+acosmi-supervisor = { path = "../acosmi-supervisor" }
+acosmi-generation-lease = { path = "../acosmi-generation-lease" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

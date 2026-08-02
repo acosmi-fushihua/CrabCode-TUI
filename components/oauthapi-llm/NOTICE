@@ -1,0 +1,15 @@
+OAuthAPI-LLM
+Copyright (c) Acosmi contributors.
+
+This product is derived from router-for-me/CLIProxyAPI at commit
+5b7f2361ee27d195f6514dde08656f6e4773a9a4 (release v7.2.71).
+
+The original project is licensed under the MIT License. The original copyright
+notice and full license text are preserved in LICENSE. Acosmi modifications
+include product white-labeling, a restricted loopback-only control surface,
+fixed-account routing, signed regional eligibility enforcement, per-connector
+region gating, first-party Qwen and Z.AI account connectors, credential
+hardening, and CrabCode release integration.
+
+OAuthAPI-LLM is not an official Router-For.ME distribution and is not endorsed
+by any model service provider.

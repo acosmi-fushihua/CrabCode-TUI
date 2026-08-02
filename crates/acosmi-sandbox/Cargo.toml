@@ -1,0 +1,116 @@
+[package]
+name = "acosmi-sandbox"
+description = "OS-native sandbox runtime for Acosmi (Linux/macOS/Windows + Docker fallback)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+
+# Diagnostic matrix feature flag. **Only for Windows sandbox validation**;
+# **不得在 production / release 构建启用**。production 默认保 Medium IL；
+# 启用后 Windows token 创建路径会读两个环境变量重放修复前矩阵行为：
+#
+#   CRABCODE_SANDBOX_MATRIX_DENY_ONLY=0   跳过 deny-only 群组（保留群组完整 SID）
+#   CRABCODE_SANDBOX_MATRIX_LOW_IL=0      保持 Medium IL；其他值重放 Low IL
+sandbox-matrix = []
+
+[dependencies]
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Serialization (JSON IPC with Go layer)
+serde = { workspace = true }
+serde_json.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Internal
+acosmi-types = { path = "../acosmi-types" }
+
+# Process detection
+which.workspace = true
+
+# Sprint 7 阶段 3（2026-04-23）：AsyncSandboxRunner trait + SandboxedProcess
+# 需要 tokio AsyncRead trait（io-util）+ 后续 async spawn 实装用 tokio::process。
+tokio = { workspace = true, features = ["io-util", "process", "rt", "sync", "time", "macros"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Landlock LSM — unprivileged filesystem & network isolation (ABI 1-6)
+landlock = "0.4"
+# Seccomp-BPF — syscall filtering (requires system libseccomp-dev >= 2.5.0)
+libseccomp = "0.4"
+# POSIX API — namespaces, signals, mount, process management
+nix = { version = "0.29", features = ["sched", "signal", "mount", "user", "process"] }
+# C library bindings — constants (AF_UNIX, EPERM, etc.) for seccomp conditional rules
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS FFI for sandbox_init_with_parameters
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "cold_start"
+harness = false
+
+[[bench]]
+name = "worker_bench"
+harness = false
+
+# Cannot use `[lints] workspace = true` because we need to override unsafe_code.
+# Manually replicate workspace lints with the single override.
+[lints.rust]
+# Override workspace `unsafe_code = "warn"` — this crate requires unsafe for
+# platform FFI (macOS sandbox_init, Linux seccomp, Windows Win32).
+# All unsafe blocks undergo mandatory audit with // SAFETY: comments.
+unsafe_code = "allow"
+
+[lints.clippy]
+# 复制 workspace.lints.clippy（因 unsafe_code = allow 不能用 lints.workspace = true）
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+unwrap_used = "deny"
+expect_used = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+# Rust 1.94 pedantic/nursery baseline for existing sandbox FFI/worker code.
+# Keep `cargo clippy -p acosmi-sandbox --no-deps -- -D warnings` focused on
+# actionable regressions while the older audit debt is retired separately.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_ptr_alignment = "allow"
+cast_sign_loss = "allow"
+doc_lazy_continuation = "allow"
+field_reassign_with_default = "allow"
+items_after_statements = "allow"
+missing_transmute_annotations = "allow"
+needless_pass_by_value = "allow"
+option_if_let_else = "allow"
+or_fun_call = "allow"
+pub_underscore_fields = "allow"
+significant_drop_tightening = "allow"
+too_many_lines = "allow"

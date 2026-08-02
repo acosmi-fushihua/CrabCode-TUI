@@ -1,0 +1,15 @@
+# clippy.toml — workspace-wide clippy configuration
+#
+# Workspace lint policy is in `Cargo.toml` `[workspace.lints.clippy]`.
+# This file holds the orthogonal `allow-…-in-tests` knobs that apply
+# globally:
+#
+# - `allow-unwrap-in-tests` — `clippy::unwrap_used` is `deny` at workspace
+#   level to keep production code panic-free, but inside `#[cfg(test)]`
+#   modules and `tests/*.rs` integration files `unwrap()` is the standard
+#   shorthand for "if this fails the test fails". Let lint pass for tests.
+#
+# Per-crate clippy.toml (currently only `acosmi-supervisor/clippy.toml`)
+# overrides this file for that crate; if a crate adds its own clippy.toml,
+# replicate `allow-unwrap-in-tests = true` there too if it has any test code.
+allow-unwrap-in-tests = true

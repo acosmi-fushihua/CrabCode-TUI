@@ -1,0 +1,17 @@
+[package]
+name = "acosmi-heartbeat"
+description = "Acosmi 心跳/watchdog — 活性检测与 kill-safe 状态机"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

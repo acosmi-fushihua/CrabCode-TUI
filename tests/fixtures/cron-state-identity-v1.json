@@ -1,0 +1,17 @@
+[
+  {
+    "statePath": "/tmp/crabcode-state-a",
+    "transportNamespace": "/tmp/crabcode-runtime/run/cron.sock",
+    "identity": "cron-state-v1:a7cd4b4842115630576c1cfe921a714168ac66cf7fbd2ba5bcade9484e5dfa87"
+  },
+  {
+    "statePath": "c:/users/alice/appdata/crabcode",
+    "transportNamespace": "//./pipe/crabcode-alice-cron",
+    "identity": "cron-state-v1:eb68a4c58ec1e137da11aca348f58fad6c9e849f8762ca2e91ab2918be6d2557"
+  },
+  {
+    "statePath": "/Users/测试/.crabcode-dev",
+    "transportNamespace": "/Users/测试/runtime/run/cron.sock",
+    "identity": "cron-state-v1:cf590e57d41b5a9db9e294526ee84618e5464272c9d51d16435ae41d9d312479"
+  }
+]

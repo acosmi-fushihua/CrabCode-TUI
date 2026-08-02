@@ -1,0 +1,31 @@
+{
+  "buckets": [
+    {
+      "modelId": "model-alpha",
+      "tokenType": "REQUESTS",
+      "remainingAmount": "750",
+      "remainingFraction": 0.75,
+      "resetTime": "2026-07-15T00:00:00Z"
+    },
+    {
+      "modelId": "model-alpha",
+      "tokenType": "TOKENS",
+      "remainingAmount": "800000",
+      "remainingFraction": 0.8,
+      "resetTime": "2026-07-14T20:00:00Z"
+    },
+    {
+      "modelId": "model-beta",
+      "tokenType": "REQUESTS",
+      "remainingAmount": "250",
+      "remainingFraction": 0.25,
+      "resetTime": "2026-07-14T19:00:00Z"
+    },
+    {
+      "modelId": "model-unknown-limit",
+      "tokenType": "REQUESTS",
+      "remainingAmount": "123",
+      "resetTime": "2026-07-14T19:30:00Z"
+    }
+  ]
+}

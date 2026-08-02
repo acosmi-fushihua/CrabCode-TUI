@@ -1,0 +1,7 @@
+[test]
+# Preload global test setup before all test files
+preload = ["./tests/setup.ts"]
+
+# Coverage configuration
+coverage = false
+# Enable via CLI: bun test --coverage --coverage-reporter=lcov

@@ -1,0 +1,53 @@
+[package]
+name = "crabcode-ratatui-inline"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "CrabCode inline Ratatui viewport with native terminal scrollback"
+publish = false
+
+[dependencies]
+# ANSI escape parsing for the line splitter (production). Same VTE-style
+# state machine family as the prior termwiz-based parser; already present in
+# the shipped dependency tree via anstream/clap.
+anstyle-parse = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+ansi-width = { workspace = true }
+anyhow = { workspace = true }
+colored_json = { workspace = true }
+criterion = { workspace = true }
+lipsum = { workspace = true }
+serde_json = { workspace = true }
+# Dev-only reference implementation for tests/segment_differential.rs.
+# Not linked into shipped binaries.
+termwiz = { workspace = true }
+
+[[bench]]
+name = "bench"
+harness = false
+
+[features]
+scrolling-regions = [
+    "ratatui/scrolling-regions",
+] # required for terminal fork only
+
+# The fixed upstream implementation contains three audited unsafe operations:
+# one pointer-range comparison and two Ratatui Frame layout conversions. Keep
+# the imported Rust files byte-identical and scope the lint exception to this
+# package; all other workspace lint levels remain mirrored below.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+unwrap_used = "deny"
+expect_used = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

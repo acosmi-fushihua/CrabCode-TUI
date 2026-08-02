@@ -1,0 +1,30 @@
+[package]
+name = "acosmi-types"
+description = "Acosmi 统一类型库：配置、会话、健康、协议、错误、观测、运行时"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# 序列化
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# 类型
+chrono = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+# 日志与追踪
+tracing = { workspace = true }
+
+# Async
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# 系统
+dirs = { workspace = true }

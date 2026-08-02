@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+# The native TUI ships the orchestrator binary and its complete local source
+# closure. The retired FFI adapter is intentionally outside this workspace.
+members = ["acosmi-memory-core", "acosmi-memory-parse", "acosmi-memory-session", "acosmi-memory-vfs", "acosmi-memory-queue", "acosmi-memory-transaction", "acosmi-memory-se", "acosmi-memory-adapter", "acosmi-memory-journal", "acosmi-memory-orchestrator"]
+exclude = []
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+authors = ["UHMS Team"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

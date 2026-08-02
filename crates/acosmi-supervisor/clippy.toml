@@ -1,0 +1,34 @@
+# clippy.toml — acosmi-supervisor
+#
+# Step 2 Phase D.1: forbid bare `tokio::spawn` calls inside this crate.
+# All async tasks owned by `Supervisor` must funnel through
+# `acosmi_supervisor::task_registry::TrackedSpawn::spawn`, which:
+# - catches task panics and surfaces them as `tracing::error`
+# - owns each `JoinHandle` and aborts every outstanding task on Drop
+# - returns a `TrackedTaskId` callers can use to abort one task
+#
+# `task_registry::TrackedSpawn::spawn` is the *one* legitimate caller of
+# `tokio::spawn` in this crate; it carries an explicit
+# `#[allow(clippy::disallowed_methods)]` on its single spawn line.
+#
+# Existing spawn sites that still call `tokio::spawn` directly carry a
+# per-site `#[allow]` plus a one-line note:
+# - `// TODO(Phase D.2): migrate to TrackedSpawn` — for the six bare
+#   `let _ = tokio::spawn(...)` discard sites that D.2 will replace.
+# - `// JoinHandle held by caller — bare-discard regression audited`
+#   for spawn sites whose handle is owned (e.g. pushed onto a `Vec`,
+#   moved into a struct field, awaited later); these stay as
+#   `tokio::spawn` permanently.
+#
+# Closes Step 1 §六 R1 root cause.
+
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "use acosmi_supervisor::task_registry::TrackedSpawn::spawn(label, fut) — see src/task_registry.rs" },
+]
+
+# Mirrored from workspace `crates/clippy.toml` (clippy.toml does NOT merge
+# across ancestors when a per-crate file exists — search stops at first hit).
+# `clippy::unwrap_used` is `deny` at workspace level for production safety;
+# inside `#[cfg(test)]` modules and `tests/*.rs` integration files we want
+# `unwrap()` to be the standard test-assertion shorthand.
+allow-unwrap-in-tests = true

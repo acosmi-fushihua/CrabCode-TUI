@@ -1,0 +1,19 @@
+[package]
+name = "acosmi-executor"
+description = "Acosmi 统一命令执行器（命执）— ExecReq/ExecResult、batch API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+acosmi-types = { path = "../acosmi-types" }
+acosmi-exec = { path = "../acosmi-exec" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+which = "7"

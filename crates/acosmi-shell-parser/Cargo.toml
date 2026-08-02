@@ -1,0 +1,19 @@
+[package]
+name = "acosmi-shell-parser"
+description = "Acosmi shell 解析器（壳析）— bash/powershell 词法与 AST"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+lru = { workspace = true }
+which = "7"
+async-trait = "0.1"

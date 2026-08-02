@@ -1,0 +1,21 @@
+[package]
+name = "acosmi-memory-adapter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "TS memory markdown format adapter for acosmi-memory"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+acosmi-memory-core = { path = "../acosmi-memory-core" }
+acosmi-segment = { path = "../../acosmi-se/acosmi-segment", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v5", "serde"] }
+
+[dev-dependencies]
+pretty_assertions = "1"

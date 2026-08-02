@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsx": "preserve",
+    "noEmit": true
+  },
+  "files": ["src/entrypoints/tuiRuntime.ts"],
+  "include": ["src/**/*.d.ts"]
+}

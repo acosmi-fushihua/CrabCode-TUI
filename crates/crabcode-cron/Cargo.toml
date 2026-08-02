@@ -1,0 +1,46 @@
+[package]
+name = "crabcode-cron"
+description = "CrabCode cron daemon — 立宪 3 阶段 3-A：独立 Rust 调度二进制（与 hub daemon 平行，不依赖 supervisor）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "crabcode-cron"
+path = "src/main.rs"
+
+[dependencies]
+acosmi-daemon-launcher = { path = "../acosmi-daemon-launcher" }
+acosmi-scheduler = { path = "../acosmi-scheduler" }
+acosmi-config = { path = "../acosmi-config" }
+# W1b：首启一次性把 scheduled_tasks.json 快照导入 SQLite ledger（import→verify→
+# cutover）。本波只 open + migrate + drop，不接 fire 路径（W1c 才用）。
+acosmi-cron-ledger = { path = "../acosmi-cron-ledger" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serial_test = { workspace = true }
+
+[lints]
+workspace = true

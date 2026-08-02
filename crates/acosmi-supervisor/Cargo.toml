@@ -1,0 +1,65 @@
+[package]
+name = "acosmi-supervisor"
+description = "Acosmi supervisor — 通用进程生命周期管理"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+acosmi-types = { path = "../acosmi-types" }
+acosmi-config = { path = "../acosmi-config" }
+acosmi-heartbeat = { path = "../acosmi-heartbeat" }
+# 2026-04-28 阶段 3-B（立宪 3）：acosmi-scheduler 依赖移除 —— cron 已搬到独立
+# 二进制 `crabcode-cron`，supervisor 不再做调度决策。
+acosmi-exec = { path = "../acosmi-exec" }
+acosmi-executor = { path = "../acosmi-executor" }
+acosmi-permission = { path = "../acosmi-permission" }
+# Sprint 7 阶段 4（2026-04-23）：启用 acosmi-sandbox 真实依赖
+# 用于 handle_spawn_managed 在 sandbox_mode=Enforced 时调 AsyncSandboxRunner
+acosmi-sandbox = { path = "../acosmi-sandbox" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.22"
+# TrackedSpawn uses FutureExt::catch_unwind to capture task panics.
+futures = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+acosmi-util-absolute-path = { path = "../acosmi-util-absolute-path" }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+windows-sys = { version = "0.59", features = [
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Foundation",
+    "Win32_Security",
+    # P1-2: ConvertStringSecurityDescriptorToSecurityDescriptorW for the
+    # current-user-only DACL on the supervisor Named Pipe.
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+] }
+
+[dev-dependencies]
+serial_test = { workspace = true }
+tempfile = { workspace = true }

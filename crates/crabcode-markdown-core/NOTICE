@@ -1,0 +1,13 @@
+CrabCode Markdown core
+
+This derivative work includes source from the xAI Grok Build project:
+https://github.com/xai-org/grok-build.git
+
+Upstream copyright:
+Copyright 2023-2026 SpaceXAI
+
+The upstream work is licensed under the Apache License, Version 2.0. A copy
+is included as LICENSE-Apache-2.0.txt.
+
+CrabCode modifications are identified in PATCHES.md. The fixed upstream
+revision and source path are recorded in PROVENANCE.md.

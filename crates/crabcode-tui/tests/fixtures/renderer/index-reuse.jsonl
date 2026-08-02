@@ -1,0 +1,8 @@
+{"type":"stream_event","uuid":"reuse-0","event":{"type":"message_start","message":{"id":"reuse-message"}}}
+{"type":"stream_event","uuid":"reuse-1","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}
+{"type":"stream_event","uuid":"reuse-2","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"first"}}}
+{"type":"stream_event","uuid":"reuse-3","event":{"type":"content_block_stop","index":1}}
+{"type":"stream_event","uuid":"reuse-4","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"reuse-tool","name":"Read","input":{}}}}
+{"type":"stream_event","uuid":"reuse-5","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"README.md\"}"}}}
+{"type":"stream_event","uuid":"reuse-6","event":{"type":"content_block_stop","index":1}}
+{"type":"stream_event","uuid":"reuse-7","event":{"type":"message_stop"}}

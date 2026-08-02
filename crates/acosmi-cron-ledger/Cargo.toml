@@ -1,0 +1,33 @@
+[package]
+name = "acosmi-cron-ledger"
+description = "Acosmi cron SQLite-WAL occurrence ledger — durable jobs/occurrences/attempts/results store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# CronJob / CronJobCreate 等类型（W1b/W1c 的 daemon 接线会在 lib 代码里用；W1a
+# 仅在单测里构造 job_json）。保持普通依赖（非 dev-dep）以对齐后续切片。
+acosmi-scheduler = { path = "../acosmi-scheduler" }
+# spike 钦定 0.32（→ libsqlite3-sys 0.30.1 / SQLite 3.46.0）。0.40.x 的
+# libsqlite3-sys 0.38.1 用 unstable cfg_select! → rustc E0658。bundled = 从
+# 源码编译 SQLite（含 JSON1），不依赖系统 libsqlite3。
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# W1c 才用 spawn_blocking 包同步库函数；W1a 不引入 async，此依赖为前瞻声明。
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# W1b/c 用于时间戳；W1a 时间戳全部由调用方传入，此依赖为前瞻声明。
+chrono = { workspace = true }
+# W1b 迁移 source_hash 用；W1a 未使用，前瞻声明。
+sha2 = { workspace = true }
+# W1b 迁移 migration_state.schema_epoch = 新 UUIDv4。
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

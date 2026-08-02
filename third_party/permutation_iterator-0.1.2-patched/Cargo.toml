@@ -1,0 +1,12 @@
+[package]
+name = "permutation_iterator"
+version = "0.1.2"
+edition = "2018"
+license = "Apache-2.0"
+description = "Iterate over random permutations in constant space"
+repository = "https://github.com/asimihsan/permutation-iterator-rs"
+publish = false
+
+[dependencies]
+blake2-rfc = "0.2.18"
+rand = "0.8.6"

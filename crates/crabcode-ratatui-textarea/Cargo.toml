@@ -1,0 +1,38 @@
+[package]
+name = "crabcode-ratatui-textarea"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "CrabCode multiline terminal text editor for Ratatui"
+publish = false
+
+[dependencies]
+crossterm = { workspace = true, features = ["event-stream", "bracketed-paste"] }
+ratatui = { workspace = true, features = ["crossterm", "unstable-widget-ref"] }
+ratatui-core = "0.1"
+textwrap = { workspace = true }
+tracing = { workspace = true, optional = true }
+tui-scrollbar = "0.2"
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+arboard = { workspace = true }
+chrono = { workspace = true }
+fuzzy-matcher = "0.3.7"
+ignore = "0.4"
+itertools = "0.14"
+pretty_assertions = { workspace = true }
+rand = { workspace = true }
+
+[[example]]
+name = "textarea_demo"
+path = "examples/textarea_demo.rs"
+
+[features]
+default = []
+debug-logs = ["dep:tracing"]
+
+[lints]
+workspace = true

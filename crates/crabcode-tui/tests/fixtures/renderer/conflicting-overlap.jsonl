@@ -1,0 +1,7 @@
+{"type":"stream_event","uuid":"overlap-0","event":{"type":"message_start","message":{"id":"overlap-message"}}}
+{"type":"stream_event","uuid":"overlap-1","event":{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}}
+{"type":"stream_event","uuid":"overlap-2","event":{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"partial text"}}}
+{"type":"stream_event","uuid":"overlap-3","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"overlap-tool","name":"web_search","input":{}}}}
+{"type":"stream_event","uuid":"overlap-4","event":{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"renderer lifecycle\"}"}}}
+{"type":"stream_event","uuid":"overlap-5","event":{"type":"content_block_stop","index":2}}
+{"type":"stream_event","uuid":"overlap-6","event":{"type":"message_stop"}}

@@ -1,0 +1,12 @@
+{
+  "currentPeriod": {
+    "month": "2026-07",
+    "end": "2026-08-01T00:00:00Z",
+    "creditUsagePercent": 61.5
+  },
+  "monthlyLimit": 100,
+  "onDemandCap": 0,
+  "onDemandUsed": 0,
+  "prepaidBalance": 0,
+  "isUnifiedBillingUser": true
+}

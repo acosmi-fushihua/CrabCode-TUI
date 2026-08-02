@@ -1,0 +1,10 @@
+crabcode-ratatui-textarea is a renamed derivative of xai-ratatui-textarea,
+first-party code maintained by xAI for the upstream Grok TUI.
+
+Copyright 2023-2026 xAI
+Licensed under the Apache License, Version 2.0 (see
+LICENSE-Apache-2.0.txt in this crate).
+
+This crate is not a wholesale redistribution of third-party source. Dependencies
+such as ratatui are declared in Cargo.toml; their licenses appear in the
+repository root THIRD-PARTY-NOTICES file.

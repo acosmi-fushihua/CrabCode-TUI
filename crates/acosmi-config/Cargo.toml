@@ -1,0 +1,28 @@
+[package]
+name = "acosmi-config"
+description = "Configuration loading, validation, I/O, and session store for Acosmi CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+acosmi-types = { path = "../acosmi-types" }
+serde.workspace = true
+serde_json.workspace = true
+figment.workspace = true
+toml.workspace = true
+json5.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+
+[lints]
+workspace = true

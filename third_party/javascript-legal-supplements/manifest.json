@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "packages": [
+    {
+      "packageName": "@growthbook/growthbook",
+      "packageVersion": "1.6.5",
+      "installedPackageJsonSha256": "7a22a6d6153bb14121fedc512e54411373864695a1e4f9989c2b7162bc2dfbc0",
+      "installedPackageJsonSize": 2961,
+      "lockIntegrity": "sha512-mUaMsgeUTpRIUOTn33EUXHRK6j7pxBjwqH4WpQyq+pukjd1AIzWlEa6w7i6bInJUcweGgP2beXZmaP6b6UPn7A==",
+      "repositoryUrl": "https://github.com/growthbook/growthbook",
+      "revision": "0a12e077fa6c5b2c66e022d2188ccdcac7fc26c6",
+      "packageJsonSourcePath": "packages/sdk-js/package.json",
+      "packageJsonGitBlobSha1": "7aca9870ee17767797b90150efc10c2c930f86aa",
+      "publicationTransform": {
+        "kind": "identity"
+      },
+      "legalFiles": [
+        {
+          "packageRelativePath": "LICENSE",
+          "sourceOrigin": "reviewed-corpus",
+          "sourcePath": "third_party/javascript-legal-supplements/growthbook-growthbook-1.6.5/LICENSE",
+          "officialSourcePath": "LICENSE",
+          "gitBlobSha1": "0a17616ab12bebe8061d8c101597ed590dbe2c5e",
+          "sha256": "81d7d48304e7c0f1f14a778d6c4e4c89c36aebea06a9bbf4a33f19d5ffc04734",
+          "size": 1716
+        }
+      ]
+    },
+    {
+      "packageName": "isarray",
+      "packageVersion": "1.0.0",
+      "installedPackageJsonSha256": "93165ce56e458216c18240cd961a522af5b18e51da06f55d88ac552234455d95",
+      "installedPackageJsonSize": 958,
+      "lockIntegrity": "sha512-VLghIWNM6ELQzo7zwmcg0NmTVyWKYjvIeM83yjp0wRDTmUnrM678fQbcKBo6n2CJEF0szoG//ytg+TKla89ALQ==",
+      "repositoryUrl": "https://github.com/juliangruber/isarray",
+      "revision": "2a23a281f369e9ae06394c0fb4d2381355a6ba33",
+      "packageJsonSourcePath": "package.json",
+      "packageJsonGitBlobSha1": "1a4317a9c41c73d52934337143b974a35074e6f2",
+      "publicationTransform": {
+        "kind": "identity"
+      },
+      "legalFiles": [
+        {
+          "packageRelativePath": "README.md",
+          "sourceOrigin": "installed-package",
+          "sourcePath": "README.md",
+          "officialSourcePath": "README.md",
+          "gitBlobSha1": "16d2c59c6195f9a1ac9af37cb9d75f1a6b85ab01",
+          "sha256": "ff138e683771b187f3629c383db72ee7d632009010a36d08e18e8d2a34222ec7",
+          "size": 1890
+        }
+      ]
+    },
+    {
+      "packageName": "saxes",
+      "packageVersion": "5.0.1",
+      "installedPackageJsonSha256": "5730864bc76e7b0e2072c87756c8e73f56e0ca840337fecdedcd3e35e1e191c2",
+      "installedPackageJsonSize": 2809,
+      "lockIntegrity": "sha512-5LBh1Tls8c9xgGjw3QrMwETmTMVk0oFgvrFSvWx62llR2hcEInrKNZ2GZCCuuy2lvWrdl5jhbpeqc5hRYKFOcw==",
+      "repositoryUrl": "https://github.com/lddubeau/saxes",
+      "revision": "6ef6a275b20f19cb67808daf0d8f64e06aaf5b0e",
+      "packageJsonSourcePath": "package.json",
+      "packageJsonGitBlobSha1": "8db3873082e85f189fd9f28532462c88cb1d4d45",
+      "publicationTransform": {
+        "kind": "remove-exact-line",
+        "after": "{\n  \"name\": \"saxes\",\n",
+        "line": "  \"private\": true,\n"
+      },
+      "legalFiles": [
+        {
+          "packageRelativePath": "LICENSE",
+          "sourceOrigin": "reviewed-corpus",
+          "sourcePath": "third_party/javascript-legal-supplements/saxes-5.0.1/LICENSE",
+          "officialSourcePath": "LICENSE",
+          "gitBlobSha1": "187f3ba399862022f4e670b2a3a1dbc6d7e6a800",
+          "sha256": "0fac2374380621b22e6b50451057721a9c52935b02d16d106a9f04897f061d0e",
+          "size": 3011
+        }
+      ]
+    }
+  ]
+}

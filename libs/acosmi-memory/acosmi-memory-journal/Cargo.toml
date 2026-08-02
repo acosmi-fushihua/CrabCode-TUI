@@ -1,0 +1,15 @@
+[package]
+name = "acosmi-memory-journal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "SQLite-WAL durable handoff journal for CrabCode Memory work"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
