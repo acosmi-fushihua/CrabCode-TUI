@@ -190,14 +190,14 @@ jobs:
           test -s "${ASSET}"
           test "$(find dist/release -maxdepth 1 -type f -name 'crabcode-*' | wc -l | tr -d ' ')" = '1'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: release-${{ matrix.platform }}
           path: dist/release/crabcode-*.tar.gz
           if-no-files-found: ignore
           retention-days: 14
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: release-${{ matrix.platform }}-zip
           path: dist/release/crabcode-*.zip
@@ -214,13 +214,14 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.1
         with:
           pattern: release-*
           path: release-assets
@@ -255,7 +256,7 @@ jobs:
           test "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" = '8'
 
       - name: Generate GitHub build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest@v4.1.1
         with:
           subject-path: |
             release-assets/crabcode-*.tar.gz
