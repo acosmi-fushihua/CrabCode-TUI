@@ -14,6 +14,11 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const failures = []
 const portable = value => value.split(sep).join('/')
 const fail = message => failures.push(message)
+const requestedModes = process.argv.slice(2)
+for (const argument of requestedModes) {
+  if (argument !== '--source-only') fail(`unsupported repository-boundary argument: ${argument}`)
+}
+const sourceOnly = requestedModes.includes('--source-only')
 
 function run(command, args, cwd = root) {
   const result = spawnSync(command, args, {
@@ -340,34 +345,35 @@ for (const path of tracked.filter(path => {
   }
 }
 
-const metafilePath = resolve(root, 'dist/tui-runtime/metafile.json')
-if (!existsSync(metafilePath)) {
-  fail('build metafile is missing; run bun run build:ts first')
-} else {
-  const metafile = JSON.parse(readFileSync(metafilePath, 'utf8'))
-  const outputs = Object.values(metafile.outputs ?? {})
-  if (outputs.length !== 1) fail(`TUI build must have exactly one output; found ${outputs.length}`)
-  const contributing = new Set(
-    Object.entries(outputs[0]?.inputs ?? {})
-      .filter(([, value]) => Number(value?.bytesInOutput) > 0)
-      .map(([path]) => portable(path).replace(/^\.\//u, '')),
-  )
-  const runtimeInputs = new Set(
-    Object.keys(metafile.inputs ?? {}).map(path => portable(path).replace(/^\.\//u, '')),
-  )
-  for (const path of contributing) {
-    if (/^(?:apps|archive|contracts|docs|frontend)\//u.test(path)) {
-      fail(`non-TUI input contributes executable bytes: ${path}`)
+if (!sourceOnly) {
+  const metafilePath = resolve(root, 'dist/tui-runtime/metafile.json')
+  if (!existsSync(metafilePath)) {
+    fail('build metafile is missing; run bun run build:ts first')
+  } else {
+    const metafile = JSON.parse(readFileSync(metafilePath, 'utf8'))
+    const outputs = Object.values(metafile.outputs ?? {})
+    if (outputs.length !== 1) fail(`TUI build must have exactly one output; found ${outputs.length}`)
+    const contributing = new Set(
+      Object.entries(outputs[0]?.inputs ?? {})
+        .filter(([, value]) => Number(value?.bytesInOutput) > 0)
+        .map(([path]) => portable(path).replace(/^\.\//u, '')),
+    )
+    const runtimeInputs = new Set(
+      Object.keys(metafile.inputs ?? {}).map(path => portable(path).replace(/^\.\//u, '')),
+    )
+    for (const path of contributing) {
+      if (/^(?:apps|archive|contracts|docs|frontend)\//u.test(path)) {
+        fail(`non-TUI input contributes executable bytes: ${path}`)
+      }
+      if (/^src\/(?:appServer|components|ink|screens)(?:\/|$)/u.test(path)) {
+        fail(`GUI/AppServer input contributes executable bytes: ${path}`)
+      }
+      if (/node_modules\/(?:\.bun\/[^/]+\/node_modules\/)?(?:ink|react|react-dom|react-reconciler)(?:\/|$)/u.test(path)) {
+        fail(`GUI dependency contributes executable bytes: ${path}`)
+      }
     }
-    if (/^src\/(?:appServer|components|ink|screens)(?:\/|$)/u.test(path)) {
-      fail(`GUI/AppServer input contributes executable bytes: ${path}`)
-    }
-    if (/node_modules\/(?:\.bun\/[^/]+\/node_modules\/)?(?:ink|react|react-dom|react-reconciler)(?:\/|$)/u.test(path)) {
-      fail(`GUI dependency contributes executable bytes: ${path}`)
-    }
-  }
 
-  const exactTypeOnlySources = new Set([
+    const exactTypeOnlySources = new Set([
     'src/constants/querySource.ts',
     'src/entrypoints/sdk/controlTypes.ts',
     'src/entrypoints/sdk/sdkUtilityTypes.ts',
@@ -407,37 +413,38 @@ if (!existsSync(metafilePath)) {
     'src/utils/sandbox/types.ts',
     'src/utils/secureStorage/types.ts',
   ])
-  const typeOnlySources = new Set(
-    tracked.filter(
-      path =>
-        path.startsWith('src/') &&
-        /\.[cm]?[jt]sx?$/u.test(path) &&
-        !runtimeInputs.has(path),
-    ),
-  )
-  compareSet('TypeScript files outside the executable TUI bundle', typeOnlySources, exactTypeOnlySources)
+    const typeOnlySources = new Set(
+      tracked.filter(
+        path =>
+          path.startsWith('src/') &&
+          /\.[cm]?[jt]sx?$/u.test(path) &&
+          !runtimeInputs.has(path),
+      ),
+    )
+    compareSet('TypeScript files outside the executable TUI bundle', typeOnlySources, exactTypeOnlySources)
 
-  const tsc = resolve(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
-  if (!existsSync(tsc)) {
-    fail('local TypeScript compiler is missing; run bun install')
-  } else {
-    const listed = new Set(
-      run(tsc, ['-p', 'tsconfig.tui-runtime.json', '--listFilesOnly'])
-        .split(/\r?\n/u)
-        .map(path => path.trim())
-        .filter(Boolean)
-        .map(path => portable(relative(root, path)))
-        .filter(path => !path.startsWith('../')),
-    )
-    const unreachable = tracked.filter(
-      path =>
-        path.startsWith('src/') &&
-        /\.[cm]?[jt]sx?$/u.test(path) &&
-        !listed.has(path) &&
-        !contributing.has(path),
-    )
-    if (unreachable.length > 0) {
-      fail(`tracked TypeScript outside the TUI compile graph: ${unreachable.join(', ')}`)
+    const tsc = resolve(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
+    if (!existsSync(tsc)) {
+      fail('local TypeScript compiler is missing; run bun install')
+    } else {
+      const listed = new Set(
+        run(tsc, ['-p', 'tsconfig.tui-runtime.json', '--listFilesOnly'])
+          .split(/\r?\n/u)
+          .map(path => path.trim())
+          .filter(Boolean)
+          .map(path => portable(relative(root, path)))
+          .filter(path => !path.startsWith('../')),
+      )
+      const unreachable = tracked.filter(
+        path =>
+          path.startsWith('src/') &&
+          /\.[cm]?[jt]sx?$/u.test(path) &&
+          !listed.has(path) &&
+          !contributing.has(path),
+      )
+      if (unreachable.length > 0) {
+        fail(`tracked TypeScript outside the TUI compile graph: ${unreachable.join(', ')}`)
+      }
     }
   }
 }
@@ -452,5 +459,5 @@ if (failures.length > 0) {
 }
 
 process.stdout.write(
-  `repository boundary passed: files=${tracked.length} bytes=${trackedBytes} pure_tui=true\n`,
+  `repository boundary passed: mode=${sourceOnly ? 'source' : 'complete'} files=${tracked.length} bytes=${trackedBytes} pure_tui=true\n`,
 )

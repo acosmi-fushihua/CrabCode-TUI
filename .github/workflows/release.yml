@@ -81,8 +81,8 @@ jobs:
           test "$(head -c 3 scripts/install.sh | od -An -tx1 | tr -d ' \n')" != 'efbbbf'
           sh -n scripts/install.sh
 
-      - name: Enforce repository boundary at the tag
-        run: node scripts/repository-boundary.mjs
+      - name: Enforce tagged source boundary
+        run: node scripts/repository-boundary.mjs --source-only
 
   build:
     name: Build ${{ matrix.platform }}
@@ -152,6 +152,9 @@ jobs:
 
       - name: Build closed TypeScript business runtime
         run: bun run build:ts
+
+      - name: Enforce complete source and executable boundary
+        run: node scripts/repository-boundary.mjs
 
       - name: Build native Rust TUI product closure
         shell: bash
