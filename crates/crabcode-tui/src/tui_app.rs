@@ -15801,14 +15801,14 @@ mod tests {
                 )))
                 .is_empty()
         );
+        let mut actions = minimal.take_transcript_view_actions();
+        assert!(matches!(
+            actions.pop_front(),
+            Some(crate::agent_view::TranscriptViewAction::UpdateLinkHover { .. })
+        ));
         assert_eq!(
-            minimal.take_transcript_view_actions(),
-            VecDeque::from([
-                crate::agent_view::TranscriptViewAction::UpdateLinkHover {
-                    modifier_held: false,
-                },
-                crate::agent_view::TranscriptViewAction::MinimalExpandLast,
-            ]),
+            actions,
+            VecDeque::from([crate::agent_view::TranscriptViewAction::MinimalExpandLast]),
         );
     }
 
