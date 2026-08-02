@@ -43,7 +43,7 @@ const trackedSet = new Set(tracked)
 
 const requiredFiles = [
   'README.md',
-  'README.zh-CN.md',
+  'README.en.md',
   'LICENSE',
   'OPEN_SOURCE.md',
   'OPEN_SOURCE.zh-CN.md',
@@ -59,6 +59,11 @@ const requiredFiles = [
   'src/entrypoints/tuiRuntime.ts',
   'crates/crabcode-tui/src/main.rs',
   'crates/crabcode-cli/src/pure_tui_launcher.rs',
+  'scripts/assemble-release.mjs',
+  'scripts/install.sh',
+  'scripts/install.ps1',
+  '.github/assets/crab-code-logo.png',
+  '.github/workflows/release.yml',
 ]
 for (const path of requiredFiles) {
   if (!trackedSet.has(path)) fail(`required open-source TUI file is not tracked: ${path}`)
@@ -85,7 +90,7 @@ const allowedRootFiles = new Set([
   'OPEN_SOURCE.md',
   'OPEN_SOURCE.zh-CN.md',
   'README.md',
-  'README.zh-CN.md',
+  'README.en.md',
   'SECURITY.md',
   'SECURITY.zh-CN.md',
   'THIRD_PARTY_NOTICES.md',
@@ -163,8 +168,11 @@ if (trackedBytes > 80 * 1024 * 1024) {
 }
 
 const exactScripts = new Set([
+  'scripts/assemble-release.mjs',
   'scripts/build-account-bridge.ts',
   'scripts/build-ts.ts',
+  'scripts/install.ps1',
+  'scripts/install.sh',
   'scripts/repository-boundary.mjs',
   'scripts/run-bun-test.ts',
   'scripts/run-full-test-suite.ts',
@@ -175,7 +183,9 @@ for (const path of tracked.filter(path => path.startsWith('scripts/'))) {
 }
 const exactWorkflows = new Set([
   '.github/actionlint.yaml',
+  '.github/assets/crab-code-logo.png',
   '.github/workflows/ci.yml',
+  '.github/workflows/release.yml',
 ])
 for (const path of tracked.filter(path => path.startsWith('.github/'))) {
   if (!exactWorkflows.has(path)) fail(`unexpected GitHub project file: ${path}`)
@@ -226,6 +236,7 @@ const exactThirdParty = new Set([
   'ordered_hashmap',
   'permutation_iterator-0.1.2-patched',
   'ratatui-0.29.0-patched',
+  'release-licenses',
   'sharp-native',
 ])
 for (const path of tracked.filter(path => path.startsWith('third_party/'))) {

@@ -16,6 +16,7 @@
     "build:rust": "cargo build --manifest-path crates/Cargo.toml --workspace",
     "build:memory": "cargo build --manifest-path libs/acosmi-memory/Cargo.toml --bin acosmi-memory-orchestrator",
     "build:account-bridge": "bun scripts/build-account-bridge.ts",
+    "release:assemble": "bun scripts/assemble-release.mjs",
     "test": "bun scripts/run-full-test-suite.ts ./tests",
     "test:unit": "bun scripts/run-full-test-suite.ts ./tests/unit",
     "test:integration": "bun scripts/run-full-test-suite.ts ./tests/integration",

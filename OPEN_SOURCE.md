@@ -50,10 +50,21 @@ third-party account permission, signing keys, hosted infrastructure, support,
 or a trademark license. Users are responsible for complying with the terms of
 every service and model they connect.
 
+CrabCode GO subscription membership is an online product entitlement, not the
+Go programming language and not part of the MIT license. The complimentary
+six-month membership after registration, invite-earned reset counts, and
+access to models such as DeepSeek-V4, Mino, and Qwen 3.7 Fast remain subject to
+the live service's eligibility, region, quota, availability, and terms.
+Copying, modifying, or distributing this source does not create an account,
+membership, or model quota.
+
 ## Redistribution
 
 Source redistributions must preserve the root license, this guide, and all
 applicable component licenses/notices. Binary distributors must also collect
 the licenses for the exact dependency versions and platform artifacts they
 ship. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) is an attribution index,
-not a substitute for reviewing the complete dependency closure.
+not a substitute for reviewing the complete dependency closure. Official
+GitHub Release archives carry per-file hashes, a build-materials inventory,
+and license material for the JavaScript, Rust, Go, and native third-party
+closure actually shipped on that platform.

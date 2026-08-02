@@ -57,8 +57,16 @@ in `libs/acosmi-se/LICENSE`.
 ## Account Bridge
 
 `components/oauthapi-llm` is an MIT-licensed derivative of
-`router-for-me/CLIProxyAPI`. Its `LICENSE`, `NOTICE`, `UPSTREAM.lock`, and
-component-level third-party notices are retained next to the source.
+[`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI),
+pinned to release
+[`v7.2.71`](https://github.com/router-for-me/CLIProxyAPI/releases/tag/v7.2.71)
+and commit
+[`5b7f2361ee27d195f6514dde08656f6e4773a9a4`](https://github.com/router-for-me/CLIProxyAPI/commit/5b7f2361ee27d195f6514dde08656f6e4773a9a4).
+We thank the upstream maintainers and contributors for the OAuth login and
+provider-protocol foundation. Its `LICENSE`, `NOTICE`, `UPSTREAM.lock`, and
+component-level third-party notices are retained next to the source. The
+CrabCode derivative is not an official Router-For.ME distribution and is not
+endorsed by any model service provider.
 
 ## JavaScript and registry dependencies
 
@@ -67,6 +75,16 @@ Exact dependency versions are fixed by `bun.lock`, Cargo lockfiles, and
 publisher's license. The supplemental source-license bindings under
 `third_party/javascript-legal-supplements` are retained for packages whose
 published archive did not carry a complete adjacent legal file.
+
+## Prebuilt release runtime
+
+Official platform archives also bundle pinned native runtime artifacts that
+are not stored as binaries in this source repository: Bun 1.3.11, ripgrep
+14.1.1, crabcode-browser 0.28.0, and the platform-specific Sharp/libvips
+payload fixed by `third_party/sharp-native/file-hashes.json`. Every archive
+contains the corresponding upstream licenses/notices, the exact artifact URLs
+and SHA-256 values, a JavaScript/Rust dependency inventory, and the signed
+Account Bridge provenance materials.
 
 Anyone distributing binaries must collect and ship the complete license and
 notice set for the exact platform-specific dependency closure in that binary.

@@ -2,6 +2,86 @@
   "schemaVersion": 1,
   "packages": [
     {
+      "packageName": "binary",
+      "packageVersion": "0.3.0",
+      "installedPackageJsonSha256": "355ec61b56448e3d9ad74b286fa07e1b18bcbf153f45223b1a4f68d86bec891f",
+      "installedPackageJsonSize": 834,
+      "lockIntegrity": "sha512-D4H1y5KYwpJgK8wk1Cue5LLPgmwHKYSChkbspQg5JtVuR5ulGckxfR62H3AE9UDkdMC8yyXlqYihuz3Aqg2XZg==",
+      "repositoryUrl": "https://github.com/substack/node-binary",
+      "declaredLicense": "MIT",
+      "licenseEvidence": "published package.json",
+      "legalFiles": [
+        {
+          "packageRelativePath": "LICENSE",
+          "sourceOrigin": "maintainer-curated-standard-license",
+          "sourcePath": "third_party/javascript-legal-supplements/binary-0.3.0/LICENSE",
+          "officialSourcePath": "package.json#license",
+          "sha256": "438a6096a8ccc7bf9b3ce16cad7cfd9b98a9f4695df1a89df54ab56fcfd4635f",
+          "size": 1053
+        }
+      ]
+    },
+    {
+      "packageName": "buffers",
+      "packageVersion": "0.1.1",
+      "installedPackageJsonSha256": "7091616d3b687b0de9dfbc6a1f8ab61e01742a3ec87f977bef64d1f299e231b9",
+      "installedPackageJsonSize": 424,
+      "lockIntegrity": "sha512-9q/rDEGSb/Qsvv2qvzIzdluL5k7AaJOTrw23z9reQthrbF7is4CtlT0DXyO1oei2DCp4uojjzQ7igaSHp1kAEQ==",
+      "repositoryUrl": "https://github.com/substack/node-buffers",
+      "declaredLicense": "MIT/X11",
+      "licenseEvidence": "npm registry metadata for buffers@0.1.1; the packed package omits a license file",
+      "legalFiles": [
+        {
+          "packageRelativePath": "LICENSE",
+          "sourceOrigin": "maintainer-curated-standard-license",
+          "sourcePath": "third_party/javascript-legal-supplements/buffers-0.1.1/LICENSE",
+          "officialSourcePath": "https://registry.npmjs.org/buffers/0.1.1#license",
+          "sha256": "438a6096a8ccc7bf9b3ce16cad7cfd9b98a9f4695df1a89df54ab56fcfd4635f",
+          "size": 1053
+        }
+      ]
+    },
+    {
+      "packageName": "chainsaw",
+      "packageVersion": "0.1.0",
+      "installedPackageJsonSha256": "51910ad64abca4eb8c2c23abb2f713ba5220db89ed89c9fd198d27241a5a70ea",
+      "installedPackageJsonSize": 618,
+      "lockIntegrity": "sha512-75kWfWt6MEKNC8xYXIdRpDehRYY/tNSgwKaJq+dbbDcxORuVrrQ+SEHoWsniVn9XPYfP4gmdWIeDk/4YNp1rNQ==",
+      "repositoryUrl": "https://github.com/substack/node-chainsaw",
+      "declaredLicense": "MIT/X11",
+      "licenseEvidence": "published package.json",
+      "legalFiles": [
+        {
+          "packageRelativePath": "LICENSE",
+          "sourceOrigin": "maintainer-curated-standard-license",
+          "sourcePath": "third_party/javascript-legal-supplements/chainsaw-0.1.0/LICENSE",
+          "officialSourcePath": "package.json#license",
+          "sha256": "438a6096a8ccc7bf9b3ce16cad7cfd9b98a9f4695df1a89df54ab56fcfd4635f",
+          "size": 1053
+        }
+      ]
+    },
+    {
+      "packageName": "flora-colossus",
+      "packageVersion": "2.0.0",
+      "installedPackageJsonSha256": "5998a6a00cd9542b5ff727fd9b28f0e92ffdc33efdcd59e30a7df997bcd79549",
+      "installedPackageJsonSize": 976,
+      "lockIntegrity": "sha512-dz4HxH6pOvbUzZpZ/yXhafjbR2I8cenK5xL0KtBFb7U2ADsR+OwXifnxZjij/pZWF775uSCMzWVd+jDik2H2IA==",
+      "repositoryUrl": "https://github.com/MarshallOfSound/flora-colossus",
+      "declaredLicense": "MIT",
+      "licenseEvidence": "published package.json",
+      "legalFiles": [
+        {
+          "packageRelativePath": "LICENSE",
+          "sourceOrigin": "maintainer-curated-standard-license",
+          "sourcePath": "third_party/javascript-legal-supplements/flora-colossus-2.0.0/LICENSE",
+          "officialSourcePath": "package.json#license",
+          "sha256": "4dc5bf368f2f70ace5c74c178c014716b8435d2106cbafa23e51f26b93c5c477",
+          "size": 1052
+        }
+      ]
+    },
+    {
       "packageName": "@growthbook/growthbook",
       "packageVersion": "1.6.5",
       "installedPackageJsonSha256": "7a22a6d6153bb14121fedc512e54411373864695a1e4f9989c2b7162bc2dfbc0",

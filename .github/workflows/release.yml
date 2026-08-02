@@ -1,0 +1,311 @@
+name: Pure TUI Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vSemVer tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pure-tui-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  BUN_VERSION: '1.3.11'
+  RUST_TOOLCHAIN: '1.88.0'
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  CRABCODE_RELEASE_BUILD: '1'
+  CRABCODE_BUILD_MINIFY: '1'
+  ACCOUNT_BRIDGE_ELIGIBILITY_PUBLIC_KEY_BASE64URL: loXs2jEP4Spq1FRzy0dnU6qm9o6eELAuhJ7AdNw1SVE
+  ACCOUNT_BRIDGE_CONNECTOR_POLICY_PUBLIC_KEY_BASE64URL: 1rLNPsLwBefJ_7pKyv-49onlWjUZlGn6TPDnI21QcIg
+  ACCOUNT_BRIDGE_ARTIFACT_PUBLIC_KEY_BASE64URL: 15MaLfvECwoagY8Oehclhk5nqsngGq0ECrKkRwOxDAQ
+  ACCOUNT_BRIDGE_CONTROL_PLANE_ENDPOINT: https://acosmi.com/api/v4/account-bridge/control-plane/v2
+
+jobs:
+  verify-source:
+    name: Verify tagged pure-TUI source
+    if: github.repository == 'acosmi/CrabCode-TUI'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      build_id: ${{ steps.identity.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Bind tag, version, commit, and changelog
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || {
+            echo "::error::release tag is not canonical vSemVer: ${TAG}"; exit 1;
+          }
+          VERSION="${TAG#v}"
+          SOURCE_VERSION="$(node -p "require('./package.json').version")"
+          test "${VERSION}" = "${SOURCE_VERSION}" || {
+            echo "::error::tag ${TAG} does not match package.json ${SOURCE_VERSION}"; exit 1;
+          }
+          git show-ref --verify --quiet "refs/tags/${TAG}"
+          test "$(git rev-list -n 1 "refs/tags/${TAG}")" = "$(git rev-parse HEAD)" || {
+            echo "::error::checked-out commit is not ${TAG}"; exit 1;
+          }
+          grep -qE "^##[[:space:]]+v${VERSION//./\.}([[:space:]]|$)" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no v${VERSION} section"; exit 1;
+          }
+          BUILD_ID="${VERSION}+$(git rev-parse --short=12 HEAD)"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "build_id=${BUILD_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Assert installer encodings
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(head -c 3 scripts/install.ps1 | od -An -tx1 | tr -d ' \n')" = 'efbbbf'
+          test "$(head -c 3 scripts/install.sh | od -An -tx1 | tr -d ' \n')" != 'efbbbf'
+          sh -n scripts/install.sh
+
+      - name: Enforce repository boundary at the tag
+        run: node scripts/repository-boundary.mjs
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: verify-source
+    if: github.repository == 'acosmi/CrabCode-TUI'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: arm64-darwin
+            runner: macos-15
+          - platform: x64-darwin
+            runner: macos-15-intel
+          - platform: arm64-linux
+            runner: ubuntu-24.04-arm
+          - platform: x64-linux
+            runner: ubuntu-24.04
+          - platform: x64-win32
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates
+            libs/acosmi-memory
+
+      - name: Install Linux sandbox build dependency
+        if: contains(matrix.platform, 'linux')
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libseccomp-dev pkg-config
+
+      - name: Install exact JavaScript dependency graph
+        run: bun install --frozen-lockfile
+
+      - name: Parse the public PowerShell installer on Windows
+        if: matrix.platform == 'x64-win32'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [void][scriptblock]::Create(
+            [System.IO.File]::ReadAllText((Resolve-Path 'scripts/install.ps1'))
+          )
+
+      - name: Establish cross-language build identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CRABCODE_BUILD_ID=${{ needs.verify-source.outputs.build_id }}" >> "${GITHUB_ENV}"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Build closed TypeScript business runtime
+        run: bun run build:ts
+
+      - name: Build native Rust TUI product closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path crates/Cargo.toml \
+            -p crabcode-cli --bin crabcode-pure-tui-launcher
+          cargo build --locked --release --manifest-path crates/Cargo.toml \
+            -p crabcode-tui --bin crabcode-tui
+          cargo build --locked --release --manifest-path crates/Cargo.toml \
+            -p crabcode-cron --bin crabcode-cron
+          cargo build --locked --release --manifest-path libs/acosmi-memory/Cargo.toml \
+            --bin acosmi-memory-orchestrator
+
+      - name: Assemble, verify, and archive complete native package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun scripts/assemble-release.mjs \
+            --platform '${{ matrix.platform }}' \
+            --version '${{ needs.verify-source.outputs.version }}' \
+            --output-dir dist/release
+
+      - name: Verify package archive shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ needs.verify-source.outputs.version }}'
+          case '${{ matrix.platform }}' in
+            x64-win32) ASSET="dist/release/crabcode-${VERSION}-${{ matrix.platform }}.zip" ;;
+            *) ASSET="dist/release/crabcode-${VERSION}-${{ matrix.platform }}.tar.gz" ;;
+          esac
+          test -s "${ASSET}"
+          test "$(find dist/release -maxdepth 1 -type f -name 'crabcode-*' | wc -l | tr -d ' ')" = '1'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/release/crabcode-*.tar.gz
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-zip
+          path: dist/release/crabcode-*.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    name: Publish immutable GitHub Release
+    needs: [verify-source, build]
+    if: github.repository == 'acosmi/CrabCode-TUI'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Assemble exact public asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ needs.verify-source.outputs.version }}'
+          for name in \
+            "crabcode-${VERSION}-arm64-darwin.tar.gz" \
+            "crabcode-${VERSION}-x64-darwin.tar.gz" \
+            "crabcode-${VERSION}-arm64-linux.tar.gz" \
+            "crabcode-${VERSION}-x64-linux.tar.gz" \
+            "crabcode-${VERSION}-x64-win32.zip"; do
+            test -s "release-assets/${name}" || { echo "::error::missing ${name}"; exit 1; }
+          done
+          cp scripts/install.sh scripts/install.ps1 release-assets/
+          chmod 0755 release-assets/install.sh
+          (
+            cd release-assets
+            sha256sum \
+              "crabcode-${VERSION}-arm64-darwin.tar.gz" \
+              "crabcode-${VERSION}-x64-darwin.tar.gz" \
+              "crabcode-${VERSION}-arm64-linux.tar.gz" \
+              "crabcode-${VERSION}-x64-linux.tar.gz" \
+              "crabcode-${VERSION}-x64-win32.zip" \
+              install.sh install.ps1 \
+              > checksums-sha256.txt
+          )
+          test "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" = '8'
+
+      - name: Generate GitHub build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release-assets/crabcode-*.tar.gz
+            release-assets/crabcode-*.zip
+            release-assets/checksums-sha256.txt
+            release-assets/install.sh
+            release-assets/install.ps1
+
+      - name: Publish release and verify server-side digests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          VERSION='${{ needs.verify-source.outputs.version }}'
+          NOTES="${RUNNER_TEMP}/release-notes.md"
+          printf '%s\n' \
+            '# CrabCode TUI' \
+            '' \
+            '纯终端开源发行：Rust 核心底层 + TypeScript 业务运行时 + 隔离的 Go OAuth Account Bridge。' \
+            '' \
+            '- macOS/Linux arm64 与 x64、Windows x64 完整安装包' \
+            '- 安装器先校验 Release SHA-256，再校验包内逐文件清单' \
+            '- Account Bridge 验证签名来源、平台证据、SBOM 与第三方许可' \
+            '- 包含 Bun、ripgrep、crabcode-browser、Sharp/libvips 的固定版本和许可材料' \
+            '' \
+            '注册赠送 6 个月 GO 订阅会员；邀请好友可获得重置次数；模型与权益以线上服务实际展示为准。' \
+            '' \
+            'GUI 为独立产品：https://acosmi.com/zh/downloads' \
+            '' \
+            'Terminal-only open-source release with five native packages, fail-closed installers, per-file manifests, signed Account Bridge provenance, dependency licenses, and GitHub build attestation.' \
+            > "${NOTES}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release-assets/* --clobber
+            gh release edit "${TAG}" --title "CrabCode TUI ${VERSION}" --notes-file "${NOTES}" --latest
+          else
+            gh release create "${TAG}" release-assets/* \
+              --verify-tag --title "CrabCode TUI ${VERSION}" --notes-file "${NOTES}" --latest
+          fi
+          EXPECTED="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          ACTUAL="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets | length')"
+          test "${ACTUAL}" = "${EXPECTED}" || {
+            echo "::error::release asset count ${ACTUAL} != ${EXPECTED}"; exit 1;
+          }
+          BAD_DIGESTS=""
+          for attempt in 1 2 3 4 5 6; do
+            echo "server-side digest check ${attempt}/6"
+            BAD_DIGESTS="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+              --jq '.assets[] | select(.digest == null or (.digest | startswith("sha256:") | not)) | .name')"
+            [ -z "${BAD_DIGESTS}" ] && break
+            sleep 2
+          done
+          test -z "${BAD_DIGESTS}" || {
+            echo "::error::release assets without server-side SHA-256: ${BAD_DIGESTS}"; exit 1;
+          }
