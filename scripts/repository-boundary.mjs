@@ -423,12 +423,12 @@ if (!sourceOnly) {
     )
     compareSet('TypeScript files outside the executable TUI bundle', typeOnlySources, exactTypeOnlySources)
 
-    const tsc = resolve(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
+    const tsc = resolve(root, 'node_modules', 'typescript', 'bin', 'tsc')
     if (!existsSync(tsc)) {
       fail('local TypeScript compiler is missing; run bun install')
     } else {
       const listed = new Set(
-        run(tsc, ['-p', 'tsconfig.tui-runtime.json', '--listFilesOnly'])
+        run(process.execPath, [tsc, '-p', 'tsconfig.tui-runtime.json', '--listFilesOnly'])
           .split(/\r?\n/u)
           .map(path => path.trim())
           .filter(Boolean)
