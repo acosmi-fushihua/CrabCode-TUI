@@ -342,7 +342,9 @@ describe('item-specific direct-TUI setup authorities', () => {
   test('executes language, failed preflight, theme, onboarding API-key, security, and terminal authorities', async () => {
     i18n.setLocale('zh-CN')
     process.env.ACOSMI_API_KEY = 'authority-branch-key'
-    env.terminal = 'Apple_Terminal'
+    // Use a terminal supported on every host so this authority test does not
+    // accidentally depend on the CI runner's process.platform value.
+    env.terminal = 'vscode'
     const configAuthority = installConfigAuthority({
       theme: undefined,
       hasCompletedOnboarding: false,
