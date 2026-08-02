@@ -13,6 +13,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
@@ -695,19 +696,58 @@ function verifyPackageContract(packageDirectory, platformToken, version) {
   verifyManifest(packageDirectory)
 }
 
+function releaseTimestamp() {
+  const raw = process.env.SOURCE_DATE_EPOCH ?? ''
+  if (!/^[1-9][0-9]*$/u.test(raw)) fail('SOURCE_DATE_EPOCH must be a positive integer')
+  const seconds = Number(raw)
+  if (!Number.isSafeInteger(seconds)) fail('SOURCE_DATE_EPOCH is outside the safe integer range')
+  const timestamp = new Date(seconds * 1000)
+  const year = timestamp.getUTCFullYear()
+  if (Number.isNaN(timestamp.getTime()) || year < 1980 || year > 2107) {
+    fail('SOURCE_DATE_EPOCH is outside the portable ZIP timestamp range')
+  }
+  return timestamp
+}
+
+function tarOwnershipArguments() {
+  return process.platform === 'darwin'
+    ? ['--uid', '0', '--gid', '0', '--uname', 'root', '--gname', 'root']
+    : ['--owner=0', '--group=0', '--numeric-owner']
+}
+
 function createArchive(packageDirectory, outputDirectory, packageName, extension) {
   const archivePath = join(outputDirectory, `${packageName}.${extension}`)
+  const timestamp = releaseTimestamp()
+  const files = walkFiles(packageDirectory)
+  for (const path of files) utimesSync(path, timestamp, timestamp)
   rmSync(archivePath, { force: true })
   if (extension === 'zip') {
     const input = {}
-    for (const path of walkFiles(packageDirectory)) {
+    for (const path of files) {
       input[`${packageName}/${portable(relative(packageDirectory, path))}`] = new Uint8Array(readFileSync(path))
     }
-    writeFileSync(archivePath, zipSync(input, { level: 9 }))
+    writeFileSync(archivePath, zipSync(input, { level: 9, mtime: timestamp }))
   } else {
-    const result = spawnSync('tar', ['-czf', archivePath, '-C', outputDirectory, packageName], {
-      encoding: 'utf8',
-    })
+    const members = files.map(path => `${packageName}/${portable(relative(packageDirectory, path))}`)
+    if (members.some(member => member.includes('\n'))) fail('release member path contains a newline')
+    const result = spawnSync(
+      'tar',
+      [
+        ...tarOwnershipArguments(),
+        '--format=ustar',
+        '-czf',
+        archivePath,
+        '-C',
+        outputDirectory,
+        '-T',
+        '-',
+      ],
+      {
+        encoding: 'utf8',
+        input: `${members.join('\n')}\n`,
+        env: { ...process.env, COPYFILE_DISABLE: '1' },
+      },
+    )
     if (result.status !== 0) fail(`tar creation failed: ${result.stderr}`)
   }
   ensureRegularSource(archivePath, 'final release archive')

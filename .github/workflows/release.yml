@@ -173,10 +173,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          VERSION='${{ needs.verify-source.outputs.version }}'
+          PLATFORM='${{ matrix.platform }}'
           bun scripts/assemble-release.mjs \
-            --platform '${{ matrix.platform }}' \
-            --version '${{ needs.verify-source.outputs.version }}' \
+            --platform "${PLATFORM}" \
+            --version "${VERSION}" \
             --output-dir dist/release
+          case "${PLATFORM}" in
+            x64-win32) ASSET="dist/release/crabcode-${VERSION}-${PLATFORM}.zip" ;;
+            *) ASSET="dist/release/crabcode-${VERSION}-${PLATFORM}.tar.gz" ;;
+          esac
+          BASELINE='dist/release/.reproducibility-baseline'
+          cp "${ASSET}" "${BASELINE}"
+          bun scripts/assemble-release.mjs \
+            --platform "${PLATFORM}" \
+            --version "${VERSION}" \
+            --output-dir dist/release
+          cmp -s "${BASELINE}" "${ASSET}" || {
+            echo "::error::release archive is not byte-for-byte reproducible"; exit 1;
+          }
+          rm -f "${BASELINE}"
 
       - name: Verify package archive shape
         shell: bash
