@@ -925,25 +925,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn non_utf8_executable_path_probe_child() {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        if std::env::var_os("CRABCODE_BINARY_OS_TEST_PROBE").is_none() {
-            return;
-        }
-        let executable = std::env::current_exe().expect("current probe executable");
-        assert_eq!(
-            executable
-                .file_name()
-                .expect("probe executable filename")
-                .as_bytes(),
-            b"crabcode-\xff-probe",
-            "managed child was not started from the exact non-UTF-8 executable path",
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn non_utf8_environment_round_trips_through_managed_process() {
@@ -984,34 +965,30 @@ mod tests {
         use std::os::unix::ffi::OsStringExt as _;
 
         let temp = tempfile::tempdir().expect("temporary executable directory");
-        let copied_executable = temp
+        let executable = temp
             .path()
             .join(OsString::from_vec(b"crabcode-\xff-probe".to_vec()));
-        std::fs::copy(
-            std::env::current_exe().expect("current test executable"),
-            &copied_executable,
-        )
-        .expect("copy probe executable");
-        let mut permissions = std::fs::metadata(&copied_executable)
+        // A successful exec of this uniquely named script is the direct
+        // contract: lossy conversion would address a different pathname and
+        // fail before the script can return zero. Avoid current_exe() here;
+        // Linux procfs is not required to preserve the spelling used at exec.
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("write probe executable");
+        let mut permissions = std::fs::metadata(&executable)
             .expect("probe executable metadata")
             .permissions();
         {
             use std::os::unix::fs::PermissionsExt as _;
             permissions.set_mode(0o700);
         }
-        std::fs::set_permissions(&copied_executable, permissions).expect("make probe executable");
+        std::fs::set_permissions(&executable, permissions).expect("make probe executable");
 
         let mut config = make_config("binary-os-round-trip", RestartPolicy::Never);
         config.binary = "this-unicode-fallback-must-not-be-used".into();
-        config.binary_os = Some(copied_executable.into_os_string());
-        config.args = vec![
-            "--exact".into(),
-            "child::tests::non_utf8_executable_path_probe_child".into(),
-            "--nocapture".into(),
-        ];
-        config.env = HashMap::from([("CRABCODE_BINARY_OS_TEST_PROBE".into(), "1".into())]);
+        config.binary_os = Some(executable.into_os_string());
+        config.args.clear();
+        config.env.clear();
         config.inherit_parent_env = false;
-        config.stdio_policy = StdioPolicy::Captured;
+        config.stdio_policy = StdioPolicy::Silent;
 
         let mut process = ManagedProcess::new(config);
         process.spawn().await.expect("spawn non-UTF-8 executable");
