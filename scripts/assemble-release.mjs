@@ -492,9 +492,23 @@ function collectJavaScriptLicenses(packageDirectory) {
         fail(`reviewed JavaScript legal supplement no longer matches installed ${identity}`)
       }
       for (const legal of supplement.legalFiles) {
-        const source = resolve(repositoryRoot, legal.sourcePath)
-        if (!source.startsWith(join(repositoryRoot, 'third_party', 'javascript-legal-supplements'))) {
-          fail(`legal supplement escapes reviewed corpus: ${legal.sourcePath}`)
+        let source
+        if (legal.sourceOrigin === 'installed-package') {
+          source = resolve(packageRoot, legal.sourcePath)
+          if (source !== packageRoot && !source.startsWith(`${packageRoot}${sep}`)) {
+            fail(`installed legal material escapes ${identity}: ${legal.sourcePath}`)
+          }
+        } else if (
+          legal.sourceOrigin === 'reviewed-corpus'
+          || legal.sourceOrigin === 'maintainer-curated-standard-license'
+        ) {
+          const corpusRoot = join(repositoryRoot, 'third_party', 'javascript-legal-supplements')
+          source = resolve(repositoryRoot, legal.sourcePath)
+          if (source !== corpusRoot && !source.startsWith(`${corpusRoot}${sep}`)) {
+            fail(`legal supplement escapes reviewed corpus: ${legal.sourcePath}`)
+          }
+        } else {
+          fail(`unsupported legal material origin for ${identity}: ${legal.sourceOrigin}`)
         }
         ensureRegularSource(source, `${identity} legal supplement`)
         if (statSync(source).size !== legal.size || sha256File(source) !== legal.sha256) {
