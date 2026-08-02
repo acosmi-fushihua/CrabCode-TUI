@@ -23,6 +23,7 @@ const sourceRepository = 'https://github.com/acosmi/CrabCode-TUI'
 const bunVersion = '1.3.11'
 const ripgrepVersion = '14.1.1'
 const browserVersion = '0.28.0'
+// The signed Go Account Bridge component has an independent release lineage.
 const accountBridgeRelease = 'v1.0.21'
 const accountBridgeArtifactKey = '15MaLfvECwoagY8Oehclhk5nqsngGq0ECrKkRwOxDAQ'
 const accountBridgeLockSha256 = '449fa63b0d3a276a99250b2e2158d8f5769b86571388475e8c88e72858e20c85'

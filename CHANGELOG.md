@@ -1,6 +1,6 @@
 # Changelog / 更新日志
 
-## v1.0.21 — 2026-08-02
+## v1.0.22 — 2026-08-02
 
 - Established a source-only, open-source baseline for the native CrabCode TUI.
 - Removed GUI, AppServer, shared-application communication, archived source,
