@@ -1,5 +1,45 @@
 # Changelog / 更新日志
 
+## v1.0.27 — 2026-08-03
+
+- Forward-fixes the failed, unpublished `v1.0.26` tag without moving, deleting,
+  rerunning, or creating a Release for it. The single `v1.0.26` workflow run
+  passed signed-source verification, the native Intel preflight, and all 100
+  package replays on four platforms; Windows was cancelled at its 180-minute
+  job limit before publishing any asset.
+- Separates child execution deadlines from stdout/stderr drain deadlines in the
+  release-package observer. The verifier can no longer block forever after a
+  parent exits or is terminated while pipe EOF remains unavailable.
+- On execution timeout, terminates the complete Windows process tree with
+  `taskkill /T /F`, bounds the final pipe drain, then fails with captured output
+  instead of waiting indefinitely.
+- Permits a bounded open-pipe recovery only for the packaged launcher and only
+  after exit code zero, a complete newline-terminated JSON contract, and empty
+  stderr.
+  The subsequent Memory identity, promotion, package-process exit, and isolation
+  checks remain mandatory; every other open-pipe condition is fail-closed.
+- Adds real parent/descendant process regressions for authorized inherited
+  handles, unauthorized handles, and timeout cleanup, plus per-iteration start
+  and completion evidence. Product runtime, protocol, SDK `2.15.0`, Gateway,
+  installers, configuration, sessions, and package layout remain unchanged.
+
+---
+
+- 对失败且未公开的 `v1.0.26` 标签执行前滚修复；不移动、不删除、不重跑，也不为其
+  补建 Release。唯一一次 `v1.0.26` 流水线已通过签名源码校验、原生 Intel 预检，
+  并在四个平台跑满各 100 次正式包回放；Windows 在任何资产发布前达到 180 分钟
+  作业上限并被取消。
+- 将发布包观察器中的“子进程执行期限”和“stdout/stderr 排空期限”彻底分离。父进程
+  已退出或被终止但管道 EOF 仍不可用时，验证器也不再无限阻塞。
+- 执行超时时，Windows 使用 `taskkill /T /F` 终止完整进程树，再以独立期限排空并
+  取消管道，最后携带已捕获输出失败，不再无界等待。
+- 仅对正式包 launcher 接纳有界的未关闭管道恢复，而且必须同时满足退出码为零、
+  stdout 是完整换行结尾 JSON 契约、stderr 为空；后续 Memory 身份、promotion、包内
+  进程退出和隔离检查仍全部强制执行，其他未关闭管道仍全部 fail-closed。
+- 新增真实父/后代进程回归，覆盖授权继承句柄、未授权句柄与超时回收，并逐轮记录
+  开始/完成证据。产品 runtime、协议、SDK `2.15.0`、Gateway、安装器、配置、会话和
+  包布局均不改变。
+
 ## v1.0.26 — 2026-08-03
 
 - Forward-fixes the failed, unpublished `v1.0.25` tag without moving, deleting,

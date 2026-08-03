@@ -213,7 +213,112 @@ function snapshotPathSummary(snapshot) {
   }
 }
 
-async function runProcess(command, args, options = {}) {
+function createTextCapture(stream) {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  let cancelled = false
+  let settled = false
+  const completion = (async () => {
+    try {
+      while (true) {
+        const read = await reader.read()
+        if (read.done) break
+        text += decoder.decode(read.value, { stream: true })
+      }
+      text += decoder.decode()
+      return { closed: !cancelled }
+    } finally {
+      settled = true
+      try {
+        reader.releaseLock()
+      } catch {
+        // A cancelled stream may already have released the reader.
+      }
+    }
+  })()
+  completion.catch(() => {})
+
+  return {
+    completion,
+    snapshot: () => text,
+    cancel: async reason => {
+      if (settled) return
+      cancelled = true
+      try {
+        await reader.cancel(reason)
+      } catch {
+        // The stream may close between the deadline and cancellation.
+      }
+      await Promise.allSettled([completion])
+    },
+  }
+}
+
+async function collectProcessText(captures, timeoutMs) {
+  let timer
+  const outcome = await Promise.race([
+    Promise.all(captures.map(capture => capture.completion)).then(
+      results => ({ type: 'complete', results }),
+      error => ({ type: 'error', error }),
+    ),
+    new Promise(resolveTimeout => {
+      timer = setTimeout(
+        () => resolveTimeout({ type: 'timeout' }),
+        timeoutMs,
+      )
+    }),
+  ])
+  clearTimeout(timer)
+
+  if (outcome.type === 'error') {
+    await Promise.all(captures.map(capture => capture.cancel(outcome.error)))
+    throw outcome.error
+  }
+  if (outcome.type === 'timeout') {
+    await Promise.all(
+      captures.map(capture =>
+        capture.cancel(new Error(`stdio drain exceeded ${timeoutMs}ms`)),
+      ),
+    )
+    return {
+      closed: false,
+      texts: captures.map(capture => capture.snapshot()),
+    }
+  }
+  return {
+    closed: outcome.results.every(result => result.closed),
+    texts: captures.map(capture => capture.snapshot()),
+  }
+}
+
+function terminateTimedOutProcess(child) {
+  if (process.platform === 'win32' && Number.isSafeInteger(child.pid)) {
+    const result = spawnSync(
+      'taskkill',
+      ['/PID', String(child.pid), '/T', '/F'],
+      {
+        encoding: 'utf8',
+        timeout: 10_000,
+        windowsHide: true,
+      },
+    )
+    if (result.status === 0) return 'taskkill-tree'
+  }
+  try {
+    child.kill()
+    return 'child-kill'
+  } catch {
+    return 'already-exited'
+  }
+}
+
+function diagnosticTail(value) {
+  const limit = 4 * 1024
+  return value.length <= limit ? value : `<truncated>${value.slice(-limit)}`
+}
+
+export async function runProcess(command, args, options = {}) {
   const child = Bun.spawn({
     cmd: [command, ...args],
     cwd: options.cwd,
@@ -222,23 +327,68 @@ async function runProcess(command, args, options = {}) {
     stdout: 'pipe',
     stderr: 'pipe',
   })
-  const stdoutPromise = new Response(child.stdout).text()
-  const stderrPromise = new Response(child.stderr).text()
+  const stdoutCapture = createTextCapture(child.stdout)
+  const stderrCapture = createTextCapture(child.stderr)
   let timer
+  const timeoutMs = options.timeoutMs ?? 60_000
   const outcome = await Promise.race([
-    child.exited.then(code => ({ code })),
+    child.exited.then(
+      code => ({ type: 'exit', code }),
+      error => ({ type: 'exit-error', error }),
+    ),
     new Promise(resolveTimeout => {
-      timer = setTimeout(() => resolveTimeout({ timeout: true }), options.timeoutMs ?? 60_000)
+      timer = setTimeout(() => resolveTimeout({ type: 'timeout' }), timeoutMs)
     }),
   ])
   clearTimeout(timer)
-  if (outcome.timeout) child.kill()
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
-  if (outcome.timeout) fail(`${basename(command)} timed out`)
+  const termination = outcome.type === 'timeout' ? terminateTimedOutProcess(child) : null
+  let captured
+  try {
+    captured = await collectProcessText(
+      [stdoutCapture, stderrCapture],
+      options.streamDrainTimeoutMs ?? 5_000,
+    )
+  } catch (error) {
+    fail(
+      `${basename(command)} output capture failed: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+  const [stdout, stderr] = captured.texts
+  if (outcome.type === 'timeout') {
+    fail(
+      `${basename(command)} timed out after ${timeoutMs}ms; termination=${termination}; stdout=${diagnosticTail(stdout)}; stderr=${diagnosticTail(stderr)}`,
+    )
+  }
+  if (outcome.type === 'exit-error') {
+    fail(
+      `${basename(command)} exit observation failed: ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}; stdout=${diagnosticTail(stdout)}; stderr=${diagnosticTail(stderr)}`,
+    )
+  }
   if (outcome.code !== 0) {
     fail(`${basename(command)} exited ${outcome.code}: ${stderr.trim() || stdout.trim()}`)
   }
-  return { pid: child.pid, stdout, stderr }
+  if (!captured.closed) {
+    if (!options.allowInheritedPipeHandles) {
+      fail(
+        `${basename(command)} exited 0 but descendant processes kept stdio open; stdout=${diagnosticTail(stdout)}; stderr=${diagnosticTail(stderr)}`,
+      )
+    }
+    if (!stdout.endsWith(options.requiredStdoutSuffix ?? '\n')) {
+      fail(`${basename(command)} left stdio open before stdout completed its contract`)
+    }
+    if (options.requireEmptyStderrWhenPipesOpen !== false && stderr.length > 0) {
+      fail(
+        `${basename(command)} left stdio open with stderr: ${diagnosticTail(stderr)}`,
+      )
+    }
+  }
+  return { pid: child.pid, stdout, stderr, streamsClosed: captured.closed }
+}
+
+function writeIterationPhase(iteration, phase, detail = '') {
+  process.stderr.write(
+    `release package smoke phase: ${iteration} ${phase}${detail ? ` ${detail}` : ''}\n`,
+  )
 }
 
 function fnv1a32(value) {
@@ -485,9 +635,13 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
   const baseEnvironment = { ...process.env, ...options.extraEnvironment }
   let promotionAcknowledged = false
   try {
+    writeIterationPhase(iteration, 'launcher-start')
     const launcherResult = await runProcess(launcher, ['__release-package-smoke'], {
       cwd: packageRoot,
       timeoutMs: 30_000,
+      streamDrainTimeoutMs: 500,
+      allowInheritedPipeHandles: true,
+      requiredStdoutSuffix: '\n',
       env: {
         ...baseEnvironment,
         CRABCODE_CONFIG_DIR: stateRoot,
@@ -504,7 +658,13 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
     ) {
       fail(`packaged Rust replay returned an invalid result: ${launcherResult.stdout}`)
     }
+    writeIterationPhase(
+      iteration,
+      'launcher-complete',
+      `stdio=${launcherResult.streamsClosed ? 'closed' : 'bounded-cancel'}`,
+    )
 
+    writeIterationPhase(iteration, 'runtime-start')
     const runtimeResult = await runProcess(packagedBun, [join(repositoryRoot, 'scripts/tui-runtime-smoke.mjs')], {
       cwd: packageRoot,
       timeoutMs: 60_000,
@@ -518,6 +678,7 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
     if (runtime.turns !== '2/2 success' || runtime.endSession !== 'success') {
       fail(`packaged TypeScript runtime did not complete two turns: ${runtimeResult.stdout}`)
     }
+    writeIterationPhase(iteration, 'runtime-complete')
 
     const identity = await endpointRequest(endpoint, { method: 'memory.ping' })
     if (
@@ -528,6 +689,7 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
     ) {
       fail(`packaged Memory identity is invalid: ${JSON.stringify(identity)}`)
     }
+    writeIterationPhase(iteration, 'memory-ping-complete')
     const promotion = await endpointRequest(endpoint, {
       method: 'memory.coordinator.promote',
       payload: {
@@ -544,14 +706,21 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
       fail(`Memory promotion was not acknowledged: ${JSON.stringify(promotion)}`)
     }
     promotionAcknowledged = true
+    writeIterationPhase(iteration, 'memory-promotion-acknowledged')
     await waitForPackageProcessesToExit(ownershipRoot, endpoint, 10_000)
+    writeIterationPhase(iteration, 'package-processes-exited')
   } finally {
-    if (!promotionAcknowledged) await terminateOwnedProcesses(ownershipRoot)
+    if (!promotionAcknowledged) {
+      writeIterationPhase(iteration, 'failure-cleanup-start')
+      await terminateOwnedProcesses(ownershipRoot)
+      writeIterationPhase(iteration, 'failure-cleanup-complete')
+    }
     rmSync(stateRoot, { recursive: true, force: true })
   }
   if (existsSync(stateRoot)) fail(`iteration state root survived cleanup: ${stateRoot}`)
   const lingering = listPackageProcesses(ownershipRoot)
   if (lingering.length > 0) fail(`package processes survived iteration ${iteration}: ${JSON.stringify(lingering)}`)
+  writeIterationPhase(iteration, 'isolation-cleanup-complete')
 }
 
 async function runInstallerSmoke(archive, installer, version, scratchRoot, baseEnvironment) {
@@ -652,9 +821,15 @@ async function main() {
     packageRoot = extractArchive(args.archive, extractRoot)
     const manifest = verifyManifest(packageRoot)
     for (let iteration = 1; iteration <= args.iterations; iteration += 1) {
+      process.stderr.write(
+        `release package smoke iteration start: ${iteration}/${args.iterations}\n`,
+      )
       await runIteration(packageRoot, scratchRoot, iteration, {
         extraEnvironment: isolatedEnvironment,
       })
+      process.stderr.write(
+        `release package smoke iteration complete: ${iteration}/${args.iterations}\n`,
+      )
       if (iteration % 10 === 0 || iteration === args.iterations) {
         process.stderr.write(`release package smoke progress: ${iteration}/${args.iterations}\n`)
       }
