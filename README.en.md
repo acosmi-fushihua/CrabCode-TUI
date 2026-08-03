@@ -17,16 +17,54 @@ CrabCode TUI is CrabCode's terminal-only open-source edition. Rust owns the term
 macOS / Linux:
 
 ```bash
-curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.sh | sh
+VERSION=v1.0.23
+case "$(uname -m)-$(uname -s)" in
+  arm64-Darwin|aarch64-Darwin) PLATFORM=arm64-darwin ;;
+  x86_64-Darwin|amd64-Darwin) PLATFORM=x64-darwin ;;
+  arm64-Linux|aarch64-Linux) PLATFORM=arm64-linux ;;
+  x86_64-Linux|amd64-Linux) PLATFORM=x64-linux ;;
+  *) echo "unsupported platform" >&2; exit 1 ;;
+esac
+ASSET="crabcode-${VERSION#v}-${PLATFORM}.tar.gz"
+VERIFIED_DIR="$(mktemp -d)"
+gh release download "$VERSION" --repo acosmi/CrabCode-TUI --dir "$VERIFIED_DIR" \
+  --pattern install.sh --pattern checksums-sha256.txt --pattern "$ASSET"
+for FILE in "$VERIFIED_DIR/install.sh" "$VERIFIED_DIR/checksums-sha256.txt" "$VERIFIED_DIR/$ASSET"; do
+  gh attestation verify "$FILE" --repo acosmi/CrabCode-TUI \
+    --source-ref "refs/tags/$VERSION" \
+    --signer-workflow github.com/acosmi/CrabCode-TUI/.github/workflows/release.yml
+done
+CRABCODE_VERSION="$VERSION" CRABCODE_ASSET_DIR="$VERIFIED_DIR" sh "$VERIFIED_DIR/install.sh"
+rm -rf "$VERIFIED_DIR"
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex
+$Version = 'v1.0.23'
+$Asset = "crabcode-$($Version.TrimStart('v'))-x64-win32.zip"
+$VerifiedDir = Join-Path $env:TEMP "crabcode-verified-$([Guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $VerifiedDir | Out-Null
+gh release download $Version --repo acosmi/CrabCode-TUI --dir $VerifiedDir `
+  --pattern install.ps1 --pattern checksums-sha256.txt --pattern $Asset
+@('install.ps1', 'checksums-sha256.txt', $Asset) | ForEach-Object {
+  gh attestation verify (Join-Path $VerifiedDir $_) --repo acosmi/CrabCode-TUI `
+    --source-ref "refs/tags/$Version" `
+    --signer-workflow github.com/acosmi/CrabCode-TUI/.github/workflows/release.yml
+  if ($LASTEXITCODE -ne 0) { throw "attestation verification failed: $_" }
+}
+$env:CRABCODE_VERSION = $Version
+$env:CRABCODE_ASSET_DIR = $VerifiedDir
+& (Join-Path $VerifiedDir 'install.ps1')
+Remove-Item Env:CRABCODE_VERSION, Env:CRABCODE_ASSET_DIR
+Remove-Item -LiteralPath $VerifiedDir -Recurse -Force
 ```
 
-Complete platform archives are also available from [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest). They bundle `crabcode`, the native TUI, Bun, memory and cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge, so users do not need a separate Rust, Bun, or Go toolchain. Installers verify the release SHA-256 and then the package's per-file manifest. Supported targets are macOS/Linux arm64 and x64, plus Windows x64.
+This primary flow pins a version and verifies GitHub build provenance for the installer, checksum list, and current-platform archive before executing anything. Local-asset mode performs no further network access. It requires an installed and authenticated [GitHub CLI `gh`](https://cli.github.com/). Archives bundle `crabcode`, the native TUI, Bun, memory and cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge, so users do not need a separate Rust, Bun, or Go toolchain. Installers additionally verify the release SHA-256 and package per-file manifest. Supported targets are macOS/Linux arm64 and x64, plus Windows x64.
+
+The mutable `latest/download/install.sh | sh` and `install.ps1 | iex` routes remain executable for old automation, but their bootstrap source cannot be authenticated before execution and they are not the recommended install path.
+
+The open-source TUI and GUI have separate programs, installation roots, and release chains. For state isolation during same-machine testing or multi-product use, set `CRABCODE_CONFIG_DIR` to an absolute dedicated directory; the same authority covers Rust, TypeScript, memory, cron, and renderer diagnostics. Upgrades retain the historical default state location so existing TUI sessions and settings are not silently abandoned.
 
 ### GUI (separate product, not open-sourced here)
 
@@ -110,6 +148,18 @@ The maintainers' long-term destination is an **all-Rust product runtime**. That 
 - Remove Bun or Go only after parity, regression coverage, and rollback paths are complete.
 
 The TypeScript and Go code are therefore supported production transition implementations, not archived code.
+
+Migration is delivered by frozen behavioral boundary rather than mechanical file-by-file rewriting. The current TypeScript-to-Rust implementation register is:
+
+| Behavioral boundary | TypeScript authority | Rust parity owner / migration destination |
+| --- | --- | --- |
+| StructuredIO, process lifecycle, backpressure, correlation, shutdown | `src/entrypoints/sdk`, `src/cli/structuredIO.ts` | `crates/crabcode-tui/src/sdk_runtime.rs`, `runtime_host.rs` |
+| Message, stream, progress, attachment, and result projection | `src/types`, `src/Tool.ts` | `sdk_projection.rs`, `scrollback_projection.rs`, `agent_view.rs` |
+| Startup, workspace trust, onboarding, and session picking | `src/cli/crabcodeTuiBridgeProtocol.ts` | `tui_app.rs`, `session_picker.rs`, `terminal.rs` |
+| Model, account, usage, plugin, and retained commands | `src/cli/directTui*Actions.ts` | `sdk_runtime.rs`, `model_management.rs`, `usage_plugin_management.rs`, `retained_command_surface.rs` |
+| Terminal input, drawing, suspend/resume, and exit | TS supplies business events only | `app_event_loop.rs`, `terminal.rs`, `tui_app.rs`, `tui_ui.rs` |
+
+`bun run check:capabilities` expands the current public and process-private TypeScript unions with the TypeScript compiler and generates `crates/crabcode-tui/src/generated_renderer_contract.rs`. Every protocol family records an explicit `rustOwner`; adding a TS branch without a reviewed Rust owner fails the check or native tests instead of creating silent migration drift.
 
 ## Included source
 

@@ -128,7 +128,7 @@ describe('pure TUI native generation lifecycle source contract', () => {
     for (const path of [
       'dist/tui-runtime/index.js',
       'release-manifest.json',
-      'release-manifest.sig',
+      'release-manifest.digest.json',
     ]) {
       expect(validation).toContain(path)
     }

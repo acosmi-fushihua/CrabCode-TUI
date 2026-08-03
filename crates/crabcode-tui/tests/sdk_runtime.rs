@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 use sdk_runtime::{
     EnvelopeClass, OutboundCompletion, OutboundSubmitError, RequestCorrelation, RuntimeConfig,
-    RuntimeEvent, SdkRuntime, SendError, SendTimeoutStage, ShutdownError, SpawnError,
-    SystemSubtype, TransportLimits,
+    RuntimeEvent, SdkRuntime, SendError, SendTimeoutStage, ShutdownError, ShutdownOutcome,
+    SpawnError, SystemSubtype, TransportLimits,
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -83,6 +83,22 @@ case "$mode" in
             printf '{"type":"user","message":{"role":"user","content":"%s-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}\n' "$index"
             index=$((index + 1))
         done
+        read_stdin
+        ;;
+    long-stream)
+        # Emit a sustained task stream on the data lane while the parent keeps
+        # servicing health, interrupt, and shutdown requests on stdin. Every
+        # line stays below PIPE_BUF so the two writers cannot splice JSON.
+        (
+            index=0
+            while [ "$index" -lt 4096 ]; do
+                printf '{"type":"keep_alive","task":"long-stream","index":%s,"payload":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}\n' "$index"
+                index=$((index + 1))
+                if [ $((index % 64)) -eq 0 ]; then
+                    sleep 0.005
+                fi
+            done
+        ) &
         read_stdin
         ;;
     unknown-top)
@@ -826,6 +842,84 @@ fn bounded_queue_applies_backpressure_without_loss_or_reordering() {
 }
 
 #[test]
+fn sustained_long_task_stream_stays_ordered_bounded_and_control_responsive() {
+    let fixture = Fixture::create();
+    let mut config = fixture.config("long-stream");
+    config.limits.max_stdout_frame_bytes = 512;
+    config.limits.stdout_event_capacity = 8;
+    config.limits.stdout_queue_bytes = 2 * 1024;
+    config.limits.writer_capacity = 2;
+    let mut runtime = SdkRuntime::spawn(config).expect("spawn long-stream runtime");
+
+    let mut stream_count = 0_u64;
+    let mut next_health_probe = 512_u64;
+    let mut matched_health_probes = 0_u64;
+    while stream_count < 4096 || matched_health_probes < 8 {
+        let raw = envelope(recv(&runtime));
+        match raw.value.get("type").and_then(Value::as_str) {
+            Some("keep_alive") => {
+                assert_eq!(raw.value["task"], "long-stream");
+                assert_eq!(raw.value["index"].as_u64(), Some(stream_count));
+                stream_count += 1;
+                if stream_count == next_health_probe {
+                    let request_id = format!("long-stream-health-{stream_count}");
+                    let delivery_id = runtime
+                        .submit_private_runtime_action(
+                            request_id,
+                            json!({"kind":"health_snapshot"}),
+                        )
+                        .expect("health probe must enter the bounded control lane");
+                    let completion = recv_outbound_completions(&runtime, 1, Duration::from_secs(2))
+                        .pop()
+                        .expect("health probe writer completion");
+                    assert_eq!(completion.id, delivery_id);
+                    completion.result.expect("health probe writer ACK");
+                    next_health_probe += 512;
+                }
+            }
+            Some("crabcode_tui_runtime_result") => {
+                assert!(matches!(
+                    raw.classification,
+                    EnvelopeClass::PrivateRuntimeResult {
+                        ref result_kind,
+                        validation_error: None,
+                        ..
+                    } if result_kind.as_deref() == Some("health_snapshot")
+                ));
+                assert!(matches!(
+                    raw.correlation,
+                    Some(RequestCorrelation::PrivateRuntimeResultMatched {
+                        ref action_kind,
+                        ..
+                    }) if action_kind == "health_snapshot"
+                ));
+                matched_health_probes += 1;
+            }
+            observed => panic!("unexpected long-stream event type: {observed:?}"),
+        }
+    }
+
+    assert_eq!(stream_count, 4096);
+    assert_eq!(matched_health_probes, 8);
+    let interrupt = runtime
+        .interrupt("long-stream-interrupt")
+        .expect("interrupt remains writable after sustained output");
+    assert_eq!(interrupt.value["request"]["subtype"], "interrupt");
+    let interrupt_response = envelope(recv(&runtime));
+    assert!(matches!(
+        interrupt_response.correlation,
+        Some(RequestCorrelation::OutboundResponseMatched {
+            ref request_id,
+            ref request_subtype,
+        }) if request_id == "long-stream-interrupt" && request_subtype == "interrupt"
+    ));
+
+    runtime
+        .shutdown("end-long-stream", Some("soak-complete"))
+        .expect("long-stream graceful shutdown");
+}
+
+#[test]
 fn dropping_with_a_full_bounded_queue_terminates_without_deadlock() {
     let fixture = Fixture::create();
     let mut config = fixture.config("backpressure");
@@ -1180,9 +1274,12 @@ fn interrupt_and_shutdown_use_correlated_control_requests() {
             ref request_subtype
         }) if request_id == "interrupt-1" && request_subtype == "interrupt"
     ));
-    runtime
-        .shutdown("end-interrupt", Some("test_complete"))
-        .expect("graceful shutdown");
+    assert_eq!(
+        runtime
+            .shutdown("end-interrupt", Some("test_complete"))
+            .expect("graceful shutdown"),
+        ShutdownOutcome::Graceful
+    );
     let end_response = envelope(recv(&runtime));
     assert_eq!(
         end_response.value,
@@ -1206,6 +1303,12 @@ fn interrupt_and_shutdown_use_correlated_control_requests() {
         recv(&runtime),
         RuntimeEvent::ChildExited(ref exit) if exit.expected && exit.success
     ));
+    assert_eq!(
+        runtime
+            .shutdown("end-interrupt-repeat", Some("test_complete"))
+            .expect("repeated shutdown is idempotent"),
+        ShutdownOutcome::AlreadyStopped
+    );
 
     let sent = Fixture::read_lines(&fixture.stdin)
         .into_iter()
@@ -1229,6 +1332,30 @@ fn interrupt_and_shutdown_use_correlated_control_requests() {
                 }
             })
         ]
+    );
+}
+
+#[test]
+fn shutdown_after_protocol_abort_is_idempotent_and_sends_no_end_session() {
+    let fixture = Fixture::create();
+    let mut runtime = SdkRuntime::spawn(fixture.config("interrupt")).expect("spawn runtime");
+    runtime.abort_nonblocking("test protocol root failure".to_string());
+    assert_eq!(
+        runtime
+            .shutdown("unused-after-abort", Some("test"))
+            .expect("aborting shutdown is already terminal"),
+        ShutdownOutcome::AlreadyStopped
+    );
+    assert_eq!(
+        runtime
+            .shutdown("unused-after-stop", Some("test"))
+            .expect("stopped shutdown remains idempotent"),
+        ShutdownOutcome::AlreadyStopped
+    );
+    let captured_stdin = std::fs::read_to_string(&fixture.stdin).unwrap_or_default();
+    assert!(
+        captured_stdin.is_empty(),
+        "an aborting runtime must not receive a second end_session command: {captured_stdin}"
     );
 }
 
@@ -1853,6 +1980,7 @@ fn complete_backend_adapter_nonroute_critical_contracts_are_lossless() {
         );
     }
 
+    let projected_item_count_before_future_event = projection.items().len();
     let future_event = json!({
         "type":"stream_event",
         "uuid":"future-event",
@@ -1862,15 +1990,21 @@ fn complete_backend_adapter_nonroute_critical_contracts_are_lossless() {
     });
     assert_eq!(
         projection.ingest(raw(200, future_event.clone())),
-        ProjectionEffect::None
+        ProjectionEffect::CompatibilityFault {
+            sequence: 200,
+            event_type: "future_stream_event".to_string(),
+            code: "unknown_stream_event".to_string(),
+        }
     );
     assert_eq!(
         projection.raw_envelopes().last().map(|entry| &entry.value),
         Some(&future_event)
     );
-    assert!(projection.items().iter().any(|item| {
-        item.title == "Renderer compatibility" && item.text.contains("future_stream_event")
-    }));
+    assert_eq!(
+        projection.items().len(),
+        projected_item_count_before_future_event,
+        "unknown presentation events are diagnosed by the typed effect without inventing transcript content"
+    );
 
     let future_delta = json!({
         "type":"stream_event",

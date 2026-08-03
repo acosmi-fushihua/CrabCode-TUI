@@ -672,21 +672,21 @@ function inventoryFiles(packageDirectory, excluded = new Set()) {
 
 function verifyManifest(packageDirectory) {
   const manifestPath = join(packageDirectory, 'release-manifest.json')
-  const signaturePath = join(packageDirectory, 'release-manifest.sig')
+  const digestPath = join(packageDirectory, 'release-manifest.digest.json')
   const manifest = jsonFile(manifestPath)
-  const signature = jsonFile(signaturePath)
+  const digest = jsonFile(digestPath)
   if (
-    signature.schemaVersion !== 1 ||
-    signature.scheme !== 'sha256' ||
-    signature.manifestSha256 !== sha256File(manifestPath)
+    digest.schemaVersion !== 1 ||
+    digest.scheme !== 'sha256' ||
+    digest.manifestSha256 !== sha256File(manifestPath)
   ) {
-    fail('release-manifest.sig does not bind release-manifest.json')
+    fail('release-manifest.digest.json does not bind release-manifest.json')
   }
   const expected = manifest.files
   if (!Array.isArray(expected) || expected.length === 0) fail('release manifest has no files')
   const actual = inventoryFiles(
     packageDirectory,
-    new Set(['release-manifest.json', 'release-manifest.sig']),
+    new Set(['release-manifest.json', 'release-manifest.digest.json']),
   )
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     fail('release package file inventory differs from release-manifest.json')
@@ -710,7 +710,7 @@ function verifyPackageContract(packageDirectory, platformToken, version) {
     'build-id',
     'release-materials.json',
     'release-manifest.json',
-    'release-manifest.sig',
+    'release-manifest.digest.json',
     'LICENSE',
     'OPEN_SOURCE.md',
     'OPEN_SOURCE.zh-CN.md',
@@ -1027,11 +1027,11 @@ async function main() {
   }
   const manifestPath = join(packageDirectory, 'release-manifest.json')
   writeJson(manifestPath, manifest)
-  writeJson(join(packageDirectory, 'release-manifest.sig'), {
+  writeJson(join(packageDirectory, 'release-manifest.digest.json'), {
     schemaVersion: 1,
     scheme: 'sha256',
     manifestSha256: sha256File(manifestPath),
-    trustAnchor: 'The installer authenticates the containing archive against checksums-sha256.txt from the same immutable GitHub Release tag.',
+    bindingScope: 'Package-internal integrity only; release authenticity is established by the verified GitHub artifact attestation before installation.',
   })
 
   verifyPackageContract(packageDirectory, args.platform, args.version)

@@ -1,10 +1,10 @@
 import {
   Client,
+  classifySourcesEvent,
   EventComplete,
   EventError,
   discover,
   getAdapterForModel,
-  parseSourcesEvent,
   revokeToken,
   // SDK 真值源 type 名 → 本地 alias rename。SDK 端 export 名按上游约定保留；
   // 本仓内 caller 一律使用 AcosmiResponse。
@@ -18,6 +18,7 @@ import {
   type TokenSet,
   type WSConfig,
 } from '@acosmi/sdk-ts'
+import type { NormalizedAcosmiChatStreamEvent } from '../../types/api-types.js'
 import { assertRuntimeModel } from '../../utils/model/runtimeModelResolution.js'
 import { isNonGatewayModelReference } from '../../utils/model/nonGatewayModelReference.js'
 import { getOauthConfig } from '../../constants/oauth.js'
@@ -437,7 +438,7 @@ export interface AuthStatus {
  * Recover the effective scopes for one completed OAuth transaction.
  *
  * RFC 6749 §5.1 permits a token response to omit `scope` when the granted
- * scopes are identical to the request. SDK 2.12.0 represents that omission as
+ * scopes are identical to the request. SDK 2.15.0 represents that omission as
  * an empty TokenSet scope string, so getAuthStatus() projects an empty array.
  * The direct login adapters still own the exact scopes they requested and may
  * restore only that known value; a non-empty server response remains
@@ -815,9 +816,9 @@ export async function chatComplete(
 
 /**
  * SDK Client.chatMessagesStream — 流式聊天 (SSE async iterable).
- * SDK 返回 raw SSE event {event, data}; 此处 JSON.parse(data) 转 SDK 原生
- * BetaRawMessageStreamEvent 形态，并保留 SDK 2.12 声明的 sources 事件两种
- * 等价编码。同时提供 .controller
+ * SDK 返回 raw SSE event {event, data}; 此处通过 SDK 2.15 的四态分类器
+ * 归一成 NormalizedAcosmiChatStreamEvent，并明确丢弃合法零来源和损坏的
+ * 可选来源事件。同时提供 .controller
  * (AbortController) 兼容 queryModel.ts:1313 的 'controller' in stream 检查.
  */
 export interface ChatStreamAdapter {
@@ -857,12 +858,10 @@ export function chatStreamAdapter(
 }
 
 /**
- * Preserve the JSON payload emitted by the locked SDK chat stream while
- * restoring the one discriminator which can legally live only in the SSE
- * event name. `@acosmi/sdk-ts` 2.12.0 `parseSourcesEvent` accepts both
- * `{type:"sources", ...}` payloads and `event:sources` + `{sources:[...]}`.
- * QueryEngine's raw stream contract requires the payload discriminator, so
- * the second source-declared form receives that exact discriminator here.
+ * Preserve ordinary JSON payloads while routing every candidate sources event
+ * through the SDK's authoritative four-state classifier. Empty sources are a
+ * presentation no-op. Malformed sources are bounded compatibility faults and
+ * never reach StructuredIO. Non-sources invalid JSON stops only the turn.
  *
  * This is an application-internal adapter. It does not add a backend, public
  * SDK, or control-protocol event.
@@ -871,24 +870,64 @@ export function chatStreamAdapter(
  */
 export function normalizeAcosmiChatStreamEvent(
   evt: StreamEvent,
-): unknown | undefined {
-  if (!evt.data) return undefined
-  try {
-    const parsed = JSON.parse(evt.data) as unknown
-    if (
-      typeof parsed === 'object' &&
-      parsed !== null &&
-      !Array.isArray(parsed) &&
-      typeof (parsed as { type?: unknown }).type !== 'string' &&
-      parseSourcesEvent(evt) !== null
-    ) {
-      return { ...parsed, type: 'sources' }
-    }
-    return parsed
-  } catch {
-    // SDK SSE event with non-JSON data is unexpected; skip silently.
-    return undefined
+): NormalizedAcosmiChatStreamEvent | undefined {
+  if (!evt.data || evt.data.trim() === '[DONE]') return undefined
+
+  const sources = classifySourcesEvent(evt)
+  switch (sources.kind) {
+    case 'empty_sources':
+      recordSourcesCompatibilityEvent('sources_empty_noop', evt.data)
+      return undefined
+    case 'malformed_sources':
+      recordSourcesCompatibilityEvent(sources.code, evt.data)
+      return undefined
+    case 'sources':
+      return {
+        ...sources.value,
+        type: 'sources',
+      }
+    case 'not_sources':
+      break
   }
+
+  try {
+    return JSON.parse(evt.data) as NormalizedAcosmiChatStreamEvent
+  } catch {
+    throw new AcosmiStreamDecodeError(evt.event)
+  }
+}
+
+export class AcosmiStreamDecodeError extends Error {
+  readonly code = 'stream_event_invalid_json'
+
+  readonly eventNameEncodedLength: number
+
+  constructor(eventName: string) {
+    super('Acosmi stream event JSON is invalid')
+    this.name = 'AcosmiStreamDecodeError'
+    this.eventNameEncodedLength = new TextEncoder().encode(eventName).byteLength
+  }
+}
+
+const sourcesCompatibilityCounts = new Map<string, number>()
+
+function recordSourcesCompatibilityEvent(code: string, data: string): void {
+  const count = (sourcesCompatibilityCounts.get(code) ?? 0) + 1
+  sourcesCompatibilityCounts.set(code, count)
+  if (count !== 1) return
+  console.warn(
+    `[stream-compat] ${JSON.stringify({
+      event_type: 'sources',
+      issue_code: code,
+      encoded_len: new TextEncoder().encode(data).byteLength,
+      suppressed_count: 1,
+    })}`,
+  )
+}
+
+/** @internal test-only reset for the per-process/turn diagnostic limiter. */
+export function _resetAcosmiStreamDiagnosticsForTesting(): void {
+  sourcesCompatibilityCounts.clear()
 }
 
 /**

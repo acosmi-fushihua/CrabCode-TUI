@@ -17,16 +17,54 @@ CrabCode TUI 是 CrabCode 的纯终端开源版本。Rust 进程独占终端、�
 macOS / Linux：
 
 ```bash
-curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.sh | sh
+VERSION=v1.0.23
+case "$(uname -m)-$(uname -s)" in
+  arm64-Darwin|aarch64-Darwin) PLATFORM=arm64-darwin ;;
+  x86_64-Darwin|amd64-Darwin) PLATFORM=x64-darwin ;;
+  arm64-Linux|aarch64-Linux) PLATFORM=arm64-linux ;;
+  x86_64-Linux|amd64-Linux) PLATFORM=x64-linux ;;
+  *) echo "unsupported platform" >&2; exit 1 ;;
+esac
+ASSET="crabcode-${VERSION#v}-${PLATFORM}.tar.gz"
+VERIFIED_DIR="$(mktemp -d)"
+gh release download "$VERSION" --repo acosmi/CrabCode-TUI --dir "$VERIFIED_DIR" \
+  --pattern install.sh --pattern checksums-sha256.txt --pattern "$ASSET"
+for FILE in "$VERIFIED_DIR/install.sh" "$VERIFIED_DIR/checksums-sha256.txt" "$VERIFIED_DIR/$ASSET"; do
+  gh attestation verify "$FILE" --repo acosmi/CrabCode-TUI \
+    --source-ref "refs/tags/$VERSION" \
+    --signer-workflow github.com/acosmi/CrabCode-TUI/.github/workflows/release.yml
+done
+CRABCODE_VERSION="$VERSION" CRABCODE_ASSET_DIR="$VERIFIED_DIR" sh "$VERIFIED_DIR/install.sh"
+rm -rf "$VERIFIED_DIR"
 ```
 
 Windows PowerShell：
 
 ```powershell
-irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex
+$Version = 'v1.0.23'
+$Asset = "crabcode-$($Version.TrimStart('v'))-x64-win32.zip"
+$VerifiedDir = Join-Path $env:TEMP "crabcode-verified-$([Guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $VerifiedDir | Out-Null
+gh release download $Version --repo acosmi/CrabCode-TUI --dir $VerifiedDir `
+  --pattern install.ps1 --pattern checksums-sha256.txt --pattern $Asset
+@('install.ps1', 'checksums-sha256.txt', $Asset) | ForEach-Object {
+  gh attestation verify (Join-Path $VerifiedDir $_) --repo acosmi/CrabCode-TUI `
+    --source-ref "refs/tags/$Version" `
+    --signer-workflow github.com/acosmi/CrabCode-TUI/.github/workflows/release.yml
+  if ($LASTEXITCODE -ne 0) { throw "attestation verification failed: $_" }
+}
+$env:CRABCODE_VERSION = $Version
+$env:CRABCODE_ASSET_DIR = $VerifiedDir
+& (Join-Path $VerifiedDir 'install.ps1')
+Remove-Item Env:CRABCODE_VERSION, Env:CRABCODE_ASSET_DIR
+Remove-Item -LiteralPath $VerifiedDir -Recurse -Force
 ```
 
-也可以在 [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest) 下载对应平台的完整包。正式包内含 `crabcode`、原生 TUI、Bun、记忆与定时任务侧车、ripgrep、浏览器后端、图像原生库和 Account Bridge，不要求用户另行安装 Rust、Bun 或 Go。安装器会先校验发布级 SHA-256，再校验包内逐文件清单；支持 macOS/Linux 的 arm64、x64 和 Windows x64。
+以上主流程固定版本，并在执行安装器前分别验证安装器、SHA-256 清单和当前平台 archive 的 GitHub build provenance；本地资产模式不会再次联网。需要先安装并登录 [GitHub CLI `gh`](https://cli.github.com/)。正式包内含 `crabcode`、原生 TUI、Bun、记忆与定时任务侧车、ripgrep、浏览器后端、图像原生库和 Account Bridge，不要求用户另行安装 Rust、Bun 或 Go。安装器还会校验发布级 SHA-256 和包内逐文件清单；支持 macOS/Linux 的 arm64、x64 和 Windows x64。
+
+为兼容旧自动化，mutable `latest/download/install.sh | sh` 与 `install.ps1 | iex` 仍可执行，但 bootstrap 本身无法在执行前验证来源，因此不属于推荐安装路径。
+
+开源 TUI 与 GUI 的程序、安装目录和发布链完全分离。为避免同机测试或多产品复用默认 `~/.crabcode` 状态根，隔离运行时显式设置绝对路径 `CRABCODE_CONFIG_DIR`；该变量同时约束 Rust、TypeScript、memory、cron 与 renderer diagnostics。升级版继续保留默认状态位置，避免破坏既有 TUI 会话与配置。
 
 ### GUI（独立产品，不在本仓库开源）
 
@@ -112,6 +150,18 @@ CrabCode 的改动包括白标、回环面收敛、固定账户路由、地区/�
 - 只有功能等价、回归测试和回滚路径均完成，才会移除 Bun 或 Go 运行依赖。
 
 因此当前 TypeScript 与 Go 代码是受支持的正式过渡实现，不是归档代码；路线目标也不会被误写成当前事实。
+
+迁移不是按文件机械重写，而是按已经冻结的行为边界交付。当前 TypeScript→Rust 实现登记如下：
+
+| 行为边界 | TypeScript 权威 | Rust 等价实现/迁移落点 |
+| --- | --- | --- |
+| StructuredIO、进程、背压、关联请求、关闭 | `src/entrypoints/sdk`、`src/cli/structuredIO.ts` | `crates/crabcode-tui/src/sdk_runtime.rs`、`runtime_host.rs` |
+| 消息、流事件、进度、附件、结果投影 | `src/types`、`src/Tool.ts` | `sdk_projection.rs`、`scrollback_projection.rs`、`agent_view.rs` |
+| 启动、工作区信任、引导与会话选择 | `src/cli/crabcodeTuiBridgeProtocol.ts` | `tui_app.rs`、`session_picker.rs`、`terminal.rs` |
+| 模型、账户、用量、插件与保留命令 | `src/cli/directTui*Actions.ts` | `sdk_runtime.rs`、`model_management.rs`、`usage_plugin_management.rs`、`retained_command_surface.rs` |
+| 终端输入、绘制、暂停恢复与退出 | TS 只提供业务事件 | `app_event_loop.rs`、`terminal.rs`、`tui_app.rs`、`tui_ui.rs` |
+
+`bun run check:capabilities` 使用 TypeScript 编译器展开当前公共与进程私有联合类型，生成 `crates/crabcode-tui/src/generated_renderer_contract.rs`。每个协议族都记录明确的 `rustOwner`；TS 新增分支而 Rust 尚未认领时，检查或原生测试会失败，避免迁移期间出现静默能力漂移。
 
 ## 仓库包含什么
 

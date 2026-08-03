@@ -10,7 +10,7 @@ import type {
   BetaMessage,
   BetaMessageParam as MessageParam,
   BetaMessageStreamParams,
-  BetaRawMessageStreamEvent,
+  NormalizedAcosmiChatStreamEvent,
   BetaStopReason,
   BetaToolUnion,
   Stream,
@@ -213,6 +213,7 @@ import { getInitializationStatus } from '../lsp/manager.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
 import { HTTPError } from '@acosmi/sdk-ts'
 import {
+  AcosmiStreamDecodeError,
   chatComplete,
   chatStreamAdapter,
   systemToString,
@@ -1336,7 +1337,7 @@ async function* queryModel(
   let start = Date.now()
   let attemptNumber = 0
   const attemptStartTimes: number[] = []
-  let stream: Stream<BetaRawMessageStreamEvent> | undefined = undefined
+  let stream: Stream<NormalizedAcosmiChatStreamEvent> | undefined = undefined
   let streamRequestId: string | null | undefined = undefined
   let clientRequestId: string | undefined = undefined
   // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins -- Response is available in Node 18+ and is used by the SDK
@@ -1678,7 +1679,7 @@ async function* queryModel(
           return localModelChatStreamAdapter(
             params.model,
             params,
-          ) as unknown as Stream<BetaRawMessageStreamEvent>
+          ) as unknown as Stream<NormalizedAcosmiChatStreamEvent>
         }
         // BLOCKER-1: custom (bring-your-own) models have their own runtime
         // path — they must reach the user-declared `baseUrl`, never the
@@ -1695,7 +1696,7 @@ async function* queryModel(
           return customModelChatStreamAdapter(
             customRuntime,
             params,
-          ) as unknown as Stream<BetaRawMessageStreamEvent>
+          ) as unknown as Stream<NormalizedAcosmiChatStreamEvent>
         }
         const accountRouteId = parseAccountBridgeReference(params.model)
         if (accountRouteId) {
@@ -1719,7 +1720,7 @@ async function* queryModel(
             runtimeAccess,
             params,
             options.crabcodeThinkingMode ?? 'auto',
-          ) as unknown as Stream<BetaRawMessageStreamEvent>
+          ) as unknown as Stream<NormalizedAcosmiChatStreamEvent>
         }
         // PR-2 (2026-07-01 audit finding 5): a `custom:` prefix already
         // declares "not a gateway model". When the registry entry no longer
@@ -1734,7 +1735,7 @@ async function* queryModel(
         return chatStreamAdapter(
           params.model,
           sdkReq,
-        ) as unknown as Stream<BetaRawMessageStreamEvent>
+        ) as unknown as Stream<NormalizedAcosmiChatStreamEvent>
       },
       {
         model: options.model,
@@ -1757,7 +1758,7 @@ async function* queryModel(
         yield e.value
       }
     } while (!e.done)
-    stream = e.value as Stream<BetaRawMessageStreamEvent>
+    stream = e.value as Stream<NormalizedAcosmiChatStreamEvent>
 
     // S-1: wire the caller's AbortSignal to the stream adapter's controller so
     // a user abort propagates to the SSE transport layer immediately (aborting
@@ -2457,6 +2458,23 @@ async function* queryModel(
         }
       }
 
+      if (streamingError instanceof AcosmiStreamDecodeError) {
+        logForDiagnosticsNoPII('error', 'cli_stream_event_invalid_json')
+        logForDebugging(
+          `Acosmi stream decode failed without payload capture: event_name_encoded_len=${streamingError.eventNameEncodedLength}`,
+          { level: 'error' },
+        )
+        releaseStreamResources()
+        yield attachMediaSidecarUsage(
+          createAssistantAPIErrorMessage({
+            content:
+              '模型流返回了无法解析的事件，本轮已安全停止；运行环境仍可继续使用。\nThe model stream returned an invalid event. This turn stopped safely and the runtime remains available.',
+            error: 'server_error',
+          }),
+        )
+        return
+      }
+
       // PR-2 (2026-07-01 audit finding 2): custom/local models have no
       // "gateway non-streaming" downgrade tier. Falling back would ship the
       // full prompt to the Acosmi gateway (privacy leak + inference-time
@@ -3105,7 +3123,7 @@ async function* queryModel(
  * @internal Exported for testing
  */
 export function cleanupStream(
-  stream: Stream<BetaRawMessageStreamEvent> | undefined,
+  stream: Stream<NormalizedAcosmiChatStreamEvent> | undefined,
 ): void {
   if (!stream) {
     return

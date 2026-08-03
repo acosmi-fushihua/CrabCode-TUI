@@ -92,6 +92,7 @@ const MODEL_INFO_ARGS: &[&str] = &[
     "about", "status", "?",
 ];
 const QUIT_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
+const TURN_ABORT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIPBOARD_PROBE_DEADLINE: Duration = Duration::from_secs(8);
 const OAUTH_BROWSER_REVEAL_DELAY: Duration = Duration::from_secs(3);
 const OAUTH_BROWSER_COPIED_DURATION: Duration = Duration::from_secs(2);
@@ -526,6 +527,10 @@ impl fmt::Debug for HostAction {
 pub enum OutboundPurpose {
     Initialize,
     Interrupt,
+    AbortTurnInterrupt {
+        sequence: u64,
+        code: String,
+    },
     Generic(String),
     SetModel,
     LoginStart,
@@ -1946,6 +1951,13 @@ struct DeferredClipboardProbe {
     source: ClipboardProbeSource,
 }
 
+#[derive(Debug, Clone)]
+struct TurnAbortState {
+    sequence: u64,
+    code: String,
+    deadline: Instant,
+}
+
 struct DeferredImagePathPaste {
     receiver: Receiver<ImagePathPasteOutcome>,
     insert_at: usize,
@@ -2262,6 +2274,8 @@ pub struct TuiApp {
     initial_dispatched: bool,
     last_ctrl_c: Option<Instant>,
     interrupt_pending: bool,
+    turn_abort_pending: Option<TurnAbortState>,
+    turn_abort_result_pending: bool,
     stream_requesting: bool,
     turn_status: TurnStatus,
     action_registry: TuiActionRegistry,
@@ -2497,6 +2511,8 @@ impl TuiApp {
             initial_dispatched: false,
             last_ctrl_c: None,
             interrupt_pending: false,
+            turn_abort_pending: None,
+            turn_abort_result_pending: false,
             stream_requesting: false,
             turn_status: TurnStatus::default(),
             action_registry: TuiActionRegistry::for_screen_mode(false),
@@ -4120,6 +4136,24 @@ impl TuiApp {
     pub fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Vec<HostAction> {
         match event {
             RuntimeEvent::Envelope(envelope) => {
+                let stream_event_type = match &envelope.classification {
+                    crate::sdk_runtime::EnvelopeClass::StreamEvent { event_type } => {
+                        event_type.clone()
+                    }
+                    _ => None,
+                };
+                let stream_sources_nonempty = stream_event_type.as_deref() == Some("sources")
+                    && envelope
+                        .value
+                        .pointer("/event/sources")
+                        .and_then(Value::as_array)
+                        .is_some_and(|sources| !sources.is_empty());
+                let request_activity_class = match &envelope.classification {
+                    crate::sdk_runtime::EnvelopeClass::StreamEvent { .. } => 1_u8,
+                    crate::sdk_runtime::EnvelopeClass::Assistant
+                    | crate::sdk_runtime::EnvelopeClass::Result => 2_u8,
+                    _ => 0_u8,
+                };
                 let turn_activity_hint = renderer_turn_activity_hint(&envelope.classification);
                 if self.observe_extra_usage_runtime_pair(&envelope) {
                     // The historical JSX command replaced a successful
@@ -4152,13 +4186,6 @@ impl TuiApp {
                     )),
                     _ => None,
                 };
-                let advances_request_activity = self.stream_requesting
-                    && matches!(
-                        &envelope.classification,
-                        crate::sdk_runtime::EnvelopeClass::StreamEvent { .. }
-                            | crate::sdk_runtime::EnvelopeClass::Assistant
-                            | crate::sdk_runtime::EnvelopeClass::Result
-                    );
                 self.observe_client_runtime_state(&envelope);
                 // A raw diagnostic envelope may be evicted immediately when
                 // Projection enforces its byte budget. Retain only the typed
@@ -4200,6 +4227,20 @@ impl TuiApp {
                 }
                 self.synchronize_goal_report_projection();
                 self.synchronize_renderer_watchers(Instant::now());
+                let effect_allows_request_activity = !matches!(
+                    &effect,
+                    ProjectionEffect::CompatibilityFault { .. }
+                        | ProjectionEffect::AbortTurn { .. }
+                        | ProjectionEffect::FailClosed { .. }
+                );
+                let stream_event_advances_request_activity = match stream_event_type.as_deref() {
+                    Some("sources") => stream_sources_nonempty && effect_allows_request_activity,
+                    Some("ping") | None => false,
+                    Some(_) => effect_allows_request_activity,
+                };
+                let advances_request_activity = self.stream_requesting
+                    && ((request_activity_class == 2 && effect_allows_request_activity)
+                        || (request_activity_class == 1 && stream_event_advances_request_activity));
                 if advances_request_activity {
                     self.stream_requesting = false;
                     self.status = self
@@ -4263,6 +4304,24 @@ impl TuiApp {
 
     pub fn record_control_request(&mut self, request_id: String, purpose: OutboundPurpose) {
         self.pending_outbound.insert(request_id, purpose);
+    }
+
+    pub(crate) fn set_renderer_diagnostics(
+        &mut self,
+        diagnostics: crate::renderer_diagnostics::RendererDiagnostics,
+    ) {
+        self.projection.set_renderer_diagnostics(diagnostics);
+    }
+
+    pub(crate) fn interrupt_outbound_purpose(&self) -> OutboundPurpose {
+        self.turn_abort_pending
+            .as_ref()
+            .map_or(OutboundPurpose::Interrupt, |abort| {
+                OutboundPurpose::AbortTurnInterrupt {
+                    sequence: abort.sequence,
+                    code: abort.code.clone(),
+                }
+            })
     }
 
     /// Build one request in the closed post-setup native TUI action lane.
@@ -4841,6 +4900,14 @@ impl TuiApp {
                 ));
             }
             HostAction::Interrupt => {
+                if let Some(abort) = self.turn_abort_pending.take() {
+                    self.interrupt_pending = false;
+                    self.fail_closed(format!(
+                        "turn abort interrupt delivery failed at sequence {} ({}): {error}",
+                        abort.sequence, abort.code
+                    ));
+                    return;
+                }
                 self.interrupt_pending = false;
                 self.status = match self.renderer_ui_language {
                     UiLanguage::ZhCn => format!("中断失败：{error}"),
@@ -5181,6 +5248,7 @@ impl TuiApp {
             oauth,
             self.session_picker_exit_at,
             self.turn_status.animation_deadline(),
+            self.turn_abort_pending.as_ref().map(|abort| abort.deadline),
         ]
         .into_iter()
         .flatten()
@@ -5189,6 +5257,22 @@ impl TuiApp {
 
     pub(crate) fn tick_renderer_animation(&mut self, now: Instant) -> bool {
         let mut changed = self.turn_status.tick(now);
+        if self
+            .turn_abort_pending
+            .as_ref()
+            .is_some_and(|abort| now >= abort.deadline)
+        {
+            let abort = self
+                .turn_abort_pending
+                .take()
+                .expect("the turn-abort deadline was just observed");
+            self.interrupt_pending = false;
+            self.fail_closed(format!(
+                "turn abort interrupt acknowledgement timed out at sequence {} ({})",
+                abort.sequence, abort.code
+            ));
+            changed = true;
+        }
         if let Some(prompt) = self.oauth_browser_prompt.as_mut() {
             let (prompt_changed, newly_revealed) = prompt.tick_at(now);
             changed |= prompt_changed;
@@ -9153,6 +9237,8 @@ impl TuiApp {
         self.stream_requesting = false;
         self.turn_status.reset();
         self.interrupt_pending = false;
+        self.turn_abort_pending = None;
+        self.turn_abort_result_pending = false;
         self.pending_extra_usage_output = false;
         self.active_goal = None;
         self.goal_tasks.clear();
@@ -9304,6 +9390,10 @@ impl TuiApp {
             }
             ProjectionEffect::PromptSuggestion(_) => Vec::new(),
             ProjectionEffect::StreamRequestStarted => {
+                // A successor model request is a new turn boundary. A late
+                // result from an already acknowledged abort must not poison
+                // the successor's terminal disposition.
+                self.turn_abort_result_pending = false;
                 self.stream_requesting = true;
                 self.turn_status.begin(
                     self.projection.direct_stream_activity().turn_generation,
@@ -9322,6 +9412,25 @@ impl TuiApp {
                 is_error,
                 raw_sequence: _,
             } => {
+                if let Some(abort) = self.turn_abort_pending.take() {
+                    self.projection.finish_output_epoch();
+                    self.interrupt_pending = false;
+                    self.turn_abort_result_pending = false;
+                    self.stream_requesting = false;
+                    self.turn_status.finish(TurnOutcome::Failed);
+                    self.status = match self.renderer_ui_language {
+                        UiLanguage::ZhCn => format!("本轮已中止 · {}", abort.code),
+                        UiLanguage::EnUs => format!("Turn aborted · {}", abort.code),
+                    };
+                    return Vec::new();
+                }
+                if self.turn_abort_result_pending {
+                    self.projection.finish_output_epoch();
+                    self.turn_abort_result_pending = false;
+                    self.stream_requesting = false;
+                    self.turn_status.finish(TurnOutcome::Failed);
+                    return Vec::new();
+                }
                 let _had_visible_output = self.projection.output_since_last_finish();
                 self.projection.finish_output_epoch();
                 self.stream_requesting = false;
@@ -9337,6 +9446,32 @@ impl TuiApp {
                     (UiLanguage::EnUs, false) => "Ready".to_string(),
                 };
                 Vec::new()
+            }
+            ProjectionEffect::CompatibilityFault { .. } => Vec::new(),
+            ProjectionEffect::AbortTurn {
+                sequence,
+                code,
+                reason: _,
+            } => {
+                if self.turn_abort_pending.is_some() {
+                    return Vec::new();
+                }
+                let now = Instant::now();
+                self.stream_requesting = false;
+                self.interrupt_pending = true;
+                self.turn_status.cancel(now);
+                self.turn_abort_pending = Some(TurnAbortState {
+                    sequence,
+                    code: code.clone(),
+                    deadline: now + TURN_ABORT_ACK_TIMEOUT,
+                });
+                self.status = match self.renderer_ui_language {
+                    UiLanguage::ZhCn => format!("本轮协议数据无效，正在中止 · {code}"),
+                    UiLanguage::EnUs => {
+                        format!("Turn data is incompatible; aborting · {code}")
+                    }
+                };
+                vec![HostAction::Interrupt]
             }
             ProjectionEffect::FailClosed { reason, .. } => {
                 self.fail_closed(reason);
@@ -10380,6 +10515,22 @@ impl TuiApp {
         payload: Value,
         _raw_sequence: u64,
     ) -> Vec<HostAction> {
+        if !success && let OutboundPurpose::AbortTurnInterrupt { sequence, code } = &purpose {
+            if self
+                .turn_abort_pending
+                .as_ref()
+                .is_some_and(|abort| abort.sequence == *sequence && abort.code == *code)
+            {
+                self.turn_abort_pending = None;
+                self.interrupt_pending = false;
+                self.fail_closed(format!(
+                    "turn abort interrupt was rejected at sequence {sequence} ({code})"
+                ));
+            }
+            // If the matching result already completed the turn, this is a
+            // late negative acknowledgement and cannot affect a successor.
+            return Vec::new();
+        }
         if !success {
             let Some(error) = payload.get("error").and_then(Value::as_str) else {
                 self.fail_closed(format!(
@@ -10514,6 +10665,24 @@ impl TuiApp {
                     .renderer_ui_language
                     .text("中断已确认", "Interrupt acknowledged")
                     .to_string();
+                Vec::new()
+            }
+            OutboundPurpose::AbortTurnInterrupt { sequence, code } => {
+                let matches_active_abort = self
+                    .turn_abort_pending
+                    .as_ref()
+                    .is_some_and(|abort| abort.sequence == sequence && abort.code == code);
+                if matches_active_abort {
+                    self.turn_abort_pending = None;
+                    self.turn_abort_result_pending = true;
+                    self.interrupt_pending = false;
+                    self.stream_requesting = false;
+                    self.turn_status.finish(TurnOutcome::Failed);
+                    self.status = match self.renderer_ui_language {
+                        UiLanguage::ZhCn => format!("本轮已中止 · {code}"),
+                        UiLanguage::EnUs => format!("Turn aborted · {code}"),
+                    };
+                }
                 Vec::new()
             }
             OutboundPurpose::SetModel => {
@@ -12577,6 +12746,9 @@ impl TuiApp {
     fn fail_closed(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         self.stream_requesting = false;
+        self.interrupt_pending = false;
+        self.turn_abort_pending = None;
+        self.turn_abort_result_pending = false;
         self.turn_status.finish(TurnOutcome::RuntimeStopped);
         self.clear_setup_secret();
         self.oauth_browser_prompt = None;
@@ -12593,6 +12765,9 @@ impl TuiApp {
     fn fail_closed_after_runtime_stopped(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         self.stream_requesting = false;
+        self.interrupt_pending = false;
+        self.turn_abort_pending = None;
+        self.turn_abort_result_pending = false;
         self.turn_status.finish(TurnOutcome::RuntimeStopped);
         self.clear_setup_secret();
         self.oauth_browser_prompt = None;
@@ -15372,6 +15547,7 @@ fn purpose_label(purpose: &OutboundPurpose) -> &str {
     match purpose {
         OutboundPurpose::Initialize => "Initialize",
         OutboundPurpose::Interrupt => "Interrupt",
+        OutboundPurpose::AbortTurnInterrupt { .. } => "Abort turn",
         OutboundPurpose::Generic(name) => name,
         OutboundPurpose::SetModel => "Set model",
         OutboundPurpose::LoginStart => "Start login",
@@ -15398,6 +15574,7 @@ fn localized_purpose_label(purpose: &OutboundPurpose, ui_language: UiLanguage) -
     match purpose {
         OutboundPurpose::Initialize => "初始化",
         OutboundPurpose::Interrupt => "中断",
+        OutboundPurpose::AbortTurnInterrupt { .. } => "中止本轮",
         OutboundPurpose::Generic(name) => name,
         OutboundPurpose::SetModel => "切换模型",
         OutboundPurpose::LoginStart => "开始登录",
@@ -15644,6 +15821,9 @@ fn projected_tool_copy_meta(item: &crate::sdk_projection::ProjectedItem) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated_renderer_contract::{
+        GENERATED_PRIVATE_SETUP_REQUEST_ROUTES, GENERATED_PRIVATE_SETUP_RESPONSE_ROUTES,
+    };
     use crate::sdk_runtime::{EnvelopeClass, RawEnvelope, RequestCorrelation};
     use crossterm::event::MouseEvent;
 
@@ -15969,6 +16149,189 @@ mod tests {
             }],
             "a legal sparse usage frame must not lock or terminate the next input"
         );
+    }
+
+    #[test]
+    fn empty_and_malformed_sources_never_stop_or_advance_the_runtime() {
+        let mut app = app();
+        start_request_activity(&mut app);
+
+        let actions = app.handle_runtime_event(thinking_stream_event(1, json!({"type":"ping"})));
+        assert!(actions.is_empty());
+        assert!(app.stream_requesting());
+
+        for (sequence, event) in [
+            (2, json!({"type":"sources","sources":[]})),
+            (3, json!({"type":"sources","sources":{}})),
+        ] {
+            let actions = app.handle_runtime_event(raw(
+                sequence,
+                json!({
+                    "type":"stream_event",
+                    "uuid":format!("sources-{sequence}"),
+                    "event":event
+                }),
+                EnvelopeClass::StreamEvent {
+                    event_type: Some("sources".to_string()),
+                },
+            ));
+            assert!(actions.is_empty());
+            assert!(app.fatal.is_none());
+            assert!(app.take_runtime_stop_action().is_none());
+            assert!(app.stream_requesting());
+            assert_eq!(
+                app.projection.direct_stream_activity().phase,
+                crate::sdk_projection::DirectStreamActivityPhase::Requesting
+            );
+        }
+
+        let actions = app.handle_runtime_event(raw(
+            4,
+            json!({
+                "type":"stream_event",
+                "uuid":"message-start-after-sources",
+                "event":{"type":"message_start","message":{"id":"message-1"}}
+            }),
+            EnvelopeClass::StreamEvent {
+                event_type: Some("message_start".to_string()),
+            },
+        ));
+        assert!(actions.is_empty());
+        assert!(!app.stream_requesting());
+        assert_eq!(app.status, "CrabCode is responding");
+        assert!(app.fatal.is_none());
+    }
+
+    #[test]
+    fn valid_nonempty_sources_advance_request_activity_without_stopping_runtime() {
+        let mut app = app();
+        start_request_activity(&mut app);
+
+        let actions = app.handle_runtime_event(thinking_stream_event(
+            1,
+            json!({
+                "type":"sources",
+                "sources":[{"title":"Documentation","url":"https://example.invalid"}]
+            }),
+        ));
+
+        assert!(actions.is_empty());
+        assert!(!app.stream_requesting());
+        assert_eq!(app.status, "CrabCode is responding");
+        assert!(app.fatal.is_none());
+    }
+
+    #[test]
+    fn malformed_turn_lifecycle_interrupts_one_turn_and_ack_unlocks_the_next() {
+        let mut app = app();
+        start_request_activity(&mut app);
+        let actions = app.handle_runtime_event(raw(
+            1,
+            json!({
+                "type":"stream_event",
+                "uuid":"malformed-message-start",
+                "event":{"type":"message_start","message":{}}
+            }),
+            EnvelopeClass::StreamEvent {
+                event_type: Some("message_start".to_string()),
+            },
+        ));
+        assert_eq!(actions, vec![HostAction::Interrupt]);
+        assert!(app.interrupt_pending);
+        assert!(app.turn_abort_pending.is_some());
+        assert!(app.fatal.is_none());
+        assert!(app.take_runtime_stop_action().is_none());
+
+        let purpose = app.interrupt_outbound_purpose();
+        assert!(matches!(
+            purpose,
+            OutboundPurpose::AbortTurnInterrupt {
+                sequence: 1,
+                ref code,
+            } if code == "message_start_invalid"
+        ));
+        app.record_control_request("abort-turn-1".to_string(), purpose);
+        let mut response = match raw(
+            2,
+            json!({
+                "type":"control_response",
+                "response":{
+                    "subtype":"success",
+                    "request_id":"abort-turn-1",
+                    "response":{}
+                }
+            }),
+            EnvelopeClass::ControlResponse {
+                request_id: "abort-turn-1".to_string(),
+                outcome: "success".to_string(),
+            },
+        ) {
+            RuntimeEvent::Envelope(envelope) => envelope,
+            _ => unreachable!(),
+        };
+        response.correlation = Some(RequestCorrelation::OutboundResponseMatched {
+            request_id: "abort-turn-1".to_string(),
+            request_subtype: "interrupt".to_string(),
+        });
+        assert!(
+            app.handle_runtime_event(RuntimeEvent::Envelope(response))
+                .is_empty()
+        );
+        assert!(!app.busy());
+        assert!(!app.interrupt_pending);
+        assert!(app.turn_abort_pending.is_none());
+        assert!(app.status.contains("message_start_invalid"));
+        assert!(app.fatal.is_none());
+        assert!(app.take_runtime_stop_action().is_none());
+
+        app.handle_event(Event::Paste("second turn".to_string()));
+        assert_eq!(
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            vec![HostAction::SendUser {
+                content: Value::String("second turn".to_string()),
+                priority: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_turn_abort_ack_escalates_only_after_the_fixed_deadline() {
+        let mut app = app();
+        start_request_activity(&mut app);
+        assert_eq!(
+            app.handle_runtime_event(raw(
+                1,
+                json!({
+                    "type":"stream_event",
+                    "uuid":"malformed-message-start-timeout",
+                    "event":{"type":"message_start","message":{}}
+                }),
+                EnvelopeClass::StreamEvent {
+                    event_type: Some("message_start".to_string()),
+                },
+            )),
+            vec![HostAction::Interrupt]
+        );
+        let deadline = app
+            .turn_abort_pending
+            .as_ref()
+            .expect("turn abort is pending")
+            .deadline;
+        let _ = app.tick_renderer_animation(deadline - Duration::from_nanos(1));
+        assert!(app.fatal.is_none());
+        assert!(app.tick_renderer_animation(deadline));
+        assert!(
+            app.fatal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("acknowledgement timed out"))
+        );
+        assert!(matches!(
+            app.take_runtime_stop_action(),
+            Some(HostAction::StopRuntime { .. })
+        ));
     }
 
     fn project_session_state(app: &mut TuiApp, sequence: u64, state: &str) {
@@ -18972,6 +19335,101 @@ mod tests {
                 "https://acosmi.test/login".to_string(),
             ))
         );
+    }
+
+    fn native_setup_request_route_is_owned(route: &str) -> bool {
+        matches!(
+            route,
+            "kind=api_key_approval|stage=-|phase=-"
+                | "kind=auto_mode_opt_in|stage=-|phase=-"
+                | "kind=bypass_permissions_consent|stage=-|phase=-"
+                | "kind=development_channels|stage=-|phase=-"
+                | "kind=external_crabcode_md|stage=-|phase=-"
+                | "kind=grove_terms|stage=-|phase=-"
+                | "kind=mcp_server_approval|stage=-|phase=-"
+                | "kind=onboarding|stage=language|phase=-"
+                | "kind=onboarding|stage=oauth|phase=browser_open_failed"
+                | "kind=onboarding|stage=oauth|phase=browser_url"
+                | "kind=onboarding|stage=oauth|phase=custom_api_key"
+                | "kind=onboarding|stage=oauth|phase=custom_base_url"
+                | "kind=onboarding|stage=oauth|phase=custom_model_id"
+                | "kind=onboarding|stage=oauth|phase=custom_provider"
+                | "kind=onboarding|stage=oauth|phase=error"
+                | "kind=onboarding|stage=oauth|phase=platform_setup"
+                | "kind=onboarding|stage=oauth|phase=select_method"
+                | "kind=onboarding|stage=oauth|phase=success"
+                | "kind=onboarding|stage=preflight|phase=-"
+                | "kind=onboarding|stage=security|phase=-"
+                | "kind=onboarding|stage=terminal|phase=-"
+                | "kind=onboarding|stage=theme|phase=-"
+                | "kind=renderer_context|stage=-|phase=-"
+                | "kind=renderer_scroll_speed|stage=-|phase=-"
+                | "kind=session_picker|stage=-|phase=catalog_chunk"
+                | "kind=session_picker|stage=-|phase=catalog_show"
+                | "kind=session_picker|stage=-|phase=catalog_start"
+                | "kind=session_picker|stage=-|phase=cross_project"
+                | "kind=session_picker|stage=-|phase=loading"
+                | "kind=session_picker|stage=-|phase=preview_complete"
+                | "kind=session_picker|stage=-|phase=preview_failed"
+                | "kind=session_picker|stage=-|phase=preview_message_chunk"
+                | "kind=session_picker|stage=-|phase=preview_start"
+                | "kind=session_picker|stage=-|phase=resolved"
+                | "kind=workspace_trust|stage=-|phase=-"
+        )
+    }
+
+    fn native_setup_response_route_is_owned(route: &str) -> bool {
+        matches!(
+            route,
+            "kind=api_key_approval|stage=-|phase=-"
+                | "kind=auto_mode_opt_in|stage=-|phase=-"
+                | "kind=bypass_permissions_consent|stage=-|phase=-"
+                | "kind=development_channels|stage=-|phase=-"
+                | "kind=external_crabcode_md|stage=-|phase=-"
+                | "kind=grove_terms|stage=-|phase=-"
+                | "kind=mcp_server_approval|stage=-|phase=-"
+                | "kind=onboarding|stage=language|phase=-"
+                | "kind=onboarding|stage=oauth|phase=browser_open_failed"
+                | "kind=onboarding|stage=oauth|phase=browser_url"
+                | "kind=onboarding|stage=oauth|phase=custom_api_key"
+                | "kind=onboarding|stage=oauth|phase=custom_base_url"
+                | "kind=onboarding|stage=oauth|phase=custom_model_id"
+                | "kind=onboarding|stage=oauth|phase=custom_provider"
+                | "kind=onboarding|stage=oauth|phase=error"
+                | "kind=onboarding|stage=oauth|phase=platform_setup"
+                | "kind=onboarding|stage=oauth|phase=select_method"
+                | "kind=onboarding|stage=oauth|phase=success"
+                | "kind=onboarding|stage=preflight|phase=-"
+                | "kind=onboarding|stage=security|phase=-"
+                | "kind=onboarding|stage=terminal|phase=-"
+                | "kind=onboarding|stage=theme|phase=-"
+                | "kind=renderer_context|stage=-|phase=-"
+                | "kind=renderer_scroll_speed|stage=-|phase=-"
+                | "kind=session_picker|stage=-|phase=catalog_chunk"
+                | "kind=session_picker|stage=-|phase=catalog_start"
+                | "kind=session_picker|stage=-|phase=interaction"
+                | "kind=session_picker|stage=-|phase=loading"
+                | "kind=session_picker|stage=-|phase=preview_message_chunk"
+                | "kind=session_picker|stage=-|phase=preview_start"
+                | "kind=session_picker|stage=-|phase=resolved"
+                | "kind=workspace_trust|stage=-|phase=-"
+        )
+    }
+
+    #[test]
+    fn compiler_generated_private_setup_routes_have_explicit_native_owners() {
+        for route in GENERATED_PRIVATE_SETUP_REQUEST_ROUTES {
+            assert!(
+                native_setup_request_route_is_owned(route),
+                "TypeScript private setup request route `{route}` has no reviewed Rust owner"
+            );
+        }
+        for route in GENERATED_PRIVATE_SETUP_RESPONSE_ROUTES {
+            assert!(
+                native_setup_response_route_is_owned(route),
+                "TypeScript private setup response route `{route}` has no reviewed Rust owner"
+            );
+        }
     }
 
     #[test]

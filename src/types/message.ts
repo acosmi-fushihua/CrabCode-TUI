@@ -11,8 +11,8 @@ import type {
   APIError,
   BetaContentBlock,
   BetaMessage,
-  BetaRawMessageStreamEvent,
   ContentBlockParam,
+  NormalizedAcosmiChatStreamEvent,
 } from './api-types.js'
 import type { UUID } from 'crypto'
 
@@ -193,7 +193,7 @@ export type HookResultMessage = AttachmentMessage
 
 export interface StreamEvent {
   type: 'stream_event'
-  event: BetaRawMessageStreamEvent
+  event: NormalizedAcosmiChatStreamEvent
   ttftMs?: number
   uuid?: string
 }

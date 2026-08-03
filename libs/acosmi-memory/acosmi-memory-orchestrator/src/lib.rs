@@ -307,6 +307,145 @@ fn is_resource_exhaustion(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
 }
 
+/// Removes only the exact Unix socket inode created by this server. A
+/// same-user process that unlinks and replaces the pathname cannot make this
+/// owner delete the replacement during shutdown.
+#[cfg(unix)]
+struct BoundUnixSocketPath {
+    path: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+    short_parent: Option<OwnedShortSocketParent>,
+}
+
+#[cfg(unix)]
+struct OwnedShortSocketParent {
+    path: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl BoundUnixSocketPath {
+    fn capture(path: &std::path::Path) -> Result<Self> {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_socket() {
+            return Err(anyhow!(
+                "bound memory endpoint is not a Unix socket: {}",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            short_parent: OwnedShortSocketParent::capture(path)?,
+        })
+    }
+
+    fn remove_owned_short_parent(&self) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let Some(parent) = self.short_parent.as_ref() else {
+            return;
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(&parent.path) else {
+            return;
+        };
+        if metadata.dev() != parent.device || metadata.ino() != parent.inode {
+            log::warn!(
+                "memory short-socket directory changed ownership before cleanup; preserving replacement: {}",
+                parent.path.display()
+            );
+            return;
+        }
+        match std::fs::remove_dir(&parent.path) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error
+                        .raw_os_error()
+                        .is_some_and(|code| code == libc::ENOTEMPTY || code == libc::EEXIST) => {}
+            Err(error) => log::warn!(
+                "failed to remove owned memory short-socket directory {}: {error}",
+                parent.path.display()
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl OwnedShortSocketParent {
+    fn capture(socket_path: &std::path::Path) -> Result<Option<Self>> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if socket_path.file_name() != Some(std::ffi::OsStr::new("memory-orchestrator.sock")) {
+            return Ok(None);
+        }
+        let Some(parent) = socket_path.parent() else {
+            return Ok(None);
+        };
+        if parent.parent() != Some(std::path::Path::new("/tmp")) {
+            return Ok(None);
+        }
+        let Some(namespace) = parent
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.strip_prefix("crabcode-memory-"))
+        else {
+            return Ok(None);
+        };
+        if namespace.len() != 32 || !namespace.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+
+        let metadata = std::fs::symlink_metadata(parent)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(anyhow!(
+                "memory short-socket parent is not a private 0700 directory: {}",
+                parent.display()
+            ));
+        }
+        Ok(Some(Self {
+            path: parent.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BoundUnixSocketPath {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let Ok(metadata) = std::fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if metadata.dev() != self.device || metadata.ino() != self.inode {
+            log::warn!(
+                "memory endpoint path changed ownership before cleanup; preserving replacement: {}",
+                self.path.display()
+            );
+            return;
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => self.remove_owned_short_parent(),
+            Err(error) => {
+                log::warn!(
+                    "failed to remove owned memory endpoint {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 async fn serve_unix_endpoint(
     socket_path: &str,
@@ -340,6 +479,7 @@ async fn serve_unix_endpoint(
         }
         Err(error) => return Err(error.into()),
     };
+    let _bound_socket_path = BoundUnixSocketPath::capture(std::path::Path::new(socket_path))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -950,6 +1090,76 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn private_short_socket_path() -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let parent = std::path::Path::new("/tmp")
+            .join(format!("crabcode-memory-{}", uuid::Uuid::new_v4().simple()));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(&parent).expect("private short parent");
+        parent.join("memory-orchestrator.sock")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_cleanup_removes_its_empty_private_short_parent() {
+        let socket_path = private_short_socket_path();
+        let parent = socket_path.parent().expect("socket parent").to_path_buf();
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind private socket");
+        let owner = BoundUnixSocketPath::capture(&socket_path).expect("capture socket identity");
+
+        drop(owner);
+
+        assert!(!socket_path.exists(), "owned socket must be removed");
+        assert!(!parent.exists(), "empty owned short parent must be removed");
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_cleanup_preserves_a_nonempty_private_short_parent() {
+        let socket_path = private_short_socket_path();
+        let parent = socket_path.parent().expect("socket parent").to_path_buf();
+        let sentinel = parent.join("successor-owned");
+        std::fs::write(&sentinel, b"keep").expect("sentinel");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind private socket");
+        let owner = BoundUnixSocketPath::capture(&socket_path).expect("capture socket identity");
+
+        drop(owner);
+
+        assert!(!socket_path.exists(), "owned socket must be removed");
+        assert!(sentinel.exists(), "unrelated parent content must survive");
+        drop(listener);
+        std::fs::remove_file(sentinel).expect("remove sentinel");
+        std::fs::remove_dir(parent).expect("remove private parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_cleanup_preserves_a_replacement_inode() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let socket_path = temp_dir.path().join("memory.sock");
+        let original = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind original");
+        let owner = BoundUnixSocketPath::capture(&socket_path).expect("capture original identity");
+
+        std::fs::remove_file(&socket_path).expect("unlink original pathname");
+        let replacement =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind replacement");
+        drop(owner);
+
+        assert!(
+            socket_path.exists(),
+            "the old owner must not delete a replacement socket"
+        );
+        drop(replacement);
+        drop(original);
+        std::fs::remove_file(&socket_path).expect("cleanup replacement pathname");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn unix_server_acknowledges_compatible_promotion_before_releasing_endpoint() {
         use tokio::io::AsyncWriteExt as _;
@@ -1015,5 +1225,9 @@ mod tests {
             .expect("server releases endpoint after acknowledged promotion")
             .expect("server task joins");
         assert_eq!(exit, ServeExit::Promoted);
+        assert!(
+            !socket_path.exists(),
+            "acknowledged promotion must remove the owned Unix socket pathname"
+        );
     }
 }

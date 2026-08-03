@@ -367,7 +367,7 @@ fn validate_generation_directory(versions_dir: &Path, generation_path: &Path) ->
         ),
         ("build-id", "generation build id"),
         ("release-manifest.json", "generation signed manifest"),
-        ("release-manifest.sig", "generation manifest signature"),
+        ("release-manifest.digest.json", "generation manifest digest"),
     ] {
         assert_real_regular_file(&target, relative, label)?;
     }
@@ -1626,7 +1626,7 @@ mod tests {
             "dist/tui-runtime/index.js",
             "build-id",
             "release-manifest.json",
-            "release-manifest.sig",
+            "release-manifest.digest.json",
         ] {
             write_file(&generation.join(relative));
         }
@@ -1669,7 +1669,7 @@ mod tests {
             "dist/tui-runtime/index.js",
             "build-id",
             "release-manifest.json",
-            "release-manifest.sig",
+            "release-manifest.digest.json",
         ] {
             let path = generation.join(relative);
             let contents = fs::read(&path).unwrap();

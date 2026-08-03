@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 
 use crate::sdk_runtime::{
     OutboundCompletion, OutboundDeliveryId, OutboundSubmitError, RuntimeConfig, RuntimeEvent,
-    SdkRuntime, SendError, ShutdownError, SpawnError, TransportLimits,
+    SdkRuntime, SendError, ShutdownError, ShutdownOutcome, SpawnError, TransportLimits,
 };
 
 #[cfg(feature = "terminal-lifecycle-tests")]
@@ -223,14 +223,16 @@ impl RuntimeHost {
             .submit_control_success(request_id, subtype, response)
     }
 
-    pub fn shutdown(&mut self, reason: Option<&str>) -> Result<(), ShutdownError> {
+    pub fn shutdown(&mut self, reason: Option<&str>) -> Result<ShutdownOutcome, ShutdownError> {
         let request_id = self.next_control_id();
         self.runtime.shutdown(request_id, reason)
     }
 
     /// Reap the private child before its setup router has handed stdin to
     /// StructuredIO. No backend envelope is valid at this boundary.
-    pub(crate) fn shutdown_before_runtime_handoff(&mut self) -> Result<(), ShutdownError> {
+    pub(crate) fn shutdown_before_runtime_handoff(
+        &mut self,
+    ) -> Result<ShutdownOutcome, ShutdownError> {
         self.runtime.shutdown_before_runtime_handoff()
     }
 

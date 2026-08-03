@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# SECURITY NOTICE: piping this bootstrap from a mutable URL does not authenticate its source.
 # CrabCode TUI fail-closed installer for macOS and Linux.
 set -eu
 
@@ -20,8 +21,15 @@ trap cleanup EXIT HUP INT TERM
 info() { printf 'info: %s\n' "$1"; }
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
-command -v curl >/dev/null 2>&1 || die "需要 curl 才能下载安装包"
 command -v tar >/dev/null 2>&1 || die "需要 tar 才能解压安装包"
+
+if [ -n "${CRABCODE_ASSET_DIR:-}" ] && [ -z "${CRABCODE_VERSION:-}" ]; then
+  die "CRABCODE_ASSET_DIR 本地模式必须同时固定 CRABCODE_VERSION"
+fi
+if [ -z "${CRABCODE_ASSET_DIR:-}" ]; then
+  command -v curl >/dev/null 2>&1 || die "需要 curl 才能下载安装包"
+  info "安全提示：当前 bootstrap 本身未验证来源；推荐按 README 先用 gh attestation verify 校验固定版本资产"
+fi
 
 case "$(uname -s)" in
   Darwin) OS="darwin" ;;
@@ -50,16 +58,25 @@ printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Z
 ARCHIVE="crabcode-${VERSION}-${PLATFORM}.tar.gz"
 BASE_URL="https://github.com/${REPOSITORY}/releases/download/${TAG}"
 TEMP_ROOT="$(mktemp -d)"
-ARCHIVE_PATH="${TEMP_ROOT}/${ARCHIVE}"
-CHECKSUM_PATH="${TEMP_ROOT}/checksums-sha256.txt"
-
-info "下载 ${ARCHIVE}"
-curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 --max-time 600 \
-  -o "$ARCHIVE_PATH" "${BASE_URL}/${ARCHIVE}" \
-  || die "未找到 ${TAG} 的 ${PLATFORM} 完整包"
-curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 --max-time 120 \
-  -o "$CHECKSUM_PATH" "${BASE_URL}/checksums-sha256.txt" \
-  || die "无法下载同一 Release 的 SHA-256 清单，拒绝安装"
+if [ -n "${CRABCODE_ASSET_DIR:-}" ]; then
+  case "$CRABCODE_ASSET_DIR" in /*) ;; *) die "CRABCODE_ASSET_DIR 必须是绝对路径" ;; esac
+  [ -d "$CRABCODE_ASSET_DIR" ] || die "CRABCODE_ASSET_DIR 不是目录: $CRABCODE_ASSET_DIR"
+  ARCHIVE_PATH="${CRABCODE_ASSET_DIR}/${ARCHIVE}"
+  CHECKSUM_PATH="${CRABCODE_ASSET_DIR}/checksums-sha256.txt"
+  [ -f "$ARCHIVE_PATH" ] || die "本地资产目录缺少 ${ARCHIVE}"
+  [ -f "$CHECKSUM_PATH" ] || die "本地资产目录缺少 checksums-sha256.txt"
+  info "使用已下载的固定版本本地资产；安装器不会访问网络"
+else
+  ARCHIVE_PATH="${TEMP_ROOT}/${ARCHIVE}"
+  CHECKSUM_PATH="${TEMP_ROOT}/checksums-sha256.txt"
+  info "下载 ${ARCHIVE}"
+  curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 --max-time 600 \
+    -o "$ARCHIVE_PATH" "${BASE_URL}/${ARCHIVE}" \
+    || die "未找到 ${TAG} 的 ${PLATFORM} 完整包"
+  curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 --max-time 120 \
+    -o "$CHECKSUM_PATH" "${BASE_URL}/checksums-sha256.txt" \
+    || die "无法下载同一 Release 的 SHA-256 清单，拒绝安装"
+fi
 
 EXPECTED_LINES="$(awk -v name="$ARCHIVE" '$2 == name { print $1 }' "$CHECKSUM_PATH")"
 [ "$(printf '%s\n' "$EXPECTED_LINES" | sed '/^$/d' | wc -l | tr -d ' ')" = "1" ] \
@@ -97,6 +114,9 @@ verify_manifest() {
   root="$1"
   bun_bin="${root}/bun"
   [ -x "$bun_bin" ] || die "发布包缺少可执行的内置 Bun"
+  # The JavaScript program is intentionally single-quoted so shell expansion
+  # cannot rewrite template literals or package paths.
+  # shellcheck disable=SC2016
   "$bun_bin" -e '
     import { createHash } from "node:crypto";
     import { lstatSync, readFileSync, readdirSync } from "node:fs";
@@ -104,12 +124,12 @@ verify_manifest() {
     const root = process.argv[1];
     const hash = path => createHash("sha256").update(readFileSync(path)).digest("hex");
     const manifestPath = join(root, "release-manifest.json");
-    const signaturePath = join(root, "release-manifest.sig");
+    const digestPath = join(root, "release-manifest.digest.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-    const signature = JSON.parse(readFileSync(signaturePath, "utf8"));
-    if (signature.schemaVersion !== 1 || signature.scheme !== "sha256" || signature.manifestSha256 !== hash(manifestPath)) throw new Error("manifest digest binding is invalid");
+    const digest = JSON.parse(readFileSync(digestPath, "utf8"));
+    if (digest.schemaVersion !== 1 || digest.scheme !== "sha256" || digest.manifestSha256 !== hash(manifestPath)) throw new Error("manifest digest binding is invalid");
     const actual = [];
-    const visit = dir => { for (const name of readdirSync(dir).sort()) { const path = join(dir, name); const stat = lstatSync(path); if (stat.isSymbolicLink()) throw new Error(`symlink: ${path}`); if (stat.isDirectory()) visit(path); else if (stat.isFile() && stat.size > 0) { const rel = relative(root, path).replaceAll("\\", "/"); if (rel !== "release-manifest.json" && rel !== "release-manifest.sig") actual.push({ path: rel, sha256: hash(path), size: stat.size }); } else throw new Error(`special/empty file: ${path}`); } };
+    const visit = dir => { for (const name of readdirSync(dir).sort()) { const path = join(dir, name); const stat = lstatSync(path); if (stat.isSymbolicLink()) throw new Error(`symlink: ${path}`); if (stat.isDirectory()) visit(path); else if (stat.isFile() && stat.size > 0) { const rel = relative(root, path).replaceAll("\\", "/"); if (rel !== "release-manifest.json" && rel !== "release-manifest.digest.json") actual.push({ path: rel, sha256: hash(path), size: stat.size }); } else throw new Error(`special/empty file: ${path}`); } };
     visit(root);
     actual.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
     if (JSON.stringify(actual) !== JSON.stringify(manifest.files)) throw new Error("package inventory differs from manifest");

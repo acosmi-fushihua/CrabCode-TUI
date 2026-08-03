@@ -1,5 +1,57 @@
 # Changelog / 更新日志
 
+## v1.0.23 — 2026-08-02
+
+- Fixed the P1 `sources: []` crash across Gateway, `@acosmi/sdk-ts 2.15.0`,
+  TypeScript normalization, and the independent Rust renderer boundary.
+  Empty sources are now a presentation no-op; malformed optional provenance is
+  recoverable and cannot stop the runtime.
+- Added a generated, versioned renderer event policy. Known broken turn
+  lifecycle events interrupt only the correlated turn; only framing,
+  correlation, control, permission, trust, and secret-boundary failures retain
+  global fail-closed authority.
+- Made runtime shutdown idempotent and preserved the primary renderer failure
+  above cleanup errors.
+- Replaced process-global diagnostics with explicit injection, bounded
+  content-free shape metadata, strict raw redaction, and temporary test roots.
+- Added exact 63-byte incident replay, two-turn package smoke, Memory promotion
+  cleanup, real-state sentinels, and a five-platform 100-run CI/release matrix.
+- Hardened overlong Unix state roots with private `0700` short supervisor
+  namespaces and `0600` sockets while preserving every representable legacy
+  path. Memory shutdown now removes only its exact socket inode and its own
+  empty short namespace, preserving replacements and non-empty directories.
+- Added offline installer + stable-generation launcher replay to every package
+  gate, including zero process/socket/short-namespace leakage. macOS package
+  process inventory now prefilters candidates before canonical `lsof` checks.
+- Made release assets immutable, verified all eight assets with GitHub build
+  attestations before publishing a draft, and renamed the package-local hash
+  binding to the honest `release-manifest.digest.json` name.
+- Replaced the recommended mutable bootstrap pipeline with a version-pinned,
+  attestation-verified local-asset install flow. Legacy pipelines remain only
+  for compatibility and display an unauthenticated-bootstrap warning.
+
+---
+
+- 全链路修复 P1 `sources: []` 停机：Gateway、`@acosmi/sdk-ts 2.15.0`、
+  TypeScript 归一层与 Rust 独立防线统一语义。空来源成为展示级 no-op；损坏的可选
+  provenance 只做兼容降级，不能终止 runtime。
+- 新增由契约生成的版本化事件处置表。已知 turn 生命周期损坏只中断关联本轮；只有
+  framing、关联身份、control、权限、信任与秘密边界损坏仍拥有全局 fail-closed 权限。
+- shutdown 改为幂等，并确保 renderer 首要错误不会被 cleanup 次生错误覆盖。
+- renderer diagnostics 改为显式注入、有界无内容 shape metadata、严格 raw 脱敏与
+  临时测试状态根，不再污染真实 `~/.crabcode`。
+- 新增精确 63 字节事故回放、连续两轮 package smoke、Memory promotion 回收、真实
+  状态 sentinel，以及五平台每平台 100 次 CI/发行门禁。
+- 过长 Unix 状态根改用私有 `0700` supervisor 短命名空间与 `0600` socket，所有内核
+  可表示的历史路径保持不变。Memory 退出只删除自己绑定的精确 inode 和自身空短目录，
+  replacement inode 与非空目录均保留。
+- 每个平台 package 门禁新增离线 installer 与稳定版本 launcher 回放，并硬性验证进程、
+  socket、短命名空间零泄漏；macOS 进程盘点先预筛候选，再以 canonical `lsof` 核权。
+- 发布资产禁止覆盖；draft 发布前验证八个资产的 GitHub build attestation；包内普通
+  hash 绑定诚实改名为 `release-manifest.digest.json`。
+- 推荐安装改为固定版本、attestation 验证后的本地资产流程；旧 pipeline 仅为兼容保留，
+  并明确提示 bootstrap 来源未认证。
+
 ## v1.0.22 — 2026-08-02
 
 - Established a source-only, open-source baseline for the native CrabCode TUI.

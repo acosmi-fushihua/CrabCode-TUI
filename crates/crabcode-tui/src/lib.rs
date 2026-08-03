@@ -23,6 +23,7 @@ mod pending_relaunch;
 mod picker_surface;
 #[cfg(any(target_os = "windows", test))]
 mod prompt_images;
+mod release_package_smoke;
 mod renderer_diagnostics;
 mod retained_command_surface;
 pub mod runtime_host;
@@ -63,7 +64,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::runtime_host::RuntimeHost;
-use crate::sdk_runtime::{OutboundDeliveryId, OutboundSubmitError};
+use crate::sdk_runtime::{OutboundDeliveryId, OutboundSubmitError, ShutdownError, ShutdownOutcome};
 #[cfg(test)]
 use crate::tui_app::InitialSessionRequest;
 use crate::tui_app::{HostAction, OutboundPurpose, TuiApp, UiLanguage};
@@ -131,6 +132,9 @@ const fn effective_presentation_verbose(cli_override: Option<bool>, config_verbo
 }
 
 pub fn run() -> anyhow::Result<()> {
+    if let Some(result) = release_package_smoke::maybe_run(std::env::args_os()) {
+        return result;
+    }
     if let Some(exit_code) =
         crabcode_mermaid_worker::maybe_run_render_subprocess(std::env::args_os())
     {
@@ -193,6 +197,13 @@ pub fn run() -> anyhow::Result<()> {
         composer_prefill,
         presentation_verbose,
     );
+    let diagnostics_root = acosmi_daemon_launcher::paths::home_dir();
+    let diagnostics = renderer_diagnostics::RendererDiagnostics::from_state_root(&diagnostics_root)
+        .unwrap_or_else(|error| {
+            eprintln!("CrabCode renderer diagnostics are disabled for this run: {error}");
+            renderer_diagnostics::RendererDiagnostics::default()
+        });
+    app.set_renderer_diagnostics(diagnostics);
     app.set_slash_commands_enabled(slash_commands_enabled);
     app.configure_pre_initialize_setup(source_cwd)
         .map_err(anyhow::Error::msg)
@@ -250,10 +261,13 @@ pub fn run() -> anyhow::Result<()> {
             std::panic::resume_unwind(payload)
         }
         Ok(Ok(mut outcome)) => {
-            shutdown.context("failed to close the direct CrabCode runtime")?;
             if let Some(reason) = pre_shutdown_failure {
-                anyhow::bail!("direct CrabCode runtime failed: {reason}");
+                return Err(preserve_primary_shutdown_failure(
+                    anyhow::anyhow!("direct CrabCode runtime failed: {reason}"),
+                    shutdown,
+                ));
             }
+            shutdown.context("failed to close the direct CrabCode runtime")?;
             if let InteractiveOutcome::Relaunch(request) = &mut outcome {
                 request
                     .mark_runtime_stopped()
@@ -269,12 +283,33 @@ pub fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Ok(Err(error)) => match shutdown {
-            Ok(()) => Err(error),
-            Err(close_error) => Err(error.context(format!(
-                "direct CrabCode runtime also failed to close: {close_error}"
-            ))),
-        },
+        Ok(Err(error)) => {
+            let primary = pre_shutdown_failure.map_or(error, |reason| {
+                anyhow::anyhow!("direct CrabCode runtime failed: {reason}")
+            });
+            Err(preserve_primary_shutdown_failure(primary, shutdown))
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{primary}")]
+struct PrimaryShutdownFailure {
+    primary: String,
+    #[source]
+    cleanup: ShutdownError,
+}
+
+fn preserve_primary_shutdown_failure(
+    primary: anyhow::Error,
+    shutdown: Result<ShutdownOutcome, ShutdownError>,
+) -> anyhow::Error {
+    match shutdown {
+        Ok(_) => primary,
+        Err(cleanup) => anyhow::Error::new(PrimaryShutdownFailure {
+            primary: format!("{primary:#}"),
+            cleanup,
+        }),
     }
 }
 
@@ -1728,7 +1763,8 @@ fn submit_outbound_action(
             response,
         } => host.submit_startup_interaction_response(request_id, subtype, response.clone()),
         HostAction::Interrupt => host.submit_interrupt().map(|(request_id, delivery_id)| {
-            app.record_control_request(request_id, OutboundPurpose::Interrupt);
+            let purpose = app.interrupt_outbound_purpose();
+            app.record_control_request(request_id, purpose);
             delivery_id
         }),
         HostAction::StopRuntime { .. } => {
@@ -1812,6 +1848,7 @@ fn publish_test_only_resume_cutover_ready() -> io::Result<()> {
 }
 
 #[cfg(feature = "terminal-lifecycle-tests")]
+#[allow(unsafe_code)]
 fn inject_test_only_fault_after_raw() -> anyhow::Result<()> {
     const FAULT_ENV: &str = "CRABCODE_TUI_TEST_ONLY_FAULT_AFTER_RAW";
     const READY_FILE_ENV: &str = "CRABCODE_TUI_TEST_ONLY_FAULT_READY_FILE";
@@ -1866,6 +1903,18 @@ fn inject_test_only_fault_after_raw() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_failure_never_replaces_the_primary_runtime_error() {
+        let error = preserve_primary_shutdown_failure(
+            anyhow::anyhow!("primary renderer failure"),
+            Err(ShutdownError::SupervisorClosed),
+        );
+        assert_eq!(error.to_string(), "primary renderer failure");
+        let chain = format!("{error:#}");
+        assert!(chain.starts_with("primary renderer failure"));
+        assert!(chain.contains("SDK runtime supervisor is closed"));
+    }
 
     #[test]
     fn presentation_verbose_uses_explicit_override_or_authoritative_config() {

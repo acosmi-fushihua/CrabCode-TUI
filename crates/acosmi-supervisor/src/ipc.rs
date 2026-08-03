@@ -354,6 +354,55 @@ pub struct IpcConfig {
     pub auth_secret: String,
 }
 
+#[cfg(unix)]
+const UNIX_SOCKET_SAFE_PATH_BYTES: usize = 100;
+#[cfg(unix)]
+const SHORT_SUPERVISOR_SOCKET_ROOT: &str = "/tmp";
+#[cfg(unix)]
+const SHORT_SUPERVISOR_DIR_PREFIX: &str = "crabcode-supervisor-";
+
+/// Preserve the historical state-root socket for every path the kernel can
+/// represent. Overlong roots use an unguessable, process-private directory
+/// under `/tmp`; the authenticated child receives the exact resolved path via
+/// `CRABCODE_SUPERVISOR_UDS`, so no external client has to recompute it.
+#[cfg(unix)]
+fn default_unix_socket_path(state_dir: &std::path::Path, pid: u32) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let candidate = state_dir.join("supervisor").join(format!("{pid}.sock"));
+    if candidate.as_os_str().as_bytes().len() <= UNIX_SOCKET_SAFE_PATH_BYTES {
+        return candidate;
+    }
+
+    let namespace = uuid::Uuid::new_v4().simple().to_string();
+    PathBuf::from(SHORT_SUPERVISOR_SOCKET_ROOT)
+        .join(format!("{SHORT_SUPERVISOR_DIR_PREFIX}{namespace}"))
+        .join(format!("{pid}.sock"))
+}
+
+#[cfg(unix)]
+fn ephemeral_short_socket_parent(path: &std::path::Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    if parent.parent() != Some(std::path::Path::new(SHORT_SUPERVISOR_SOCKET_ROOT)) {
+        return None;
+    }
+    let name = parent.file_name()?.to_str()?;
+    let namespace = name.strip_prefix(SHORT_SUPERVISOR_DIR_PREFIX)?;
+    (namespace.len() == 32 && namespace.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| parent.to_path_buf())
+}
+
+#[cfg(unix)]
+fn cleanup_unix_socket_start_failure(
+    socket_path: &std::path::Path,
+    ephemeral_parent: Option<&std::path::Path>,
+) {
+    let _ = std::fs::remove_file(socket_path);
+    if let Some(parent) = ephemeral_parent {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
 /// P1-2: 生成进程级一次性握手密钥（≥240 bit CSPRNG 熵）。
 ///
 /// 复用既有 `uuid` v4 依赖（getrandom CSPRNG，无需新增 crate）。两个 v4
@@ -375,6 +424,9 @@ impl Default for IpcConfig {
         // 多 supervisor 撞同一 socket）。
         let pid = std::process::id();
         let state_dir = acosmi_config::paths::resolve_state_dir();
+        #[cfg(unix)]
+        let uds_path = default_unix_socket_path(&state_dir, pid);
+        #[cfg(not(unix))]
         let uds_path = state_dir.join("supervisor").join(format!("{pid}.sock"));
         Self {
             uds_path: Some(uds_path),
@@ -477,18 +529,58 @@ impl IpcServer {
         use tokio::net::UnixListener;
 
         let uds_path = config.uds_path.clone().unwrap_or_else(|| {
-            // P1-2: fallback 也落 state_dir/supervisor，不再用 /tmp。
-            acosmi_config::paths::resolve_state_dir()
-                .join("supervisor")
-                .join(format!("{}.sock", std::process::id()))
+            default_unix_socket_path(
+                &acosmi_config::paths::resolve_state_dir(),
+                std::process::id(),
+            )
         });
+        let ephemeral_parent = ephemeral_short_socket_parent(&uds_path);
 
         // P1-2: 父目录 0700（仅当前用户可遍历），create_dir_all 后强制权限。
         if let Some(parent) = uds_path.parent() {
-            std::fs::create_dir_all(parent)?;
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            {
+            use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+            if ephemeral_parent.is_some() {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder.create(parent)?;
+                let metadata = match std::fs::symlink_metadata(parent) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        cleanup_unix_socket_start_failure(&uds_path, ephemeral_parent.as_deref());
+                        return Err(error.into());
+                    }
+                };
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!(
+                        "短 supervisor socket 父路径不是私有实体目录: {}",
+                        parent.display()
+                    );
+                }
+            } else {
+                std::fs::create_dir_all(parent)?;
+            }
+            let permission_result =
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            if ephemeral_parent.is_some() {
+                if let Err(error) = permission_result {
+                    cleanup_unix_socket_start_failure(&uds_path, ephemeral_parent.as_deref());
+                    return Err(error.into());
+                }
+                let actual_mode = match std::fs::metadata(parent) {
+                    Ok(metadata) => metadata.permissions().mode() & 0o777,
+                    Err(error) => {
+                        cleanup_unix_socket_start_failure(&uds_path, ephemeral_parent.as_deref());
+                        return Err(error.into());
+                    }
+                };
+                if actual_mode != 0o700 {
+                    cleanup_unix_socket_start_failure(&uds_path, ephemeral_parent.as_deref());
+                    anyhow::bail!(
+                        "短 supervisor socket 私有目录权限不是 0700: {} (mode={actual_mode:o})",
+                        parent.display()
+                    );
+                }
+            } else if let Err(e) = permission_result {
                 tracing::warn!(error = %e, dir = %parent.display(), "设置 supervisor socket 目录 0700 失败");
             }
         }
@@ -499,11 +591,40 @@ impl IpcServer {
             let _ = std::fs::remove_file(&uds_path);
         }
 
-        let listener = UnixListener::bind(&uds_path)?;
+        let listener = match UnixListener::bind(&uds_path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                cleanup_unix_socket_start_failure(&uds_path, ephemeral_parent.as_deref());
+                return Err(error.into());
+            }
+        };
         // P1-2: bind 后立刻把 socket chmod 0600（仅 owner 读写）。
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&uds_path, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+            if let Err(error) =
+                std::fs::set_permissions(&uds_path, std::fs::Permissions::from_mode(0o600))
+            {
+                drop(listener);
+                cleanup_unix_socket_start_failure(&uds_path, ephemeral_parent.as_deref());
+                return Err(error.into());
+            }
+            let metadata = match std::fs::symlink_metadata(&uds_path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    drop(listener);
+                    cleanup_unix_socket_start_failure(&uds_path, ephemeral_parent.as_deref());
+                    return Err(error.into());
+                }
+            };
+            let actual_mode = metadata.permissions().mode() & 0o777;
+            if !metadata.file_type().is_socket() || actual_mode != 0o600 {
+                drop(listener);
+                cleanup_unix_socket_start_failure(&uds_path, ephemeral_parent.as_deref());
+                anyhow::bail!(
+                    "supervisor socket 类型或权限校验失败: {} (mode={actual_mode:o})",
+                    uds_path.display()
+                );
+            }
         }
         tracing::info!(path = %uds_path.display(), "IPC 服务器启动（Unix Domain Socket，0600）");
 
@@ -568,6 +689,10 @@ impl IpcServer {
             if uds_path.exists() {
                 let _ = std::fs::remove_file(&uds_path);
                 tracing::debug!(path = %uds_path.display(), "已清理 UDS socket 文件");
+            }
+            if let Some(parent) = ephemeral_parent {
+                let _ = std::fs::remove_dir(&parent);
+                tracing::debug!(path = %parent.display(), "已清理短 supervisor socket 私有目录");
             }
         });
 
@@ -3974,6 +4099,73 @@ mod tests {
             config.auth_secret, other.auth_secret,
             "两次生成的 secret 应不同"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_unix_socket_path_preserves_short_roots_and_shortens_long_roots() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let short_root = std::path::Path::new("/tmp/crabcode-supervisor-short-state");
+        assert_eq!(
+            default_unix_socket_path(short_root, 4242),
+            short_root.join("supervisor/4242.sock"),
+            "representable historical paths remain byte-for-byte compatible"
+        );
+
+        let long_root = std::path::PathBuf::from("/tmp").join("s".repeat(180));
+        let first = default_unix_socket_path(&long_root, 4242);
+        let second = default_unix_socket_path(&long_root, 4242);
+        assert_ne!(first, second, "each supervisor gets a private namespace");
+        assert!(
+            first.as_os_str().as_bytes().len() <= UNIX_SOCKET_SAFE_PATH_BYTES,
+            "{}",
+            first.display()
+        );
+        assert_eq!(first.file_name(), Some(std::ffi::OsStr::new("4242.sock")));
+        assert!(ephemeral_short_socket_parent(&first).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlong_state_root_socket_binds_privately_and_cleans_its_namespace() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let long_root = std::path::PathBuf::from("/tmp").join("s".repeat(180));
+        let sock = default_unix_socket_path(&long_root, std::process::id());
+        let parent = ephemeral_short_socket_parent(&sock).expect("short private parent");
+        let cfg = IpcConfig {
+            uds_path: Some(sock.clone()),
+            ..IpcConfig::default()
+        };
+        let executor = Arc::new(CommandExecutor::new());
+        let shutdown = CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<IpcSignal>(8);
+        let server = IpcServer::new(cfg, executor, shutdown.clone(), tx);
+        let handle = server.start().await.expect("overlong state root must bind");
+
+        assert!(sock.exists(), "{}", sock.display());
+        assert_eq!(
+            std::fs::metadata(&parent)
+                .expect("short parent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&sock)
+                .expect("short socket metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        shutdown.cancel();
+        handle.await.expect("IPC server task joins");
+        assert!(!sock.exists(), "short socket must be removed");
+        assert!(!parent.exists(), "private short namespace must be removed");
     }
 
     // ── P1-2: 握手密钥校验单测 ──────────────────────────────────────

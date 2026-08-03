@@ -12,6 +12,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
+use crate::generated_renderer_contract::{
+    GeneratedEventDisposition, generated_stream_event_disposition,
+};
 use crate::sdk_runtime::{
     DirectSystemSubtype, EnvelopeClass, RawEnvelope, RequestCorrelation, SystemSubtype,
 };
@@ -25,10 +28,10 @@ pub const UNPROJECTED_DIRECT_QUERY_EVENT_TYPES: [&str; 0] = [];
 /// Raw stream-event members known in the current QueryEngine sources.
 ///
 /// The first eight members are the current `BetaRawMessageStreamEvent` union in
-/// `src/types/api-types.ts`. The locked `@acosmi/sdk-ts` 2.12.0
-/// `parseSourcesEvent` additionally recognizes a JSON payload whose `type` is
-/// `sources` and returns its declared `SourcesEvent`; `chatStreamAdapter`
-/// JSON-parses that same payload and `queryModel.ts` forwards it unchanged.
+/// `src/types/api-types.ts`. The locked `@acosmi/sdk-ts` 2.15.0
+/// `classifySourcesEvent` additionally recognizes a JSON payload whose `type`
+/// is `sources`. `chatStreamAdapter` suppresses empty or malformed source
+/// payloads and forwards only the classifier's normalized non-empty event.
 /// This is a drift baseline, not a runtime allowlist: a future presentation
 /// member remains visible and diagnosable without stopping the backend.
 #[cfg(test)]
@@ -429,6 +432,7 @@ pub struct DirectStreamActivityState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionCompatibilityKind {
     UnknownPresentation,
+    MalformedPresentation,
     StreamReplay,
     StreamIndexReuse,
     StreamOverlap,
@@ -1181,6 +1185,21 @@ pub enum ProjectionEffect {
         is_error: bool,
         raw_sequence: u64,
     },
+    /// A presentation-only or forward-compatible stream event could not be
+    /// projected. The raw envelope and bounded metadata have been retained;
+    /// the current turn and runtime remain authoritative and active.
+    CompatibilityFault {
+        sequence: u64,
+        event_type: String,
+        code: String,
+    },
+    /// A known message lifecycle can no longer be projected reliably. The
+    /// host must interrupt only the active turn and keep the runtime alive.
+    AbortTurn {
+        sequence: u64,
+        code: String,
+        reason: String,
+    },
     /// The raw value has already been journaled when this is returned. The
     /// host must stop the child and show an upgrade diagnostic.
     FailClosed {
@@ -1281,6 +1300,7 @@ impl DirectUserEnvelopeFields {
 
 #[derive(Debug, Default)]
 pub struct Projection {
+    diagnostics: crate::renderer_diagnostics::RendererDiagnostics,
     raw_envelopes: Vec<RawEnvelope>,
     raw_envelope_count: u64,
     raw_evicted_count: u64,
@@ -1401,27 +1421,84 @@ impl Projection {
         };
         let effect = match projected {
             Ok(effect) => effect,
-            // Compatibility failures are owned by the fatal modal lifecycle
-            // (`TuiApp::fail_closed`), which displays the exact reason and
-            // recent diagnostics. They are not transcript messages in the
-            // fixed direct product, so do not also fabricate an untyped Error
-            // row that the scrollback cannot consume.
-            Err(reason) => ProjectionEffect::FailClosed { sequence, reason },
+            Err(reason) => self.stream_projection_failure_effect(&raw, reason),
         };
         let block_generation = self.diagnostic_block_generation(&raw);
-        let compatibility = self
+        let compatibility_count = self
             .compatibility_diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.sequence == sequence)
-            .map(|diagnostic| diagnostic.reason.clone())
-            .collect::<Vec<_>>();
-        crate::renderer_diagnostics::record_envelope(
+            .count();
+        let (disposition, issue_code, root_error_code) =
+            projection_effect_diagnostic_fields(&effect, &raw);
+        self.diagnostics.record_envelope(
             &raw,
             self.direct_stream_activity.turn_generation,
             block_generation,
-            &compatibility,
+            disposition,
+            issue_code,
+            root_error_code,
+            compatibility_count,
         );
         effect
+    }
+
+    fn stream_projection_failure_effect(
+        &mut self,
+        envelope: &RawEnvelope,
+        reason: String,
+    ) -> ProjectionEffect {
+        let EnvelopeClass::StreamEvent { event_type } = &envelope.classification else {
+            return ProjectionEffect::FailClosed {
+                sequence: envelope.sequence,
+                reason,
+            };
+        };
+        let Some(event_type) = event_type.as_deref() else {
+            return ProjectionEffect::AbortTurn {
+                sequence: envelope.sequence,
+                code: "stream_event_type_missing".to_string(),
+                reason,
+            };
+        };
+        let code = format!("{event_type}_invalid");
+        match generated_stream_event_disposition(event_type) {
+            Some(GeneratedEventDisposition::TurnFatal) => ProjectionEffect::AbortTurn {
+                sequence: envelope.sequence,
+                code,
+                reason,
+            },
+            Some(
+                GeneratedEventDisposition::PresentationOnly
+                | GeneratedEventDisposition::Recoverable,
+            )
+            | None => {
+                self.record_compatibility(
+                    envelope.sequence,
+                    ProjectionCompatibilityKind::MalformedPresentation,
+                    None,
+                    None,
+                    format!("ignored incompatible stream event `{event_type}` ({code})"),
+                    false,
+                );
+                ProjectionEffect::CompatibilityFault {
+                    sequence: envelope.sequence,
+                    event_type: event_type.to_string(),
+                    code,
+                }
+            }
+            Some(GeneratedEventDisposition::ProtocolFatal) => ProjectionEffect::FailClosed {
+                sequence: envelope.sequence,
+                reason,
+            },
+        }
+    }
+
+    pub(crate) fn set_renderer_diagnostics(
+        &mut self,
+        diagnostics: crate::renderer_diagnostics::RendererDiagnostics,
+    ) {
+        self.diagnostics = diagnostics;
     }
 
     #[cfg(test)]
@@ -1664,6 +1741,7 @@ impl Projection {
     }
 
     fn replace_session_projection_preserving_diagnostics(&mut self, mut replacement: Self) {
+        replacement.diagnostics = std::mem::take(&mut self.diagnostics);
         replacement.raw_envelopes = std::mem::take(&mut self.raw_envelopes);
         replacement.raw_envelope_count = self.raw_envelope_count;
         replacement.raw_evicted_count = self.raw_evicted_count;
@@ -1721,8 +1799,7 @@ impl Projection {
                 Ok(ProjectionEffect::None)
             }
             EnvelopeClass::StreamEvent { event_type } => {
-                self.project_stream_event(envelope, event_type.as_deref())?;
-                Ok(ProjectionEffect::None)
+                self.project_stream_event(envelope, event_type.as_deref())
             }
             EnvelopeClass::ToolProgress => {
                 self.project_tool_progress(envelope)?;
@@ -3431,22 +3508,43 @@ impl Projection {
         &mut self,
         envelope: &RawEnvelope,
         declared_type: Option<&str>,
-    ) -> Result<(), String> {
-        let event = envelope
-            .value
-            .get("event")
-            .ok_or_else(|| "stream_event omitted event".to_string())?;
-        let event_type = event
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "stream_event omitted event.type".to_string())?;
+    ) -> Result<ProjectionEffect, String> {
+        // SDK/session identity is an authority boundary and is validated
+        // before the presentation event discriminator. Its failures remain
+        // protocol-fatal instead of being downgraded by a stream policy.
+        let context = match stream_context(&envelope.value, envelope) {
+            Ok(context) => context,
+            Err(reason) => {
+                return Ok(ProjectionEffect::FailClosed {
+                    sequence: envelope.sequence,
+                    reason,
+                });
+            }
+        };
+        let Some(event) = envelope.value.get("event") else {
+            return Ok(ProjectionEffect::AbortTurn {
+                sequence: envelope.sequence,
+                code: "stream_event_missing".to_string(),
+                reason: "stream_event omitted event".to_string(),
+            });
+        };
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            return Ok(ProjectionEffect::AbortTurn {
+                sequence: envelope.sequence,
+                code: "stream_event_type_missing".to_string(),
+                reason: "stream_event omitted string event.type".to_string(),
+            });
+        };
         if declared_type != Some(event_type) {
-            return Err(format!(
-                "stream_event classification disagrees with event.type at sequence {}",
-                envelope.sequence
-            ));
+            return Ok(ProjectionEffect::FailClosed {
+                sequence: envelope.sequence,
+                reason: format!(
+                    "stream_event classification disagrees with event.type at sequence {}",
+                    envelope.sequence
+                ),
+            });
         }
-        let context = stream_context(&envelope.value, envelope)?;
+        let mut effect = ProjectionEffect::None;
         match event_type {
             "message_start" => {
                 let message_id = event
@@ -3543,7 +3641,7 @@ impl Projection {
                         if context == StreamContext::DirectQuery {
                             self.observe_direct_stream_event_activity(event_type, event, envelope)?;
                         }
-                        return Ok(());
+                        return Ok(ProjectionEffect::None);
                     }
 
                     self.record_compatibility(
@@ -3601,7 +3699,7 @@ impl Projection {
                     if context == StreamContext::DirectQuery {
                         self.observe_direct_stream_event_activity(event_type, event, envelope)?;
                     }
-                    return Ok(());
+                    return Ok(ProjectionEffect::None);
                 };
                 let mut tool_use_id = string_at(block, &["tool_use_id"]);
                 let mut title = stream_title(&block_type).to_string();
@@ -3910,7 +4008,7 @@ impl Projection {
                     if context == StreamContext::DirectQuery {
                         self.observe_direct_stream_event_activity(event_type, event, envelope)?;
                     }
-                    return Ok(());
+                    return Ok(ProjectionEffect::None);
                 }
                 let message_id = self.stream_message_id(event, &context, envelope.sequence)?;
                 let slot = StreamBlockSlot {
@@ -3964,7 +4062,7 @@ impl Projection {
                     if context == StreamContext::DirectQuery {
                         self.observe_direct_stream_event_activity(event_type, event, envelope)?;
                     }
-                    return Ok(());
+                    return Ok(ProjectionEffect::None);
                 };
                 let block_type = active.block_type.clone();
                 if !stream_delta_matches_block(&block_type, expected_block) {
@@ -3982,7 +4080,7 @@ impl Projection {
                     if context == StreamContext::DirectQuery {
                         self.observe_direct_stream_event_activity(event_type, event, envelope)?;
                     }
-                    return Ok(());
+                    return Ok(ProjectionEffect::None);
                 }
                 let item_key = active.item_key.clone();
                 self.append_stream_delta(
@@ -4074,6 +4172,7 @@ impl Projection {
             "message_delta" => {}
             "error" => {
                 let stream_error = parse_stream_error(event, envelope)?;
+                let reason = stream_error.message.clone();
                 if let Some(message_id) = self.active_message_by_context.remove(&context) {
                     self.finish_stream_message(&context, &message_id, envelope.sequence);
                 }
@@ -4099,6 +4198,11 @@ impl Projection {
                         ..ProjectedPresentation::default()
                     },
                 });
+                effect = ProjectionEffect::AbortTurn {
+                    sequence: envelope.sequence,
+                    code: "upstream_stream_error".to_string(),
+                    reason,
+                };
             }
             "message_stop" => {
                 let Some(message_id) = self.active_message_by_context.remove(&context) else {
@@ -4113,7 +4217,7 @@ impl Projection {
                     if context == StreamContext::DirectQuery {
                         self.observe_direct_stream_event_activity(event_type, event, envelope)?;
                     }
-                    return Ok(());
+                    return Ok(ProjectionEffect::None);
                 };
                 self.finish_stream_message(&context, &message_id, envelope.sequence);
             }
@@ -4121,14 +4225,31 @@ impl Projection {
             // payload-free heartbeat. The complete envelope is already in the
             // raw journal; it must not create conversational transcript text.
             "ping" => {}
-            // Acosmi SDK `SourcesEvent` is an in-band search/RAG provenance
-            // record. QueryModel deliberately performs no conversational
-            // projection for it before forwarding the exact raw stream event.
-            // Validate its closed typed payload and retain it only in the raw
-            // journal. The fixed `handleMessageFromStream` default branch did
-            // still advance the direct spinner to `responding`; that lifecycle
-            // effect is applied below without inventing transcript content.
-            "sources" => validate_stream_sources_event(event, envelope)?,
+            // Empty search provenance is a legal zero-result presentation
+            // event. It is intentionally inert: no transcript row, activity,
+            // TTFT, token, or turn-state mutation. A malformed payload is
+            // retained as bounded compatibility evidence and also remains
+            // non-fatal. Only a non-empty, valid event reaches the ordinary
+            // direct-query activity update below.
+            "sources" => match validate_stream_sources_event(event) {
+                SourcesEventValidation::Empty => return Ok(ProjectionEffect::None),
+                SourcesEventValidation::Valid => {}
+                SourcesEventValidation::Malformed(code) => {
+                    self.record_compatibility(
+                        envelope.sequence,
+                        ProjectionCompatibilityKind::MalformedPresentation,
+                        None,
+                        None,
+                        format!("ignored malformed sources event ({code})"),
+                        false,
+                    );
+                    return Ok(ProjectionEffect::CompatibilityFault {
+                        sequence: envelope.sequence,
+                        event_type: "sources".to_string(),
+                        code: code.to_string(),
+                    });
+                }
+            },
             unknown => {
                 self.record_compatibility(
                     envelope.sequence,
@@ -4138,14 +4259,19 @@ impl Projection {
                     format!(
                         "Unsupported stream event `{unknown}` retained without stopping the backend"
                     ),
-                    true,
+                    false,
                 );
+                return Ok(ProjectionEffect::CompatibilityFault {
+                    sequence: envelope.sequence,
+                    event_type: unknown.to_string(),
+                    code: "unknown_stream_event".to_string(),
+                });
             }
         }
         if context == StreamContext::DirectQuery {
             self.observe_direct_stream_event_activity(event_type, event, envelope)?;
         }
-        Ok(())
+        Ok(effect)
     }
 
     fn finish_stream_message(&mut self, context: &StreamContext, message_id: &str, sequence: u64) {
@@ -8885,28 +9011,87 @@ fn parse_stream_error(
     })
 }
 
-fn validate_stream_sources_event(event: &Value, envelope: &RawEnvelope) -> Result<(), String> {
-    let sources = required_array_at(event, &["sources"], "stream sources event", envelope)?;
-    if sources.is_empty() {
-        return Err(format!(
-            "stream sources event sources is empty at sequence {}",
-            envelope.sequence
-        ));
-    }
-    optional_string_at(event, &["session_id"], "stream sources event", envelope)?;
-    for (index, source) in sources.iter().enumerate() {
-        if !source.is_object() {
-            return Err(format!(
-                "stream sources event sources[{index}] is not an object at sequence {}",
-                envelope.sequence
-            ));
+fn projection_effect_diagnostic_fields<'a>(
+    effect: &'a ProjectionEffect,
+    envelope: &RawEnvelope,
+) -> (&'static str, Option<&'a str>, Option<&'static str>) {
+    match effect {
+        ProjectionEffect::SessionTransition { effect, .. } => {
+            projection_effect_diagnostic_fields(effect, envelope)
         }
-        let context = format!("stream sources event sources[{index}]");
-        required_string_at(source, &["title"], &context, envelope)?;
-        required_string_at(source, &["url"], &context, envelope)?;
-        optional_string_at(source, &["snippet"], &context, envelope)?;
+        ProjectionEffect::CompatibilityFault { code, .. } => {
+            ("recoverable", Some(code.as_str()), None)
+        }
+        ProjectionEffect::AbortTurn { code, .. } => (
+            "turn-fatal",
+            Some(code.as_str()),
+            Some("projection_turn_fatal"),
+        ),
+        ProjectionEffect::FailClosed { .. } => {
+            ("protocol-fatal", None, Some("projection_protocol_fatal"))
+        }
+        _ => {
+            let disposition = match &envelope.classification {
+                EnvelopeClass::StreamEvent {
+                    event_type: Some(event_type),
+                } => match generated_stream_event_disposition(event_type) {
+                    Some(GeneratedEventDisposition::PresentationOnly) => "presentation-only",
+                    Some(GeneratedEventDisposition::Recoverable) => "recoverable",
+                    Some(GeneratedEventDisposition::TurnFatal) => "turn-fatal",
+                    Some(GeneratedEventDisposition::ProtocolFatal) => "protocol-fatal",
+                    None => "recoverable",
+                },
+                _ => "accepted",
+            };
+            (disposition, None, None)
+        }
     }
-    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourcesEventValidation {
+    Empty,
+    Valid,
+    Malformed(&'static str),
+}
+
+fn validate_stream_sources_event(event: &Value) -> SourcesEventValidation {
+    let Some(object) = event.as_object() else {
+        return SourcesEventValidation::Malformed("missing_sources");
+    };
+    let Some(sources) = object.get("sources") else {
+        return SourcesEventValidation::Malformed("missing_sources");
+    };
+    if object
+        .get("session_id")
+        .is_some_and(|session_id| !session_id.is_string())
+    {
+        return SourcesEventValidation::Malformed("session_id_invalid");
+    }
+    let Some(sources) = sources.as_array() else {
+        return SourcesEventValidation::Malformed("sources_not_array");
+    };
+    if sources.is_empty() {
+        return SourcesEventValidation::Empty;
+    }
+    for source in sources {
+        let Some(source) = source.as_object() else {
+            return SourcesEventValidation::Malformed("source_not_object");
+        };
+        if !source.get("title").is_some_and(Value::is_string) {
+            return SourcesEventValidation::Malformed("source_title_invalid");
+        }
+        if !source.get("url").is_some_and(Value::is_string) {
+            return SourcesEventValidation::Malformed("source_url_invalid");
+        }
+        if source
+            .get("snippet")
+            .is_some_and(|snippet| !snippet.is_string())
+        {
+            return SourcesEventValidation::Malformed("source_snippet_invalid");
+        }
+    }
+    SourcesEventValidation::Valid
 }
 
 fn stream_context(value: &Value, envelope: &RawEnvelope) -> Result<StreamContext, String> {
@@ -9417,6 +9602,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::generated_renderer_contract::{
+        GENERATED_ASSISTANT_CONTENT_BLOCK_TYPES, GENERATED_SDK_RESULT_SUBTYPES,
+        GENERATED_STREAM_EVENT_TYPES, GENERATED_USER_CONTENT_BLOCK_TYPES,
+    };
 
     fn raw(sequence: u64, value: Value) -> RawEnvelope {
         let classification = crate::sdk_runtime::classify_envelope(&value).unwrap_or_else(|_| {
@@ -13735,10 +13924,15 @@ mod tests {
                 "event":{"type":"future_sdk_event"}
             }),
         ));
-        assert_eq!(effect, ProjectionEffect::None);
-        assert!(future_projection.items().iter().any(|item| {
-            item.title == "Renderer compatibility" && item.text.contains("future_sdk_event")
-        }));
+        assert_eq!(
+            effect,
+            ProjectionEffect::CompatibilityFault {
+                sequence: 8,
+                event_type: "future_sdk_event".to_string(),
+                code: "unknown_stream_event".to_string(),
+            }
+        );
+        assert!(future_projection.items().is_empty());
         assert!(
             future_projection
                 .compatibility_diagnostics()
@@ -13761,8 +13955,9 @@ mod tests {
         ));
         assert!(matches!(
             missing_discriminator,
-            ProjectionEffect::FailClosed { reason, .. }
-                if reason.contains("stream_event omitted event.type")
+            ProjectionEffect::AbortTurn { code, reason, .. }
+                if code == "stream_event_type_missing"
+                    && reason.contains("stream_event omitted string event.type")
         ));
     }
 
@@ -13786,17 +13981,26 @@ mod tests {
         ];
         let mut projection = Projection::default();
         for (sequence, event) in frames.into_iter().enumerate() {
-            assert_eq!(
-                projection.ingest(raw(
-                    sequence as u64,
-                    json!({
-                        "type":"stream_event",
-                        "uuid":format!("stream-{sequence}"),
-                        "event":event
-                    })
-                )),
-                ProjectionEffect::None
-            );
+            let effect = projection.ingest(raw(
+                sequence as u64,
+                json!({
+                    "type":"stream_event",
+                    "uuid":format!("stream-{sequence}"),
+                    "event":event
+                }),
+            ));
+            if sequence == 3 {
+                assert_eq!(
+                    effect,
+                    ProjectionEffect::AbortTurn {
+                        sequence: 3,
+                        code: "upstream_stream_error".to_string(),
+                        reason: "gateway overloaded".to_string(),
+                    }
+                );
+            } else {
+                assert_eq!(effect, ProjectionEffect::None);
+            }
         }
 
         assert_eq!(projection.items().len(), 2);
@@ -13880,32 +14084,46 @@ mod tests {
     }
 
     #[test]
-    fn malformed_stream_sources_fail_closed_by_exact_field() {
-        for (sequence, event, expected_reason) in [
-            (
-                0,
-                json!({"type":"sources","sources":{}}),
-                "omitted array sources",
-            ),
+    fn empty_stream_sources_are_inert_and_malformed_sources_are_recoverable() {
+        let mut empty_projection = Projection::default();
+        let incident_fixture =
+            include_str!("../../../tests/fixtures/renderer/empty-sources-sequence-6034.jsonl")
+                .trim_end();
+        assert_eq!(incident_fixture.as_bytes().len(), 63);
+        let empty: Value = serde_json::from_str(incident_fixture).expect("incident fixture parses");
+        assert_eq!(
+            empty_projection.ingest(raw(6034, empty.clone())),
+            ProjectionEffect::None
+        );
+        assert_eq!(empty_projection.raw_envelopes()[0].value, empty);
+        assert!(empty_projection.items().is_empty());
+        assert_eq!(
+            empty_projection.direct_stream_activity(),
+            &DirectStreamActivityState::default()
+        );
+        assert!(empty_projection.compatibility_diagnostics().is_empty());
+
+        for (sequence, event, expected_code) in [
+            (0, json!({"type":"sources"}), "missing_sources"),
             (
                 1,
-                json!({"type":"sources","sources":[]}),
-                "sources is empty",
+                json!({"type":"sources","sources":{}}),
+                "sources_not_array",
             ),
             (
                 2,
                 json!({"type":"sources","sources":["not-an-object"]}),
-                "sources[0] is not an object",
+                "source_not_object",
             ),
             (
                 3,
                 json!({"type":"sources","sources":[{"url":"https://example.invalid"}]}),
-                "omitted string title",
+                "source_title_invalid",
             ),
             (
                 4,
                 json!({"type":"sources","sources":[{"title":"Missing URL"}]}),
-                "omitted string url",
+                "source_url_invalid",
             ),
             (
                 5,
@@ -13917,7 +14135,7 @@ mod tests {
                         "snippet":7
                     }]
                 }),
-                "non-string optional snippet",
+                "source_snippet_invalid",
             ),
             (
                 6,
@@ -13926,7 +14144,7 @@ mod tests {
                     "sources":[{"title":"Source","url":"https://example.invalid"}],
                     "session_id":7
                 }),
-                "non-string optional session_id",
+                "session_id_invalid",
             ),
         ] {
             let mut projection = Projection::default();
@@ -13934,15 +14152,20 @@ mod tests {
                 sequence,
                 json!({"type":"stream_event","uuid":format!("sources-{sequence}"),"event":event}),
             ));
-            assert!(
-                matches!(
-                    &effect,
-                    ProjectionEffect::FailClosed { reason, .. }
-                        if reason.contains(expected_reason)
-                ),
-                "malformed sources sequence {sequence} did not fail on `{expected_reason}`: {effect:?}"
+            assert_eq!(
+                effect,
+                ProjectionEffect::CompatibilityFault {
+                    sequence,
+                    event_type: "sources".to_string(),
+                    code: expected_code.to_string(),
+                },
+                "malformed sources sequence {sequence} did not classify as `{expected_code}`"
             );
             assert!(projection.items().is_empty());
+            assert!(projection.compatibility_diagnostics().iter().any(|entry| {
+                entry.kind == ProjectionCompatibilityKind::MalformedPresentation
+                    && entry.reason.contains(expected_code)
+            }));
         }
     }
 
@@ -15311,16 +15534,7 @@ mod tests {
 
         // All five result subtypes share the exact required metrics/identity
         // envelope and differ only in success.result versus error.errors.
-        for (sequence, subtype) in [
-            "success",
-            "error_during_execution",
-            "error_max_budget_usd",
-            "error_max_structured_output_retries",
-            "error_max_turns",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (sequence, subtype) in GENERATED_SDK_RESULT_SUBTYPES.iter().copied().enumerate() {
             let is_success = subtype == "success";
             let mut value = json!({
                 "type": "result",
@@ -15472,16 +15686,56 @@ mod tests {
         assert_eq!(projection.raw_envelopes()[0].value, keep_alive);
         assert!(projection.items().is_empty());
 
-        // Fail-closed and raw-before-projection invariants apply across the
-        // complete denominator, not just to one discriminator family.
+        // Raw-before-projection and the fixed failure-scope policy apply
+        // across the complete denominator, not just to one discriminator
+        // family.
         extra_fields_survive_known_message_projection_verbatim();
         journals_complete_unknown_presentation_without_stopping_runtime();
         unknown_assistant_block_and_stream_delta_are_nonfatal_and_diagnosable();
-        malformed_typed_variants_fail_closed_without_guessing_defaults();
+        malformed_typed_variants_follow_fixed_failure_scope_without_guessing_defaults();
     }
 
     #[test]
-    fn malformed_typed_variants_fail_closed_without_guessing_defaults() {
+    fn compiler_generated_projection_families_reach_typed_rust_discriminators() {
+        let generated_stream = GENERATED_STREAM_EVENT_TYPES
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let runtime_stream = KNOWN_RAW_STREAM_EVENT_TYPES
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            generated_stream, runtime_stream,
+            "the generated TypeScript stream union and Rust projection denominator must remain exact"
+        );
+
+        for block_type in GENERATED_ASSISTANT_CONTENT_BLOCK_TYPES {
+            assert!(
+                assistant_block_type(block_type).is_some(),
+                "assistant content block {block_type} lacks a native discriminator"
+            );
+        }
+        for block_type in GENERATED_USER_CONTENT_BLOCK_TYPES {
+            assert!(
+                direct_user_block_type(block_type, 0).is_ok(),
+                "user content block {block_type} lacks a native discriminator"
+            );
+        }
+        assert_eq!(
+            GENERATED_SDK_RESULT_SUBTYPES,
+            [
+                "error_during_execution",
+                "error_max_budget_usd",
+                "error_max_structured_output_retries",
+                "error_max_turns",
+                "success",
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_typed_variants_follow_fixed_failure_scope_without_guessing_defaults() {
         let mut projection = Projection::default();
         let unknown_image = json!({
             "type":"user","uuid":"u","session_id":"s","parent_tool_use_id":null,
@@ -15502,7 +15756,8 @@ mod tests {
         });
         assert!(matches!(
             projection.ingest(raw(2, orphan_delta.clone())),
-            ProjectionEffect::FailClosed { sequence: 2, .. }
+            ProjectionEffect::AbortTurn { sequence: 2, code, .. }
+                if code == "content_block_delta_invalid"
         ));
         assert_eq!(projection.raw_envelopes()[1].value, orphan_delta);
 

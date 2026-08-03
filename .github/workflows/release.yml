@@ -4,24 +4,18 @@ on:
   push:
     tags:
       - 'v*.*.*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing vSemVer tag to publish
-        required: true
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: pure-tui-release-${{ github.event.inputs.tag || github.ref_name }}
+  group: pure-tui-release-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
   BUN_VERSION: '1.3.11'
   RUST_TOOLCHAIN: '1.92.0'
-  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ github.ref_name }}
   CRABCODE_RELEASE_BUILD: '1'
   CRABCODE_BUILD_MINIFY: '1'
   ACCOUNT_BRIDGE_ELIGIBILITY_PUBLIC_KEY_BASE64URL: loXs2jEP4Spq1FRzy0dnU6qm9o6eELAuhJ7AdNw1SVE
@@ -43,6 +37,29 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
+
+      - name: Verify the authorized signed annotated tag
+        shell: bash
+        env:
+          RELEASE_TAG_SIGNER_SSH_ED25519: ${{ vars.RELEASE_TAG_SIGNER_SSH_ED25519 }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          test "$(git cat-file -t "refs/tags/${TAG}")" = 'tag' || {
+            echo "::error::release tag must be an annotated tag"; exit 1;
+          }
+          [[ "${RELEASE_TAG_SIGNER_SSH_ED25519}" =~ ^ssh-ed25519[[:space:]][A-Za-z0-9+/=]+$ ]] || {
+            echo "::error::protected RELEASE_TAG_SIGNER_SSH_ED25519 is missing or invalid"; exit 1;
+          }
+          test "$(git for-each-ref "refs/tags/${TAG}" --format='%(taggeremail)')" = '<crabcode-release@acosmi.com>' || {
+            echo "::error::release tagger must be crabcode-release@acosmi.com"; exit 1;
+          }
+          ALLOWED_SIGNERS="${RUNNER_TEMP}/release-tag-signers"
+          printf 'crabcode-release@acosmi.com %s\n' "${RELEASE_TAG_SIGNER_SSH_ED25519}" > "${ALLOWED_SIGNERS}"
+          chmod 0600 "${ALLOWED_SIGNERS}"
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "${ALLOWED_SIGNERS}"
+          git verify-tag "${TAG}"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -206,6 +223,26 @@ jobs:
           test -s "${ASSET}"
           test "$(find dist/release -maxdepth 1 -type f -name 'crabcode-*' | wc -l | tr -d ' ')" = '1'
 
+      - name: Replay the incident 100 times from the assembled package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ needs.verify-source.outputs.version }}'
+          case '${{ matrix.platform }}' in
+            x64-win32)
+              ASSET="dist/release/crabcode-${VERSION}-${{ matrix.platform }}.zip"
+              INSTALLER='scripts/install.ps1'
+              ;;
+            *)
+              ASSET="dist/release/crabcode-${VERSION}-${{ matrix.platform }}.tar.gz"
+              INSTALLER='scripts/install.sh'
+              ;;
+          esac
+          bun scripts/release-package-smoke.mjs \
+            --archive "${ASSET}" \
+            --installer "${INSTALLER}" \
+            --iterations 100
+
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: release-${{ matrix.platform }}
@@ -225,6 +262,7 @@ jobs:
     needs: [verify-source, build]
     if: github.repository == 'acosmi/CrabCode-TUI'
     runs-on: ubuntu-24.04
+    environment: production-release
     timeout-minutes: 20
     permissions:
       contents: write
@@ -281,7 +319,31 @@ jobs:
             release-assets/install.sh
             release-assets/install.ps1
 
-      - name: Publish release and verify server-side digests
+      - name: Verify all local release attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for asset in release-assets/*; do
+            VERIFIED='0'
+            for attempt in 1 2 3 4 5 6; do
+              echo "attestation check ${attempt}/6 for ${asset}"
+              if gh attestation verify "${asset}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --source-ref "refs/tags/${RELEASE_TAG}" \
+                --signer-workflow "github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml"; then
+                VERIFIED='1'
+                break
+              fi
+              sleep 2
+            done
+            test "${VERIFIED}" = '1' || {
+              echo "::error::attestation verification failed for ${asset}"; exit 1;
+            }
+          done
+
+      - name: Create immutable draft, verify it, then publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -307,11 +369,15 @@ jobs:
             'Terminal-only open-source release with five native packages, fail-closed installers, per-file manifests, signed Account Bridge provenance, dependency licenses, and GitHub build attestation.' \
             > "${NOTES}"
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" release-assets/* --clobber
-            gh release edit "${TAG}" --title "CrabCode TUI ${VERSION}" --notes-file "${NOTES}" --latest
+            echo "::error::release ${TAG} already exists; immutable assets cannot be overwritten"
+            exit 1
+          fi
+          if [[ "${VERSION}" == *-* ]]; then
+            gh release create "${TAG}" release-assets/* \
+              --verify-tag --draft --prerelease --title "CrabCode TUI ${VERSION}" --notes-file "${NOTES}"
           else
             gh release create "${TAG}" release-assets/* \
-              --verify-tag --title "CrabCode TUI ${VERSION}" --notes-file "${NOTES}" --latest
+              --verify-tag --draft --title "CrabCode TUI ${VERSION}" --notes-file "${NOTES}"
           fi
           EXPECTED="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
           ACTUAL="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets | length')"
@@ -329,3 +395,17 @@ jobs:
           test -z "${BAD_DIGESTS}" || {
             echo "::error::release assets without server-side SHA-256: ${BAD_DIGESTS}"; exit 1;
           }
+          while IFS= read -r path; do
+            NAME="$(basename "${path}")"
+            LOCAL="sha256:$(sha256sum "${path}" | cut -d ' ' -f 1)"
+            SERVER="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+              --jq ".assets[] | select(.name == \"${NAME}\") | .digest")"
+            test "${SERVER}" = "${LOCAL}" || {
+              echo "::error::server digest mismatch for ${NAME}"; exit 1;
+            }
+          done < <(find release-assets -maxdepth 1 -type f | sort)
+          if [[ "${VERSION}" == *-* ]]; then
+            gh release edit "${TAG}" --draft=false --prerelease
+          else
+            gh release edit "${TAG}" --draft=false --latest
+          fi

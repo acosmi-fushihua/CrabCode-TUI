@@ -351,6 +351,12 @@ pub enum ShutdownError {
     SupervisorPanicked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    Graceful,
+    AlreadyStopped,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SystemSubtype {
     Init,
@@ -873,6 +879,76 @@ fn known_control_request_subtype(value: &str) -> bool {
         || KNOWN_CONTROL_REQUEST_QUERY_EXTENSIONS.contains(&value)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateRuntimeResultFamily {
+    Health,
+    Model,
+    UsagePlugin,
+    RetainedCommand,
+    RuntimeActionError,
+}
+
+const PRIVATE_MODEL_RESULT_KINDS: &[&str] = &[
+    "model.account.consent",
+    "model.account.login_cancel",
+    "model.account.login_poll",
+    "model.account.login_start",
+    "model.account.remove",
+    "model.account.runtime",
+    "model.account.snapshot",
+    "model.custom.list",
+    "model.custom.test",
+    "model.local.byo_add",
+    "model.local.byo_remove",
+    "model.local.download",
+    "model.local.install_remove",
+    "model.local.server",
+    "model.local.snapshot",
+];
+
+const PRIVATE_USAGE_PLUGIN_RESULT_KINDS: &[&str] = &[
+    "plugin_enabled_state_updated",
+    "plugin_installed",
+    "plugin_inventory_snapshot",
+    "plugin_marketplace_added",
+    "plugin_marketplace_auto_update_updated",
+    "plugin_marketplace_catalog_snapshot",
+    "plugin_marketplace_inventory_snapshot",
+    "plugin_marketplace_removed",
+    "plugin_marketplace_updated",
+    "plugin_uninstalled",
+    "plugin_updated",
+    "plugin_validation_result",
+    "usage_five_hour_continue_updated",
+    "usage_plugin_error",
+    "usage_snapshot",
+];
+
+const PRIVATE_RETAINED_RESULT_KINDS: &[&str] = &[
+    "retained.brief.updated",
+    "retained.color.updated",
+    "retained.identity.snapshot",
+    "retained.rename.updated",
+    "retained.vim.updated",
+    "retained_command_error",
+];
+
+fn private_runtime_result_family(kind: &str) -> Option<PrivateRuntimeResultFamily> {
+    if kind == "health_snapshot" {
+        Some(PrivateRuntimeResultFamily::Health)
+    } else if kind == "runtime_action_error" {
+        Some(PrivateRuntimeResultFamily::RuntimeActionError)
+    } else if PRIVATE_MODEL_RESULT_KINDS.contains(&kind) {
+        Some(PrivateRuntimeResultFamily::Model)
+    } else if PRIVATE_USAGE_PLUGIN_RESULT_KINDS.contains(&kind) {
+        Some(PrivateRuntimeResultFamily::UsagePlugin)
+    } else if PRIVATE_RETAINED_RESULT_KINDS.contains(&kind) {
+        Some(PrivateRuntimeResultFamily::RetainedCommand)
+    } else {
+        None
+    }
+}
+
 fn classify_private_runtime_result(object: &serde_json::Map<String, Value>) -> EnvelopeClass {
     let request_id = object
         .get("request_id")
@@ -905,8 +981,11 @@ fn classify_private_runtime_result(object: &serde_json::Map<String, Value>) -> E
         let Some(result) = object.get("result").and_then(Value::as_object) else {
             return Some("private runtime result omitted its result object");
         };
-        match result_kind.as_deref() {
-            Some("health_snapshot") => {
+        let Some(kind) = result_kind.as_deref() else {
+            return Some("private runtime result omitted its kind");
+        };
+        match private_runtime_result_family(kind) {
+            Some(PrivateRuntimeResultFamily::Health) => {
                 if result.len() != 2
                     || !result.contains_key("status")
                     || result.get("status").and_then(Value::as_str) != Some("ready")
@@ -914,7 +993,7 @@ fn classify_private_runtime_result(object: &serde_json::Map<String, Value>) -> E
                     return Some("private health snapshot result is malformed");
                 }
             }
-            Some("runtime_action_error") => {
+            Some(PrivateRuntimeResultFamily::RuntimeActionError) => {
                 let valid_code = matches!(
                     result.get("code").and_then(Value::as_str),
                     Some("invalid_request" | "unknown_action" | "action_failed")
@@ -923,24 +1002,22 @@ fn classify_private_runtime_result(object: &serde_json::Map<String, Value>) -> E
                     return Some("private runtime action error result is malformed");
                 }
             }
-            Some(kind) if valid_private_model_result(kind, result) => {}
-            Some(kind) if kind.starts_with("model.") => {
-                return Some("private model-management result is malformed");
+            Some(PrivateRuntimeResultFamily::Model) => {
+                if !valid_private_model_result(kind, result) {
+                    return Some("private model-management result is malformed");
+                }
             }
-            Some(kind) if valid_private_usage_plugin_result(kind, result) => {}
-            Some(kind)
-                if kind.starts_with("usage_")
-                    || kind.starts_with("plugin_")
-                    || kind == "usage_plugin_error" =>
-            {
-                return Some("private usage/plugin result is malformed");
+            Some(PrivateRuntimeResultFamily::UsagePlugin) => {
+                if !valid_private_usage_plugin_result(kind, result) {
+                    return Some("private usage/plugin result is malformed");
+                }
             }
-            Some(kind) if valid_private_retained_result(kind, result) => {}
-            Some(kind) if kind.starts_with("retained.") || kind == "retained_command_error" => {
-                return Some("private retained-command result is malformed");
+            Some(PrivateRuntimeResultFamily::RetainedCommand) => {
+                if !valid_private_retained_result(kind, result) {
+                    return Some("private retained-command result is malformed");
+                }
             }
-            Some(_) => return Some("private runtime result has an unknown kind"),
-            None => return Some("private runtime result omitted its kind"),
+            None => return Some("private runtime result has an unknown kind"),
         }
         None
     })()
@@ -1250,6 +1327,20 @@ fn valid_private_retained_result(kind: &str, result: &serde_json::Map<String, Va
                     .and_then(Value::as_str)
                     .is_some_and(|name| !name.is_empty())
         }
+        "retained.vim.updated" => {
+            object_has_exact_fields(result, &["kind", "editor_mode"], &[])
+                && matches!(
+                    result.get("editor_mode").and_then(Value::as_str),
+                    Some("normal" | "vim")
+                )
+        }
+        "retained.brief.updated" => {
+            object_has_exact_fields(result, &["kind", "enabled", "reminder_injected"], &[])
+                && result.get("enabled").is_some_and(Value::is_boolean)
+                && result
+                    .get("reminder_injected")
+                    .is_some_and(Value::is_boolean)
+        }
         "retained_command_error" => {
             object_has_exact_fields(result, &["kind", "action_kind", "code"], &[])
                 && result
@@ -1445,6 +1536,8 @@ fn validate_private_runtime_action(request_id: &str, action: &Value) -> Result<S
     match kind {
         "health_snapshot"
         | "retained.identity.snapshot"
+        | "retained.vim.toggle"
+        | "retained.brief.toggle"
         | "model.custom.list"
         | "model.local.snapshot"
         | "model.local.server_status"
@@ -3591,9 +3684,13 @@ impl SdkRuntime {
         &mut self,
         request_id: impl Into<String>,
         reason: Option<&str>,
-    ) -> Result<(), ShutdownError> {
+    ) -> Result<ShutdownOutcome, ShutdownError> {
         if self.supervisor.is_none() {
-            return Ok(());
+            return Ok(ShutdownOutcome::AlreadyStopped);
+        }
+        if self.transport_aborted.load(Ordering::Acquire) {
+            self.close_transport_and_join();
+            return Ok(ShutdownOutcome::AlreadyStopped);
         }
         let request_id = request_id.into();
         if request_id.is_empty() {
@@ -3686,7 +3783,7 @@ impl SdkRuntime {
                 outcome,
             });
         }
-        Ok(())
+        Ok(ShutdownOutcome::Graceful)
     }
 
     /// Reap a runtime that has not crossed the setup-to-StructuredIO handoff.
@@ -3696,9 +3793,11 @@ impl SdkRuntime {
     /// Sending `end_session` in that phase would be a protocol violation, so
     /// early terminal exit closes the owned process tree without writing a
     /// backend control envelope.
-    pub(crate) fn shutdown_before_runtime_handoff(&mut self) -> Result<(), ShutdownError> {
+    pub(crate) fn shutdown_before_runtime_handoff(
+        &mut self,
+    ) -> Result<ShutdownOutcome, ShutdownError> {
         let Some(supervisor) = self.supervisor.take() else {
-            return Ok(());
+            return Ok(ShutdownOutcome::AlreadyStopped);
         };
         let _ = self.supervisor_tx.send(SupervisorCommand::Force);
         self.writer_tx.take();
@@ -3707,7 +3806,8 @@ impl SdkRuntime {
         self.stderr_budget.close();
         supervisor
             .join()
-            .map_err(|_| ShutdownError::SupervisorPanicked)
+            .map_err(|_| ShutdownError::SupervisorPanicked)?;
+        Ok(ShutdownOutcome::Graceful)
     }
 
     fn close_transport_and_join(&mut self) {
@@ -4446,6 +4546,12 @@ fn synthetic_failure_status() -> ExitStatus {
 #[cfg(test)]
 mod internal_tests {
     use super::*;
+    use crate::generated_renderer_contract::{
+        GENERATED_DIRECT_SYSTEM_SUBTYPES, GENERATED_PRIVATE_RUNTIME_ACTION_KINDS,
+        GENERATED_PRIVATE_RUNTIME_RESULT_KINDS, GENERATED_SDK_MESSAGE_TYPES,
+        GENERATED_SDK_SYSTEM_SUBTYPES, GENERATED_STDIN_MESSAGE_TYPES,
+        GENERATED_STDOUT_MESSAGE_TYPES, GENERATED_TS_TO_RUST_MIGRATION_FAMILIES,
+    };
 
     #[test]
     fn emergency_runtime_cleanup_does_not_initialize_a_missing_registry() {
@@ -4497,6 +4603,8 @@ mod internal_tests {
             json!({"kind":"retained.identity.snapshot"}),
             json!({"kind":"retained.color.apply","argument":"blue"}),
             json!({"kind":"retained.rename.apply","argument":"权威名称"}),
+            json!({"kind":"retained.vim.toggle"}),
+            json!({"kind":"retained.brief.toggle"}),
             json!({"kind":"model.custom.list"}),
             json!({"kind":"model.custom.add","input":custom_input.clone()}),
             json!({"kind":"model.custom.update","id":"custom-1","input":custom_input}),
@@ -4537,6 +4645,20 @@ mod internal_tests {
             json!({"kind":"plugin_marketplace_set_auto_update","marketplace_name":"official","enabled":true}),
             json!({"kind":"plugin_validate","path":"/tmp/plugin"}),
         ];
+        let mut covered_action_kinds = actions
+            .iter()
+            .map(|action| {
+                action
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .expect("fixture action kind")
+            })
+            .collect::<Vec<_>>();
+        covered_action_kinds.sort_unstable();
+        assert_eq!(
+            covered_action_kinds, GENERATED_PRIVATE_RUNTIME_ACTION_KINDS,
+            "every compiler-expanded TypeScript private action needs one accepted Rust fixture"
+        );
         for action in actions {
             let kind = action
                 .get("kind")
@@ -4697,6 +4819,20 @@ mod internal_tests {
                 json!({"kind":"retained.rename.updated","name":"权威名称"}),
                 "retained.rename.updated",
             ),
+            (
+                "private-retained-vim",
+                json!({"kind":"retained.vim.updated","editor_mode":"vim"}),
+                "retained.vim.updated",
+            ),
+            (
+                "private-retained-brief",
+                json!({
+                    "kind":"retained.brief.updated",
+                    "enabled":true,
+                    "reminder_injected":false
+                }),
+                "retained.brief.updated",
+            ),
         ] {
             let classified = classify_envelope(&json!({
                 "type":PRIVATE_RUNTIME_RESULT_TYPE,
@@ -4748,6 +4884,22 @@ mod internal_tests {
                 "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
                 "request_id":"private-retained-empty-name",
                 "result":{"kind":"retained.rename.updated","name":""}
+            }),
+            json!({
+                "type":PRIVATE_RUNTIME_RESULT_TYPE,
+                "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
+                "request_id":"private-retained-invalid-vim",
+                "result":{"kind":"retained.vim.updated","editor_mode":"emacs"}
+            }),
+            json!({
+                "type":PRIVATE_RUNTIME_RESULT_TYPE,
+                "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
+                "request_id":"private-retained-invalid-brief",
+                "result":{
+                    "kind":"retained.brief.updated",
+                    "enabled":true,
+                    "reminder_injected":"no"
+                }
             }),
         ] {
             assert!(matches!(
@@ -4804,6 +4956,15 @@ mod internal_tests {
         assert!(KNOWN_SYSTEM_SUBTYPES.contains(&"post_turn_summary"));
         assert_eq!(KNOWN_CONTROL_REQUEST_SUBTYPES.len(), 21);
         assert!(KNOWN_CONTROL_REQUEST_SUBTYPES.contains(&"elicitation"));
+        let mut owned_private_result_kinds = vec!["health_snapshot", "runtime_action_error"];
+        owned_private_result_kinds.extend_from_slice(PRIVATE_MODEL_RESULT_KINDS);
+        owned_private_result_kinds.extend_from_slice(PRIVATE_USAGE_PLUGIN_RESULT_KINDS);
+        owned_private_result_kinds.extend_from_slice(PRIVATE_RETAINED_RESULT_KINDS);
+        owned_private_result_kinds.sort_unstable();
+        assert_eq!(
+            owned_private_result_kinds, GENERATED_PRIVATE_RUNTIME_RESULT_KINDS,
+            "every compiler-expanded TypeScript private result needs an exact Rust family owner"
+        );
         assert_eq!(
             KNOWN_CONTROL_REQUEST_PROCESS_PRIVATE_EXTENSIONS,
             ["crabcode_tui_setup"]
@@ -4841,29 +5002,12 @@ mod internal_tests {
         for subtype in KNOWN_SYSTEM_SUBTYPES {
             assert!(classify_system_subtype(subtype).is_some());
         }
-        for subtype in [
-            "informational",
-            "permission_retry",
-            "scheduled_task_fire",
-            "stop_hook_summary",
-            "turn_duration",
-            "away_summary",
-            "memory_saved",
-            "agents_killed",
-            "api_metrics",
-            "local_command",
-            "api_error",
-            "compact_boundary",
-            "microcompact_boundary",
-            "command_input",
-            "thinking",
-            "file_snapshot",
-        ] {
+        for subtype in GENERATED_DIRECT_SYSTEM_SUBTYPES {
             assert_eq!(
                 classify_direct_system_subtype(subtype)
                     .expect("fixed direct system subtype")
                     .as_str(),
-                subtype
+                *subtype
             );
         }
         for subtype in KNOWN_CONTROL_REQUEST_SUBTYPES
@@ -4873,6 +5017,117 @@ mod internal_tests {
         {
             assert!(known_control_request_subtype(subtype));
         }
+    }
+
+    #[test]
+    fn compiler_generated_transport_families_have_explicit_native_owners() {
+        assert_eq!(GENERATED_TS_TO_RUST_MIGRATION_FAMILIES.len(), 18);
+        let mut family_ids = HashSet::new();
+        for (family, source, symbol, owner) in GENERATED_TS_TO_RUST_MIGRATION_FAMILIES {
+            assert!(
+                family_ids.insert(*family),
+                "duplicate migration family {family}"
+            );
+            assert!(
+                source.starts_with("src/"),
+                "non-source migration input {source}"
+            );
+            assert!(!symbol.is_empty(), "missing TypeScript symbol for {family}");
+            assert!(
+                owner.starts_with("crabcode-tui::"),
+                "missing native Rust owner for {family}: {owner}"
+            );
+        }
+
+        let sdk_system = GENERATED_SDK_SYSTEM_SUBTYPES
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let stdout_system = KNOWN_SYSTEM_SUBTYPES
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert!(sdk_system.is_subset(&stdout_system));
+        assert_eq!(
+            stdout_system
+                .difference(&sdk_system)
+                .copied()
+                .collect::<Vec<_>>(),
+            ["post_turn_summary"],
+            "the stdout-only post-turn summary must remain the sole SDK-system extension"
+        );
+        for subtype in GENERATED_SDK_SYSTEM_SUBTYPES {
+            assert!(classify_system_subtype(subtype).is_some(), "{subtype}");
+        }
+
+        let stdout_fixtures = [
+            ("assistant", json!({"type":"assistant"})),
+            ("auth_status", json!({"type":"auth_status"})),
+            (
+                "control_cancel_request",
+                json!({"type":"control_cancel_request","request_id":"cancel-1"}),
+            ),
+            (
+                "control_request",
+                json!({"type":"control_request","request_id":"request-1","request":{"subtype":"initialize"}}),
+            ),
+            (
+                "control_response",
+                json!({"type":"control_response","response":{"subtype":"success","request_id":"response-1"}}),
+            ),
+            ("keep_alive", json!({"type":"keep_alive"})),
+            ("prompt_suggestion", json!({"type":"prompt_suggestion"})),
+            ("rate_limit_event", json!({"type":"rate_limit_event"})),
+            ("result", json!({"type":"result"})),
+            ("stream_event", json!({"type":"stream_event"})),
+            ("streamlined_text", json!({"type":"streamlined_text"})),
+            (
+                "streamlined_tool_use_summary",
+                json!({"type":"streamlined_tool_use_summary"}),
+            ),
+            ("system", json!({"type":"system","subtype":"init"})),
+            ("tool_progress", json!({"type":"tool_progress"})),
+            ("tool_use_summary", json!({"type":"tool_use_summary"})),
+            ("user", json!({"type":"user"})),
+        ];
+        assert_eq!(
+            stdout_fixtures
+                .iter()
+                .map(|(kind, _)| *kind)
+                .collect::<Vec<_>>(),
+            GENERATED_STDOUT_MESSAGE_TYPES
+        );
+        for (kind, value) in &stdout_fixtures {
+            assert!(
+                !matches!(
+                    classify_envelope(value).expect("generated stdout family must classify"),
+                    EnvelopeClass::Unclassified { .. }
+                ),
+                "generated stdout family {kind} reached the compatibility fallback"
+            );
+        }
+
+        let sdk_types = GENERATED_SDK_MESSAGE_TYPES
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let classified_sdk_types = stdout_fixtures
+            .iter()
+            .map(|(kind, _)| *kind)
+            .filter(|kind| sdk_types.contains(kind))
+            .collect::<HashSet<_>>();
+        assert_eq!(classified_sdk_types, sdk_types);
+        assert_eq!(
+            GENERATED_STDIN_MESSAGE_TYPES,
+            [
+                "control_request",
+                "control_response",
+                "keep_alive",
+                "update_environment_variables",
+                "user",
+            ],
+            "a new TypeScript stdin family needs a bounded SdkRuntime writer before acceptance"
+        );
     }
 
     #[test]

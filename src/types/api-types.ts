@@ -7,6 +7,8 @@
  * Consumer files import from this module: `import type { X } from 'src/types/api-types.js'`
  */
 
+import type { SourcesEvent } from '@acosmi/sdk-ts'
+
 // ── Supporting types ────────────────────────────────────────────────────────
 
 export interface CacheControlEphemeral {
@@ -361,6 +363,14 @@ export type BetaRawMessageStreamEvent =
       error?: { type?: string; message?: string }
       errorCode?: string
     }
+
+/**
+ * Canonical event union after the Acosmi SSE adapter has normalized SDK
+ * side-channel events into the raw Messages stream shape consumed by Rust.
+ */
+export type NormalizedAcosmiChatStreamEvent =
+  | BetaRawMessageStreamEvent
+  | (SourcesEvent & { type: 'sources' })
 
 // ── Beta tools ──────────────────────────────────────────────────────────────
 

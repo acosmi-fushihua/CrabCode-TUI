@@ -76,7 +76,9 @@ for (const path of requiredFiles) {
 
 const allowedTopLevelDirectories = new Set([
   '.github',
+  'audits',
   'components',
+  'contracts',
   'crates',
   'libs',
   'scripts',
@@ -112,7 +114,6 @@ const forbiddenPrefixes = [
   'apps/',
   'archive/',
   'ci/',
-  'contracts/',
   'docs/',
   'e2e/',
   'frontend/',
@@ -181,9 +182,11 @@ const exactScripts = new Set([
   'scripts/assemble-release.mjs',
   'scripts/build-account-bridge.ts',
   'scripts/build-ts.ts',
+  'scripts/generate-renderer-capability-contract.mjs',
   'scripts/install.ps1',
   'scripts/install.sh',
   'scripts/repository-boundary.mjs',
+  'scripts/release-package-smoke.mjs',
   'scripts/run-bun-test.ts',
   'scripts/run-full-test-suite.ts',
   'scripts/tui-runtime-smoke.mjs',
@@ -194,6 +197,7 @@ for (const path of tracked.filter(path => path.startsWith('scripts/'))) {
 const exactWorkflows = new Set([
   '.github/actionlint.yaml',
   '.github/assets/crab-code-logo.png',
+  '.github/ISSUE_TEMPLATE/runtime-crash.yml',
   '.github/workflows/ci.yml',
   '.github/workflows/release.yml',
 ])

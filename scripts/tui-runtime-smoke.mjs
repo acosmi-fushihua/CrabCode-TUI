@@ -1,11 +1,17 @@
 #!/usr/bin/env bun
 
+import { rmSync } from 'node:fs'
 import { mkdtemp, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-const root = resolve(import.meta.dir, '..')
+const root = resolve(
+  process.env.CRABCODE_SMOKE_PACKAGE_ROOT ?? resolve(import.meta.dir, '..'),
+)
 const runtime = join(root, 'dist/tui-runtime/index.js')
+const runtimeExecutable = resolve(
+  process.env.CRABCODE_SMOKE_BUN ?? process.execPath,
+)
 const timeoutMs = 45_000
 const rendererNotificationChannels = new Set([
   'auto',
@@ -30,7 +36,7 @@ await stat(runtime)
 const configDir = await mkdtemp(join(tmpdir(), 'crabcode-tui-smoke-'))
 const child = Bun.spawn({
   cmd: [
-    process.execPath,
+    runtimeExecutable,
     runtime,
     '--bare',
     '--no-session-persistence',
@@ -51,6 +57,18 @@ const child = Bun.spawn({
   stdout: 'pipe',
   stderr: 'pipe',
 })
+
+const cleanup = () => {
+  try {
+    child.kill()
+  } catch {
+    // The child has already exited.
+  }
+  rmSync(configDir, { recursive: true, force: true })
+}
+process.once('exit', cleanup)
+process.once('SIGINT', () => process.exit(130))
+process.once('SIGTERM', () => process.exit(143))
 
 const initializeId = 'tui-runtime-smoke-initialize'
 const endId = 'tui-runtime-smoke-end'
@@ -89,7 +107,7 @@ const deadline = Date.now() + timeoutMs
 const frameTypes = []
 let buffer = ''
 let initializePayload
-let turnResult
+const turnResults = []
 let endAcknowledged = false
 let rendererContextAcknowledged = false
 let turnSubmitted = false
@@ -193,15 +211,25 @@ while (Date.now() < deadline && !endAcknowledged) {
       if (frame.subtype !== 'success') {
         throw new Error(`fixture turn failed: ${line}`)
       }
-      turnResult = frame
-      await writeFrame({
-        type: 'control_request',
-        request_id: endId,
-        request: {
-          subtype: 'end_session',
-          reason: 'tui-runtime-smoke-complete',
-        },
-      })
+      turnResults.push(frame)
+      if (turnResults.length === 1) {
+        await writeFrame({
+          type: 'user',
+          message: { role: 'user', content: '/cost' },
+          parent_tool_use_id: null,
+        })
+      } else if (turnResults.length === 2) {
+        await writeFrame({
+          type: 'control_request',
+          request_id: endId,
+          request: {
+            subtype: 'end_session',
+            reason: 'tui-runtime-smoke-complete',
+          },
+        })
+      } else {
+        throw new Error(`runtime emitted an unexpected third result: ${line}`)
+      }
       continue
     }
 
@@ -223,7 +251,7 @@ if (
   !rendererContextAcknowledged ||
   !initializePayload ||
   !turnSubmitted ||
-  !turnResult ||
+  turnResults.length !== 2 ||
   !endAcknowledged
 ) {
   child.kill()
@@ -246,7 +274,7 @@ if (
       rendererContextAcknowledged,
       initialized: Boolean(initializePayload),
       turnSubmitted,
-      turnCompleted: Boolean(turnResult),
+      turnsCompleted: turnResults.length,
       endAcknowledged,
       frameTypes,
       exitAfterKill,
@@ -278,7 +306,7 @@ process.stdout.write(
       rendererContext: 'received',
       workspaceTrust: 'skipped-by-established-demo-authority',
       initialize: 'success',
-      turn: 'success',
+      turns: '2/2 success',
       endSession: 'success',
       commands: Array.isArray(initializePayload.commands)
         ? initializePayload.commands.length

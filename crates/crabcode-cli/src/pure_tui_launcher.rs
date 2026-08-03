@@ -20,6 +20,8 @@ const UNSUPPORTED_PREFIX: &str = "CRABCODE_PURE_TUI_UNSUPPORTED:";
 const LAUNCH_FAILED_PREFIX: &str = "CRABCODE_PURE_TUI_LAUNCH_FAILED:";
 const UNSUPPORTED_EXIT_CODE: i32 = 64;
 const LAUNCH_FAILED_EXIT_CODE: i32 = 70;
+const RELEASE_PACKAGE_SMOKE_ARG: &str = "__release-package-smoke";
+const RELEASE_PACKAGE_SMOKE_ENV: &str = "CRABCODE_RELEASE_PACKAGE_SMOKE";
 
 enum PureLaunchError {
     Unsupported(String),
@@ -89,11 +91,15 @@ fn run() -> std::result::Result<i32, PureLaunchError> {
             })
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if let Some(reason) = unsupported_reason(
-        &raw_args,
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-    ) {
+    let release_package_smoke = raw_args == [RELEASE_PACKAGE_SMOKE_ARG]
+        && std::env::var(RELEASE_PACKAGE_SMOKE_ENV).as_deref() == Ok("1");
+    if !release_package_smoke
+        && let Some(reason) = unsupported_reason(
+            &raw_args,
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        )
+    {
         return Err(PureLaunchError::Unsupported(reason));
     }
 

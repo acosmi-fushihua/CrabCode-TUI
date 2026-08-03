@@ -1,0 +1,67 @@
+name: Runtime crash / 运行崩溃
+description: Report a TUI runtime stop using bounded, content-free diagnostics.
+title: "[runtime] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请只提交无内容诊断。不要上传 prompt、对话全文、raw event dump、cookie、token、API key、tool input/output、query、URL 或来源 snippet。
+
+        Submit bounded metadata only. Never upload prompts, full transcripts, raw event dumps, cookies, tokens, API keys, tool input/output, queries, URLs, or source snippets.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform / 平台
+      options:
+        - arm64-darwin
+        - x64-darwin
+        - arm64-linux
+        - x64-linux
+        - x64-win32
+    validations:
+      required: true
+
+  - type: input
+    id: build_id
+    attributes:
+      label: Build ID
+      description: Example: 1.0.23+0123456789ab
+    validations:
+      required: true
+
+  - type: input
+    id: sequence
+    attributes:
+      label: Renderer sequence
+      description: Numeric metadata sequence; do not paste the event payload.
+
+  - type: input
+    id: issue_code
+    attributes:
+      label: Event issue/root code
+      description: Stable metadata code such as sources_not_array or stream_event_type_missing.
+
+  - type: input
+    id: shape_hash
+    attributes:
+      label: Type-only shape SHA-256
+      description: The canonical type-only shape hash from renderer metadata, never a raw payload hash.
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Content-free reproduction steps
+      description: Describe commands and lifecycle order without message text, credentials, URLs, or source content.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed prompts, transcripts, raw frames, cookies, tokens, keys, tool content, queries, URLs, and snippets.
+          required: true

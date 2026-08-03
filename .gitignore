@@ -25,7 +25,13 @@
 /apps/
 /archive/
 /ci/
-/contracts/
+/contracts/*
+!/contracts/renderer-protocol/
+/contracts/renderer-protocol/*
+!/contracts/renderer-protocol/v1/
+/contracts/renderer-protocol/v1/*
+!/contracts/renderer-protocol/v1/event-policy.json
+!/contracts/renderer-protocol/v1/renderer-contract.json
 /docs/
 /e2e/
 /frontend/

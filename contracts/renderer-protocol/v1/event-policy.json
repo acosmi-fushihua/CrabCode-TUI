@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "families": {
+    "query_message_type": {
+      "owner": "tui-protocol",
+      "default": "turn-fatal",
+      "overrides": {
+        "attachment": "recoverable",
+        "progress": "recoverable",
+        "system": "recoverable",
+        "tombstone": "recoverable",
+        "tool_use_summary": "recoverable"
+      }
+    },
+    "direct_system_subtype": {
+      "owner": "rust-renderer",
+      "default": "recoverable",
+      "overrides": {}
+    },
+    "progress_type": {
+      "owner": "rust-renderer",
+      "default": "recoverable",
+      "overrides": {}
+    },
+    "attachment_type": {
+      "owner": "rust-renderer",
+      "default": "recoverable",
+      "overrides": {}
+    },
+    "stream_event_type": {
+      "owner": "rust-renderer",
+      "default": "turn-fatal",
+      "overrides": {
+        "ping": "presentation-only",
+        "sources": "presentation-only"
+      }
+    },
+    "assistant_content_block_type": {
+      "owner": "rust-renderer",
+      "default": "turn-fatal",
+      "overrides": {}
+    },
+    "user_content_block_type": {
+      "owner": "rust-renderer",
+      "default": "turn-fatal",
+      "overrides": {}
+    },
+    "sdk_message_type": {
+      "owner": "runtime-lifecycle",
+      "default": "turn-fatal",
+      "overrides": {
+        "auth_status": "recoverable",
+        "prompt_suggestion": "recoverable",
+        "rate_limit_event": "recoverable",
+        "tool_progress": "recoverable",
+        "tool_use_summary": "recoverable"
+      }
+    },
+    "sdk_system_subtype": {
+      "owner": "runtime-lifecycle",
+      "default": "recoverable",
+      "overrides": {
+        "init": "protocol-fatal",
+        "session_state_changed": "protocol-fatal"
+      }
+    },
+    "stdout_system_subtype": {
+      "owner": "runtime-lifecycle",
+      "default": "recoverable",
+      "overrides": {
+        "init": "protocol-fatal",
+        "session_state_changed": "protocol-fatal"
+      }
+    },
+    "sdk_result_subtype": {
+      "owner": "runtime-lifecycle",
+      "default": "turn-fatal",
+      "overrides": {}
+    },
+    "control_request_subtype": {
+      "owner": "security-control-plane",
+      "default": "protocol-fatal",
+      "overrides": {}
+    },
+    "stdout_message_type": {
+      "owner": "runtime-lifecycle",
+      "default": "turn-fatal",
+      "overrides": {
+        "auth_status": "recoverable",
+        "control_cancel_request": "protocol-fatal",
+        "control_request": "protocol-fatal",
+        "control_response": "protocol-fatal",
+        "keep_alive": "presentation-only",
+        "prompt_suggestion": "recoverable",
+        "rate_limit_event": "recoverable",
+        "streamlined_text": "recoverable",
+        "streamlined_tool_use_summary": "recoverable",
+        "system": "recoverable",
+        "tool_progress": "recoverable",
+        "tool_use_summary": "recoverable"
+      }
+    },
+    "stdin_message_type": {
+      "owner": "security-control-plane",
+      "default": "protocol-fatal",
+      "overrides": {}
+    },
+    "private_runtime_action_kind": {
+      "owner": "security-private-runtime",
+      "default": "protocol-fatal",
+      "overrides": {}
+    },
+    "private_runtime_result_kind": {
+      "owner": "security-private-runtime",
+      "default": "protocol-fatal",
+      "overrides": {}
+    },
+    "private_setup_request_route": {
+      "owner": "security-setup",
+      "default": "protocol-fatal",
+      "overrides": {}
+    },
+    "private_setup_response_route": {
+      "owner": "security-setup",
+      "default": "protocol-fatal",
+      "overrides": {}
+    }
+  }
+}

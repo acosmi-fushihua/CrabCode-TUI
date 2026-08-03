@@ -15,6 +15,8 @@ import { join } from 'path';
 
 import { ensureExternalStubs } from './helpers/ensureExternalStubs.js';
 
+const TEST_ROOT = join(tmpdir(), `crabcode-test-${process.pid}`);
+
 // ---------------------------------------------------------------------------
 // Native-package stubs — MUST run in the global preload, before any test
 // module loads. Several `src/` modules `import` externalized native packages
@@ -40,6 +42,10 @@ process.env.CRABCODE_DISABLE_TELEMETRY = '1';
 process.env.CRABCODE_DISABLE_AUTO_UPDATE = '1';
 process.env.DISABLE_BACKGROUND_TASKS = '1';
 process.env.CRABCODE_DISABLE_AUTO_MEMORY = '1';
+// Every test process receives its own state authority. Tests that need a
+// different root must replace this with another temporary directory; falling
+// back to ~/.crabcode is never permitted from the shared harness.
+process.env.CRABCODE_CONFIG_DIR = join(TEST_ROOT, 'state');
 
 // Prevent tests from accidentally hitting real API endpoints
 if (!process.env.ACOSMI_API_KEY) {
@@ -66,8 +72,6 @@ if (!process.env.ACOSMI_API_KEY) {
 // ---------------------------------------------------------------------------
 // Global temp directory for test artifacts
 // ---------------------------------------------------------------------------
-
-const TEST_ROOT = join(tmpdir(), `crabcode-test-${process.pid}`);
 
 /**
  * Returns the root temp directory for the current test run.
