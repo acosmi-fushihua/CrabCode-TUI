@@ -101,14 +101,49 @@ jobs:
       - name: Enforce tagged source boundary
         run: node scripts/repository-boundary.mjs --source-only
 
+  x64-darwin-runtime-preflight:
+    name: Preflight complete runtime on native Intel macOS
+    needs: verify-source
+    if: github.repository == 'acosmi/CrabCode-TUI'
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install exact JavaScript dependency graph
+        run: bun install --frozen-lockfile
+
+      - name: Establish cross-language build identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CRABCODE_BUILD_ID=${{ needs.verify-source.outputs.build_id }}" >> "${GITHUB_ENV}"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Build closed TypeScript business runtime
+        run: bun run build:ts
+
+      - name: Enforce complete source and executable boundary
+        run: node scripts/repository-boundary.mjs
+
+      - name: Exercise the pinned runtime before allocating the build matrix
+        run: bun scripts/release-x64-darwin-runtime-preflight.mjs --iterations 10
+
   build:
     name: Build ${{ matrix.platform }}
-    needs: verify-source
+    needs: [verify-source, x64-darwin-runtime-preflight]
     if: github.repository == 'acosmi/CrabCode-TUI'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeoutMinutes }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - platform: arm64-darwin

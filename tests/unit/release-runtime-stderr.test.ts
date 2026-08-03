@@ -10,9 +10,9 @@ const baselineMaterials = {
   platform: 'x64-darwin',
   runtime: {
     bun: {
-      version: '1.3.11',
-      url: 'https://github.com/oven-sh/bun/releases/download/bun-v1.3.11/bun-darwin-x64-baseline.zip',
-      sha256: 'fb6739b08bf54550edaa7c824cd5b2dca45b6a06afef408443087a63105f6f8d',
+      version: '1.3.14',
+      url: 'https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-darwin-x64-baseline.zip',
+      sha256: '3e35ad6f53971a9834bf9e6786e2adf72b5f1921cc9a9c5fde073d2972944076',
     },
   },
 }
@@ -41,6 +41,21 @@ describe('release runtime stderr classification', () => {
         ...baselineMaterials,
         runtime: {
           bun: { ...baselineMaterials.runtime.bun, sha256: '0'.repeat(64) },
+        },
+      },
+      {
+        ...baselineMaterials,
+        runtime: {
+          bun: { ...baselineMaterials.runtime.bun, version: '1.3.11' },
+        },
+      },
+      {
+        ...baselineMaterials,
+        runtime: {
+          bun: {
+            ...baselineMaterials.runtime.bun,
+            url: 'https://example.invalid/bun-darwin-x64-baseline.zip',
+          },
         },
       },
     ]) {

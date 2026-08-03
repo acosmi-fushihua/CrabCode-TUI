@@ -1,12 +1,57 @@
 # Changelog / 更新日志
 
+## v1.0.25 — 2026-08-03
+
+- Forward-fixes the failed, unpublished `v1.0.24` tag without moving or deleting
+  that signed historical record. `v1.0.24` has no GitHub Release or public
+  assets and must not be installed.
+- Pins only the x64 macOS package to the reviewed Bun `1.3.14` baseline archive,
+  including exact URL, archive size/SHA-256, executable size/SHA-256, license
+  URL/SHA-256, and package-local release-material authority. All other platforms
+  retain Bun `1.3.11`, avoiding an unnecessary cross-platform runtime change.
+- Completes entry-module evaluation synchronously instead of suspending it with
+  top-level await. The runtime promise still owns the full lifecycle and a
+  rejected bootstrap remains process-fatal after stderr is flushed.
+- Adds a native Intel macOS preflight that executes the complete bundled runtime
+  through renderer context, initialize, two successor turns, and end-session
+  before the five-platform build matrix is allocated. Ten consecutive preflight
+  lifecycles are mandatory, and matrix fail-fast is enabled to conserve CI.
+- Adds opt-in bounded macOS process sampling when the runtime lifecycle times out,
+  preserving actionable module/runtime evidence without changing normal product
+  behavior or successful smoke output.
+- Removes hard-coded “current stable version” prose from both READMEs. The
+  install command now follows only the public GitHub `latest` Release, preventing
+  documentation from advertising a tag whose assets were never published.
+
+---
+
+- 对失败且未公开的 `v1.0.24` 标签执行前滚修复，不移动或删除该已签名历史记录。
+  `v1.0.24` 没有 GitHub Release 或公开资产，不得安装。
+- 仅将 x64 macOS 发布包切换到经审查的 Bun `1.3.14` baseline 归档，同时固定精确
+  URL、归档大小/SHA-256、可执行文件大小/SHA-256、许可证 URL/SHA-256，以及包内
+  发布材料授权；其他平台继续使用 Bun `1.3.11`，避免无必要的跨平台运行时变更。
+- 入口模块改为同步完成求值，不再以 top-level await 悬挂模块；runtime promise
+  仍拥有完整生命周期，bootstrap reject 在 stderr 刷出后仍以进程级失败结束。
+- 新增原生 Intel macOS 发布预检：在分配五平台构建矩阵前，完整执行 renderer
+  context、initialize、连续两轮与 end-session 生命周期，连续十次均成功才放行；
+  同时启用矩阵 fail-fast，控制 CI 消耗。
+- runtime 生命周期超时时可选择采集有界 macOS 进程样本，为模块/运行时故障保留
+  可执行证据；正常产品行为和成功 smoke 输出均不改变。
+- 中英文 README 不再硬编码“当前稳定版本”。安装命令只跟随公开 GitHub `latest`
+  Release，杜绝文档提前宣传尚未产出资产的标签。
+
 ## v1.0.24 — 2026-08-03
 
-- Forward-fixed the unpublished `v1.0.23` release candidate without moving or
-  deleting its signed tag.
-- Replaced the x64 macOS package runtime with Bun's pinned baseline build. The
-  standard x64 build requires AVX and stalled before the renderer handshake on
-  GitHub's Intel macOS runner under Rosetta.
+- This signed release attempt failed on GitHub's native Intel macOS runner and
+  was deliberately cancelled before the remaining matrix consumed more CI.
+  It has no GitHub Release or public assets and is retained only as immutable
+  failure evidence.
+- Both Bun `1.3.11` standard and baseline executables could launch, but the
+  complete CrabCode top-level-await/dynamic-import graph stalled before the
+  renderer handshake. The failure was therefore runtime module evaluation, not
+  installer selection or inability to execute the Bun binary.
+- Forward-fixed the earlier unpublished `v1.0.23` release candidate without
+  moving or deleting its signed tag.
 - Classified only Bun's exact no-AVX compatibility warning, and only when the
   package-local release materials bind the expected platform, version, asset
   URL, and SHA-256. Every other stderr byte still fails the runtime smoke.
@@ -23,9 +68,13 @@
 
 ---
 
-- 对未公开发布的 `v1.0.23` 候选版执行前滚修复，不移动或删除其已签名标签。
-- x64 macOS 发布包改用固定版本和哈希的 Bun baseline 构建。标准 x64 构建要求
-  AVX，在 GitHub Intel macOS runner 的 Rosetta 环境中会在 renderer 握手前停滞。
+- 此次已签名发布在 GitHub 原生 Intel macOS runner 上失败；为避免其余矩阵继续
+  消耗 CI，失败后已主动取消。该版本没有 GitHub Release 或公开资产，仅作为不可变
+  的失败证据保留。
+- Bun `1.3.11` 的 standard 与 baseline 可执行文件本身都能启动，但执行 CrabCode
+  完整 top-level-await/dynamic-import 模块图时均在 renderer 握手前停滞。因此故障位于
+  运行时模块求值，不是安装器选错版本，也不是 Bun 二进制无法执行。
+- 对更早的未公开 `v1.0.23` 候选版执行前滚修复，不移动或删除其已签名标签。
 - 仅当包内发布材料同时绑定预期平台、版本、资产 URL 与 SHA-256 时，才分类接纳
   Bun 唯一一条精确的无 AVX 兼容提示；其他任何 stderr 字节仍使 runtime smoke 失败。
 - 移除从未被源码引用、安装时还会额外联网取包的 `ffmpeg-static` 死依赖；媒体渲染

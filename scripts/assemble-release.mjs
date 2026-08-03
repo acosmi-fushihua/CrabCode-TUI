@@ -22,11 +22,15 @@ import {
 } from 'node:fs'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { unzipSync, zipSync } from 'fflate'
+import {
+  bunReleaseForPlatform,
+  defaultBunRelease,
+  x64DarwinBunRelease,
+} from './release-bun-pins.mjs'
 import { comparePortablePaths } from './release-path-order.mjs'
 
 const repositoryRoot = resolve(import.meta.dir, '..')
 const sourceRepository = 'https://github.com/acosmi/CrabCode-TUI'
-const bunVersion = '1.3.11'
 const ripgrepVersion = '14.1.1'
 const browserVersion = '0.28.0'
 // The signed Go Account Bridge component has an independent release lineage.
@@ -57,12 +61,14 @@ const platforms = Object.freeze({
     rustTarget: 'x86_64-apple-darwin',
     executableExtension: '',
     archiveExtension: 'tar.gz',
-    // GitHub's Intel macOS runner is hosted on Apple Silicon without AVX.
-    // The standard Bun x64 binary stalls before the renderer handshake there;
-    // the upstream baseline build is the supported no-AVX compatibility asset.
-    bunAsset: 'bun-darwin-x64-baseline.zip',
-    bunRoot: 'bun-darwin-x64-baseline',
-    bunSha256: 'fb6739b08bf54550edaa7c824cd5b2dca45b6a06afef408443087a63105f6f8d',
+    // Bun 1.3.11 standard and baseline both deadlock while evaluating the
+    // complete top-level-await runtime graph on GitHub's native Intel runner.
+    // 1.3.14 contains the upstream ESM/TLA deadlock fixes and remains baseline
+    // so the public package also covers conservative x64 CPUs.
+    bunVersion: x64DarwinBunRelease.version,
+    bunAsset: x64DarwinBunRelease.asset,
+    bunRoot: x64DarwinBunRelease.root,
+    bunSha256: x64DarwinBunRelease.sha256,
     ripgrepAsset: 'ripgrep-14.1.1-x86_64-apple-darwin.tar.gz',
     ripgrepRoot: 'ripgrep-14.1.1-x86_64-apple-darwin',
     ripgrepSha256: 'fc87e78f7cb3fea12d69072e7ef3b21509754717b746368fd40d88963630e2b3',
@@ -122,38 +128,40 @@ const platforms = Object.freeze({
   },
 })
 
-const remoteLegalMaterials = Object.freeze([
-  {
-    id: 'bun-license',
-    destination: `licenses/runtime/bun-${bunVersion}/LICENSE.md`,
-    url: `https://raw.githubusercontent.com/oven-sh/bun/bun-v${bunVersion}/LICENSE.md`,
-    sha256: '7068a9711ef8196d654e143447ed7976b3678ce21145b9da16e1f786528f15bb',
-  },
-  {
-    id: 'browser-license',
-    destination: `licenses/runtime/crabcode-browser-${browserVersion}/LICENSE`,
-    url: `https://raw.githubusercontent.com/acosmi/agent-browser/v${browserVersion}/LICENSE`,
-    sha256: '014bb31e83d5c2e76aea1cc6e82217346ab41362f32cb355ad0f5c10aa0aeaff',
-  },
-  {
-    id: 'browser-notice',
-    destination: `licenses/runtime/crabcode-browser-${browserVersion}/NOTICE`,
-    url: `https://raw.githubusercontent.com/acosmi/agent-browser/v${browserVersion}/NOTICE`,
-    sha256: '5023a4b335e82b1dfda5738df5df247916803f106a6a334e19874a154198a586',
-  },
-  {
-    id: 'sharp-libvips-license',
-    destination: 'licenses/runtime/sharp-libvips-1.3.2/LICENSE',
-    url: 'https://raw.githubusercontent.com/lovell/sharp-libvips/v1.3.2/LICENSE',
-    sha256: 'b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1',
-  },
-  {
-    id: 'sharp-libvips-notices',
-    destination: 'licenses/runtime/sharp-libvips-1.3.2/THIRD-PARTY-NOTICES.md',
-    url: 'https://raw.githubusercontent.com/lovell/sharp-libvips/v1.3.2/THIRD-PARTY-NOTICES.md',
-    sha256: '25ffcfa69e28b1913ced27ec778b90f24911a1bb3021253577e8b0af55db0d49',
-  },
-])
+function createRemoteLegalMaterials(bunRelease) {
+  return [
+    {
+      id: 'bun-license',
+      destination: `licenses/runtime/bun-${bunRelease.version}/LICENSE.md`,
+      url: bunRelease.license.url,
+      sha256: bunRelease.license.sha256,
+    },
+    {
+      id: 'browser-license',
+      destination: `licenses/runtime/crabcode-browser-${browserVersion}/LICENSE`,
+      url: `https://raw.githubusercontent.com/acosmi/agent-browser/v${browserVersion}/LICENSE`,
+      sha256: '014bb31e83d5c2e76aea1cc6e82217346ab41362f32cb355ad0f5c10aa0aeaff',
+    },
+    {
+      id: 'browser-notice',
+      destination: `licenses/runtime/crabcode-browser-${browserVersion}/NOTICE`,
+      url: `https://raw.githubusercontent.com/acosmi/agent-browser/v${browserVersion}/NOTICE`,
+      sha256: '5023a4b335e82b1dfda5738df5df247916803f106a6a334e19874a154198a586',
+    },
+    {
+      id: 'sharp-libvips-license',
+      destination: 'licenses/runtime/sharp-libvips-1.3.2/LICENSE',
+      url: 'https://raw.githubusercontent.com/lovell/sharp-libvips/v1.3.2/LICENSE',
+      sha256: 'b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1',
+    },
+    {
+      id: 'sharp-libvips-notices',
+      destination: 'licenses/runtime/sharp-libvips-1.3.2/THIRD-PARTY-NOTICES.md',
+      url: 'https://raw.githubusercontent.com/lovell/sharp-libvips/v1.3.2/THIRD-PARTY-NOTICES.md',
+      sha256: '25ffcfa69e28b1913ced27ec778b90f24911a1bb3021253577e8b0af55db0d49',
+    },
+  ]
+}
 
 function fail(message) {
   throw new Error(`release assembly failed: ${message}`)
@@ -869,6 +877,11 @@ async function main() {
   }
 
   const info = platforms[args.platform]
+  const bunRelease = bunReleaseForPlatform(args.platform)
+  const bunVersion = info.bunVersion ?? defaultBunRelease.version
+  if (bunVersion !== bunRelease.version) {
+    fail(`Bun release pin differs from ${args.platform} package configuration`)
+  }
   const outputDirectory = resolve(repositoryRoot, args.outputDir)
   if (outputDirectory === repositoryRoot || !outputDirectory.startsWith(`${repositoryRoot}${sep}`)) {
     fail('--output-dir must be a child of the repository')
@@ -903,6 +916,9 @@ async function main() {
   writeFileSync(join(packageDirectory, 'build-id'), `${buildId}\n`)
 
   const bunUrl = `https://github.com/oven-sh/bun/releases/download/bun-v${bunVersion}/${info.bunAsset}`
+  if (bunRelease.url && bunUrl !== bunRelease.url) {
+    fail(`Bun URL differs from the reviewed ${args.platform} runtime authority`)
+  }
   const ripgrepUrl = `https://github.com/BurntSushi/ripgrep/releases/download/${ripgrepVersion}/${info.ripgrepAsset}`
   const browserUrl = `https://github.com/acosmi/agent-browser/releases/download/v${browserVersion}/${info.browserAsset}`
   const accountBridgeUrl = `https://github.com/acosmi/crabcode/releases/download/${accountBridgeRelease}/${info.accountBridgeAsset}`
@@ -950,6 +966,7 @@ async function main() {
     copyRegular(join(repositoryRoot, name), join(packageDirectory, name))
   }
   const legalMaterials = []
+  const remoteLegalMaterials = createRemoteLegalMaterials(bunRelease)
   for (const material of remoteLegalMaterials) {
     const source = await downloadPinned(cacheDirectory, material.id, material.url, material.sha256)
     copyRegular(source, join(packageDirectory, ...material.destination.split('/')))
