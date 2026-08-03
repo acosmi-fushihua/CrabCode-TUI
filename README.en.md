@@ -34,7 +34,7 @@ Download the desktop GUI from the [official CrabCode GUI page](https://acosmi.co
 
 ## Account, GO membership, and models
 
-The account entry supports OAuth login. Registration includes a complimentary **six-month GO subscription membership**, and inviting friends can earn **reset counts**. Current GO membership access includes **DeepSeek-V4, Mino, and Qwen 3.7 Fast**.
+The account entry supports OAuth login. See the [Go OAuth Account Bridge](#go-oauth-account-bridge-capabilities-supported-accounts-and-usage) for the supported third-party model accounts and exact workflow. Registration includes a complimentary **six-month GO subscription membership**, and inviting friends can earn **reset counts**. Current GO membership access includes **DeepSeek-V4, Mino, and Qwen 3.7 Fast**.
 
 **GO is the product membership name, not the Go programming language.** Eligibility, regions, model availability, quotas, reset rules, and service terms follow the live service shown after sign-in. The MIT source license does not grant subscriptions, model quota, third-party APIs, hosted services, or trademark rights.
 
@@ -57,9 +57,46 @@ Terminal
 
 Rust and TypeScript communicate through a process-private structured stdio protocol, not a GUI/AppServer or shared-app transport. Before login, the package verifies the Account Bridge version, platform, signed provenance, fixed plugins, SBOM, and third-party license materials.
 
-## OAuth upstream acknowledgment
+## Go OAuth Account Bridge: capabilities, supported accounts, and usage
+
+`components/oauthapi-llm` is not a remote Go service that users deploy separately, nor is it a general proxy exposing the upstream management API. It is a bundled, on-demand, restricted-loopback private sidecar that:
+
+- starts browser OAuth or device-code authorization and lets the TUI poll the result;
+- encrypts OAuth credentials outside the Rust and TypeScript processes, refreshes them, and isolates provider tokens;
+- discovers connected accounts and models, then creates a fixed opaque route for each account/model pair;
+- translates CrabCode's Claude Messages boundary to provider protocols and publishes per-model metadata for tools, thinking, vision, JSON mode, context windows, and related capabilities;
+- revalidates connector, account, route, model capability, cooldown, and quota state before each turn, and shows usage windows/reset times when a provider exposes them; and
+- supports multiple connected accounts, route selection, refresh, and local authorization removal.
+
+These are **OAuth/device-code account connections**, not API-key integrations. Available models and quota depend on the bundled adapter, provider state, and connected account plan; the TUI shows the effective result.
+
+| TUI entry | Account being authorized | Flow | Internal Go provider |
+| --- | --- | --- | --- |
+| OpenAI | An OpenAI / ChatGPT account eligible for Codex | Browser OAuth | `codex` |
+| Anthropic | A Claude account | Browser OAuth | `claude` |
+| Google | A Google account usable by Gemini CLI, through the fixed verified plugin | Browser OAuth | `gemini-cli` |
+| xAI | A Grok / xAI account | Device code: open the verification page and enter the code shown by the TUI | `xai` |
+| Qwen Code | A Qwen Code account | Device code | `qwen` |
+| Kimi Code | A Kimi Code account | Device code | `kimi` |
+| Z Code | A Z.AI Coding Plan account | Device code | `zai` |
+
+To connect an account:
+
+1. Start `crabcode` and run `/model manage` in the chat composer.
+2. Choose **Local account connections** → **Start account runtime** if it is not ready → **Connect account**. First use may ask for consent to the regional eligibility check.
+3. Pick a connector. Browser flows open the authorization page; device flows show the verification URL, user code, and expiry.
+4. Complete authorization and return to the TUI. It polls automatically; after success, select the model route labeled with its connector, account, and available usage.
+5. Use the same page to refresh accounts/usage/routes or remove an account and its locally encrypted credentials.
+
+Whether a connector is selectable also depends on the signed connector directory, current region, terms status, real-account conformance, and fixed release artifact. Unavailable connectors remain visible with a disabled reason. API keys and custom compatible endpoints belong under **Custom models**, not Account Bridge.
+
+The CrabCode distribution intentionally disables upstream direct-credential flags and public management surfaces. Do not run upstream-style commands such as `oauthapi-llm --codex-login`, call process-private endpoints directly, or expose the loopback listener. Use upstream CLIProxyAPI itself when you need a standalone general-purpose proxy.
+
+## OAuth upstream source and differences
 
 The `components/oauthapi-llm` sidecar is an MIT-licensed derivative of [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI), pinned to [`v7.2.71`](https://github.com/router-for-me/CLIProxyAPI/releases/tag/v7.2.71) / commit [`5b7f2361ee27d195f6514dde08656f6e4773a9a4`](https://github.com/router-for-me/CLIProxyAPI/commit/5b7f2361ee27d195f6514dde08656f6e4773a9a4). We thank its maintainers and contributors for the OAuth login and provider-protocol foundation.
+
+The pinned upstream version describes itself as an OpenAI/Gemini/Claude/Codex/Grok-compatible CLI proxy with OAuth, multi-account access, and protocol translation; see its [`v7.2.71 README`](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.71/README.md). CrabCode retains and hardens only the fixed Account Bridge subset described above. Generic API-key providers, a public compatibility proxy, remote management, arbitrary plugins, and direct CLI login from upstream are not part of CrabCode's public runtime surface.
 
 Local changes include branding, a restricted loopback surface, fixed-account routing, regional/connector policy verification, credential hardening, fixed plugins, and release verification. This derivative is not an official Router-For.ME distribution and implies no model-provider endorsement. See the component [`NOTICE`](components/oauthapi-llm/NOTICE), [`UPSTREAM.lock`](components/oauthapi-llm/UPSTREAM.lock), and [`LICENSE`](components/oauthapi-llm/LICENSE).
 

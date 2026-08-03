@@ -1047,7 +1047,7 @@ const FALLBACK_CONNECTOR_CATALOG: ReadonlyArray<{
   { connectorId: "openai", displayName: "OpenAI", authMode: "browser" },
   { connectorId: "anthropic", displayName: "Anthropic", authMode: "browser" },
   { connectorId: "google", displayName: "Google", authMode: "browser" },
-  { connectorId: "xai", displayName: "xAI", authMode: "browser" },
+  { connectorId: "xai", displayName: "xAI", authMode: "device-code" },
   { connectorId: "qwen", displayName: "Qwen Code", authMode: "device-code" },
   { connectorId: "kimi", displayName: "Kimi Code", authMode: "device-code" },
   { connectorId: "zai", displayName: "Z Code", authMode: "device-code" },

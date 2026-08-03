@@ -826,6 +826,9 @@ describe("Account Bridge lifecycle", () => {
       "kimi",
       "zai",
     ]);
+    expect(connectors.find(item => item.connectorId === "xai")?.authMode).toBe(
+      "device-code",
+    );
     for (const item of connectors) {
       expect(item.enabled).toBeFalse();
       expect(item.disabledReasonCode).toBe("eligibility_denied");

@@ -34,7 +34,7 @@ irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 
 
 ## 账户、GO 会员与模型
 
-安装后可通过账户入口完成 OAuth 登录。注册账户即赠送 **6 个月 GO 订阅会员**；邀请好友可获得**重置次数**。GO 会员当前可使用 **DeepSeek-V4、Mino、Qwen 3.7 快速版**。
+安装后可通过账户入口完成 OAuth 登录，第三方模型账户的支持范围和操作方式见[Go OAuth 账户桥](#go-oauth-账户桥能力支持账户与用法)。注册账户即赠送 **6 个月 GO 订阅会员**；邀请好友可获得**重置次数**。GO 会员当前可使用 **DeepSeek-V4、Mino、Qwen 3.7 快速版**。
 
 这里的 **GO 是 CrabCode 的产品会员名称，不是 Go 编程语言**。赠送资格、可用地区、模型上下线、额度、重置规则和服务条款以登录时的线上服务实际展示为准；仓库的 MIT 源码许可证不授予订阅、模型额度、第三方 API、托管服务或商标权益。
 
@@ -57,9 +57,46 @@ Terminal
 
 Rust TUI 与 TypeScript 之间使用进程私有的结构化标准输入/输出协议，不经过 GUI/AppServer 或所谓“统一应用通信层”。Account Bridge 只监听受限回环地址，发布包会在登录前验证其版本、平台、来源签名、插件、SBOM 和第三方许可材料。
 
-## OAuth 开源项目鸣谢
+## Go OAuth 账户桥：能力、支持账户与用法
+
+`components/oauthapi-llm` 不是需要用户单独部署的远程 Go 服务，也不是把上游管理 API 原样暴露出来的通用代理。它是 CrabCode 发布包内置、按需启动、仅绑定受限 loopback 的私有侧车，负责：
+
+- 发起浏览器 OAuth 或设备码授权，并由 TUI 自动轮询登录结果；
+- 在 Rust/TypeScript 进程之外加密保存 OAuth 凭据，刷新并隔离提供方 token；
+- 发现已连接账户、可用模型和每个“账户 × 模型”的固定不透明路由；
+- 把 CrabCode 使用的 Claude Messages 请求边界转换为各提供方协议，并按模型元数据公开工具调用、思考、视觉、JSON、上下文窗口等能力；
+- 在每轮调用前重新校验连接器、账户、路由、模型能力、冷却和配额状态；在提供方支持时展示用量窗口与重置时间；
+- 支持连接多个账户、选择账户模型路由、刷新状态以及移除本地授权。
+
+当前 CrabCode Account Bridge 的固定连接器如下。这里列的是**账户 OAuth/设备码登录**，不是 API Key 接入；具体模型与额度由当前发布版适配、对应账户方案及提供方状态共同决定，以 TUI 实际显示为准。
+
+| TUI 入口 | 登录的账户 | 授权方式 | Go 内部提供方 |
+| --- | --- | --- | --- |
+| OpenAI | 具有 Codex 使用资格的 OpenAI / ChatGPT 账户 | 浏览器 OAuth | `codex` |
+| Anthropic | Claude 账户 | 浏览器 OAuth | `claude` |
+| Google | 可用于 Gemini CLI 的 Google 账户；通过固定、已验证插件接入 | 浏览器 OAuth | `gemini-cli` |
+| xAI | Grok / xAI 账户 | 设备码：打开验证页并输入 TUI 显示的代码 | `xai` |
+| Qwen Code | Qwen Code 账户 | 设备码 | `qwen` |
+| Kimi Code | Kimi Code 账户 | 设备码 | `kimi` |
+| Z Code | Z.AI Coding Plan 账户 | 设备码 | `zai` |
+
+使用步骤：
+
+1. 启动 `crabcode`，在对话输入框执行 `/model manage`。
+2. 选择“本地账户接入”→“启动账户运行环境”（尚未就绪时）→“连接账户”。首次使用可能需要同意地区资格检测。
+3. 选择连接器。浏览器 OAuth 会打开授权页；设备码流程会同时显示验证地址、设备代码和过期时间。
+4. 在浏览器完成授权并返回 TUI；面板会自动轮询。成功后选择带有连接器、账户和用量信息的模型路由，即可设为当前模型。
+5. 回到同一页面可刷新账户/用量/路由，或移除账户及其本地加密凭据。
+
+连接器是否可点选还取决于签名连接器目录、当前地区、条款状态、真实账户一致性验证及固定发行工件；不可用项会留在列表中并显示禁用原因。API Key 或自定义兼容端点应走“自定义模型”，不属于 Account Bridge。
+
+CrabCode 发行版有意禁用了上游的直接凭据命令和公开管理面：不要运行 `oauthapi-llm --codex-login` 等上游参数，不要直接调用其进程私有接口，也不要把回环端口暴露到局域网或公网。需要独立、自托管的通用代理时，请直接使用上游 CLIProxyAPI，而不是把 CrabCode 侧车当作其可替代发行版。
+
+## OAuth 上游来源与差异
 
 账户接入侧车 `components/oauthapi-llm` 基于 MIT 许可的 [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) 二次开发，固定来源为 [`v7.2.71`](https://github.com/router-for-me/CLIProxyAPI/releases/tag/v7.2.71) / commit [`5b7f2361ee27d195f6514dde08656f6e4773a9a4`](https://github.com/router-for-me/CLIProxyAPI/commit/5b7f2361ee27d195f6514dde08656f6e4773a9a4)。感谢原项目及其贡献者为 OAuth 登录与提供方协议适配打下基础。
+
+上游固定版本将自身定位为面向 CLI 的 OpenAI/Gemini/Claude/Codex/Grok 兼容代理，并提供 OAuth、多账户和协议转换能力，详见其 [`v7.2.71 README`](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.71/README.md)。CrabCode 只复用了并加固其中与上述固定账户桥有关的能力；上游的通用 API Key 提供方、公开兼容代理、远程管理、任意插件和直接 CLI 登录方式不属于 CrabCode 的公开运行面。
 
 CrabCode 的改动包括白标、回环面收敛、固定账户路由、地区/连接器策略验证、凭据加固、固定插件及发行验证。该衍生组件不是 Router-For.ME 官方发行版，也不代表任何模型服务商背书。完整来源、修改说明和许可证见 [`components/oauthapi-llm/NOTICE`](components/oauthapi-llm/NOTICE)、[`UPSTREAM.lock`](components/oauthapi-llm/UPSTREAM.lock) 与 [`LICENSE`](components/oauthapi-llm/LICENSE)。
 
