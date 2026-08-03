@@ -17,7 +17,7 @@ import {
 } from 'node:fs'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { unzipSync } from 'fflate'
 import { comparePortablePaths } from './release-path-order.mjs'
@@ -365,6 +365,24 @@ function executableForPid(pid) {
   }
 }
 
+export function parseWindowsProcessInventory(stdout) {
+  const parsed = stdout.trim() ? JSON.parse(stdout) : []
+  return (Array.isArray(parsed) ? parsed : [parsed]).flatMap(item => {
+    const pid = Number(item?.ProcessId)
+    const executable = item?.ExecutablePath
+    if (
+      !Number.isSafeInteger(pid) ||
+      pid <= 0 ||
+      typeof executable !== 'string' ||
+      executable.length === 0 ||
+      !packageProcessNames.has(win32.basename(executable).toLowerCase())
+    ) {
+      return []
+    }
+    return [{ pid, executable }]
+  })
+}
+
 function listPackageProcesses(packageRoot) {
   let candidates = []
   if (process.platform === 'win32') {
@@ -374,9 +392,10 @@ function listPackageProcesses(packageRoot) {
       timeout: 15_000,
     })
     if (result.status !== 0) fail(`process inventory failed: ${spawnFailure(result)}`)
-    const stdout = spawnText(result.stdout)
-    const parsed = stdout.trim() ? JSON.parse(stdout) : []
-    candidates = (Array.isArray(parsed) ? parsed : [parsed]).map(item => Number(item.ProcessId))
+    // The single CIM snapshot already contains canonicalization candidates.
+    // Filter it before ownership checks instead of launching one PowerShell
+    // process for every system PID on every replay cleanup probe.
+    candidates = parseWindowsProcessInventory(spawnText(result.stdout))
   } else {
     // `lsof -p` once for every system PID made one replay take minutes on
     // macOS. Pre-filter by the kernel process command, then resolve and
@@ -391,14 +410,22 @@ function listPackageProcesses(packageRoot) {
       .split(/\r?\n/u)
       .flatMap(line => {
         const match = /^\s*(\d+)\s+(.+?)\s*$/u.exec(line)
-        if (!match || !packageProcessNames.has(basename(match[2]))) return []
-        return [Number(match[1])]
+        if (!match || !packageProcessNames.has(basename(match[2]).toLowerCase())) return []
+        return [{ pid: Number(match[1]), executable: null }]
       })
   }
-  return candidates.flatMap(pid => {
-    const executable = executableForPid(pid)
-    if (!executable || !packageProcessNames.has(basename(executable))) return []
+  return candidates.flatMap(candidate => {
+    const { pid } = candidate
     try {
+      const executable = candidate.executable
+        ? realpathSync(candidate.executable)
+        : executableForPid(pid)
+      if (
+        !executable ||
+        !packageProcessNames.has(basename(executable).toLowerCase())
+      ) {
+        return []
+      }
       return within(packageRoot, executable) ? [{ pid, executable }] : []
     } catch {
       return []
@@ -628,6 +655,9 @@ async function main() {
       await runIteration(packageRoot, scratchRoot, iteration, {
         extraEnvironment: isolatedEnvironment,
       })
+      if (iteration % 10 === 0 || iteration === args.iterations) {
+        process.stderr.write(`release package smoke progress: ${iteration}/${args.iterations}\n`)
+      }
     }
     if (args.installer) {
       await runInstallerSmoke(
@@ -688,4 +718,4 @@ async function main() {
   )
 }
 
-await main()
+if (import.meta.main) await main()

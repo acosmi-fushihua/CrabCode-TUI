@@ -57,9 +57,12 @@ const platforms = Object.freeze({
     rustTarget: 'x86_64-apple-darwin',
     executableExtension: '',
     archiveExtension: 'tar.gz',
-    bunAsset: 'bun-darwin-x64.zip',
-    bunRoot: 'bun-darwin-x64',
-    bunSha256: 'c4fe2b9247218b0295f24e895aaec8fee62e74452679a9026b67eacbd611a286',
+    // GitHub's Intel macOS runner is hosted on Apple Silicon without AVX.
+    // The standard Bun x64 binary stalls before the renderer handshake there;
+    // the upstream baseline build is the supported no-AVX compatibility asset.
+    bunAsset: 'bun-darwin-x64-baseline.zip',
+    bunRoot: 'bun-darwin-x64-baseline',
+    bunSha256: 'fb6739b08bf54550edaa7c824cd5b2dca45b6a06afef408443087a63105f6f8d',
     ripgrepAsset: 'ripgrep-14.1.1-x86_64-apple-darwin.tar.gz',
     ripgrepRoot: 'ripgrep-14.1.1-x86_64-apple-darwin',
     ripgrepSha256: 'fc87e78f7cb3fea12d69072e7ef3b21509754717b746368fd40d88963630e2b3',

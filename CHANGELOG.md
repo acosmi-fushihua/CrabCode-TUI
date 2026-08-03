@@ -1,5 +1,41 @@
 # Changelog / 更新日志
 
+## v1.0.24 — 2026-08-03
+
+- Forward-fixed the unpublished `v1.0.23` release candidate without moving or
+  deleting its signed tag.
+- Replaced the x64 macOS package runtime with Bun's pinned baseline build. The
+  standard x64 build requires AVX and stalled before the renderer handshake on
+  GitHub's Intel macOS runner under Rosetta.
+- Classified only Bun's exact no-AVX compatibility warning, and only when the
+  package-local release materials bind the expected platform, version, asset
+  URL, and SHA-256. Every other stderr byte still fails the runtime smoke.
+- Removed the unused `ffmpeg-static` dependency and its install-time network
+  fetch. Media rendering continues to use the existing explicit system FFmpeg
+  contract.
+- Removed the Windows replay's process-per-system-PID inventory loop. One CIM
+  snapshot is now name-prefiltered before canonical package-ownership checks;
+  all 100 incident replays remain, with platform-specific CI budgets and
+  progress every ten iterations.
+- Corrected release evidence terminology: repeated assembly proves byte-level
+  determinism for one compiled product closure, not independent-build
+  reproducibility.
+
+---
+
+- 对未公开发布的 `v1.0.23` 候选版执行前滚修复，不移动或删除其已签名标签。
+- x64 macOS 发布包改用固定版本和哈希的 Bun baseline 构建。标准 x64 构建要求
+  AVX，在 GitHub Intel macOS runner 的 Rosetta 环境中会在 renderer 握手前停滞。
+- 仅当包内发布材料同时绑定预期平台、版本、资产 URL 与 SHA-256 时，才分类接纳
+  Bun 唯一一条精确的无 AVX 兼容提示；其他任何 stderr 字节仍使 runtime smoke 失败。
+- 移除从未被源码引用、安装时还会额外联网取包的 `ffmpeg-static` 死依赖；媒体渲染
+  继续遵循原有的显式系统 FFmpeg 契约。
+- 移除 Windows 回放中“每个系统 PID 再启动一个 PowerShell”的进程盘点循环；改为
+  单次 CIM 快照先按名称过滤，再做 canonical 包归属核验。每平台 100 次事故回放
+  全部保留，另按平台设置 CI 时限并每十次输出进度。
+- 纠正发布证据表述：重复组装只能证明同一编译闭包的字节级确定性，不能冒充独立
+  构建之间的完整可复现性。
+
 ## v1.0.23 — 2026-08-02
 
 - Fixed the P1 `sources: []` crash across Gateway, `@acosmi/sdk-ts 2.15.0`,

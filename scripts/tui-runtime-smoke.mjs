@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 
-import { rmSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { mkdtemp, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { classifyRuntimeStderr } from './release-runtime-stderr.mjs'
 
 const root = resolve(
   process.env.CRABCODE_SMOKE_PACKAGE_ROOT ?? resolve(import.meta.dir, '..'),
@@ -12,6 +13,10 @@ const runtime = join(root, 'dist/tui-runtime/index.js')
 const runtimeExecutable = resolve(
   process.env.CRABCODE_SMOKE_BUN ?? process.execPath,
 )
+const releaseMaterialsPath = join(root, 'release-materials.json')
+const releaseMaterials = existsSync(releaseMaterialsPath)
+  ? JSON.parse(readFileSync(releaseMaterialsPath, 'utf8'))
+  : null
 const timeoutMs = 45_000
 const rendererNotificationChannels = new Set([
   'auto',
@@ -296,7 +301,8 @@ if (exitCode !== 0) {
 }
 
 const stderr = await stderrPromise
-if (stderr.length > 0) {
+const stderrDisposition = classifyRuntimeStderr(stderr, releaseMaterials)
+if (stderrDisposition === 'unexpected') {
   throw new Error(`runtime emitted stderr during smoke:\n${stderr}`)
 }
 
@@ -318,6 +324,7 @@ process.stdout.write(
         ? initializePayload.models.length
         : null,
       outputStyle: initializePayload.output_style,
+      stderr: stderrDisposition,
       frameTypes,
       exitCode,
     },

@@ -106,21 +106,26 @@ jobs:
     needs: verify-source
     if: github.repository == 'acosmi/CrabCode-TUI'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.timeoutMinutes }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: arm64-darwin
             runner: macos-15
+            timeoutMinutes: 120
           - platform: x64-darwin
             runner: macos-15-intel
+            timeoutMinutes: 120
           - platform: arm64-linux
             runner: ubuntu-24.04-arm
+            timeoutMinutes: 120
           - platform: x64-linux
             runner: ubuntu-24.04
+            timeoutMinutes: 120
           - platform: x64-win32
             runner: windows-2025
+            timeoutMinutes: 180
     steps:
       - uses: actions/checkout@v5
         with:
@@ -186,7 +191,7 @@ jobs:
           cargo build --locked --release --manifest-path libs/acosmi-memory/Cargo.toml \
             --bin acosmi-memory-orchestrator
 
-      - name: Assemble, verify, and archive complete native package
+      - name: Assemble and verify one compiled product closure
         shell: bash
         run: |
           set -euo pipefail
@@ -207,7 +212,7 @@ jobs:
             --version "${VERSION}" \
             --output-dir dist/release
           cmp -s "${BASELINE}" "${ASSET}" || {
-            echo "::error::release archive is not byte-for-byte reproducible"; exit 1;
+            echo "::error::repeated assembly from one compiled closure is not byte-for-byte reproducible"; exit 1;
           }
           rm -f "${BASELINE}"
 
