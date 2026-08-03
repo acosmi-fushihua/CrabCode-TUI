@@ -16,10 +16,11 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { createConnection } from 'node:net'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { unzipSync } from 'fflate'
+import { comparePortablePaths } from './release-path-order.mjs'
 
 const repositoryRoot = resolve(import.meta.dir, '..')
 const incidentSchema = 'crabcode-memory-ipc-v1-20260725'
@@ -36,6 +37,16 @@ const packageProcessNames = new Set([
 
 function fail(message) {
   throw new Error(`release package smoke: ${message}`)
+}
+
+function spawnText(value) {
+  return value == null ? '' : String(value)
+}
+
+function spawnFailure(result) {
+  return [result.error?.message, spawnText(result.stderr).trim(), result.signal ? `signal=${result.signal}` : '']
+    .filter(Boolean)
+    .join('; ') || `status=${String(result.status)}`
 }
 
 function parseArguments(values) {
@@ -154,17 +165,11 @@ function verifyManifest(packageRoot) {
       size: statSync(path).size,
     }))
     .filter(entry => !['release-manifest.json', 'release-manifest.digest.json'].includes(entry.path))
-    .sort((left, right) => left.path.localeCompare(right.path))
+    .sort((left, right) => comparePortablePaths(left.path, right.path))
   if (JSON.stringify(actual) !== JSON.stringify(manifest.files)) {
     fail('extracted package inventory differs from release-manifest.json')
   }
   return manifest
-}
-
-function defaultRealStateRoot() {
-  if (process.env.CRABCODE_CONFIG_DIR?.length) return resolve(process.env.CRABCODE_CONFIG_DIR)
-  if (process.env.CRABCODE_HOME?.length) return resolve(process.env.CRABCODE_HOME, '.crabcode')
-  return resolve(homedir(), '.crabcode')
 }
 
 function snapshotState(root) {
@@ -197,6 +202,15 @@ function snapshotState(root) {
   }
   visit(root)
   return JSON.stringify({ present: true, records })
+}
+
+function snapshotPathSummary(snapshot) {
+  const parsed = JSON.parse(snapshot)
+  const records = Array.isArray(parsed.records) ? parsed.records : []
+  return {
+    count: records.length,
+    entries: records.slice(0, 32).map(record => ({ path: record.path, kind: record.kind })),
+  }
 }
 
 async function runProcess(command, args, options = {}) {
@@ -331,7 +345,8 @@ function executableForPid(pid) {
         encoding: 'utf8',
         timeout: 5_000,
       })
-      const path = result.stdout
+      if (result.status !== 0) return null
+      const path = spawnText(result.stdout)
         .split(/\r?\n/u)
         .find(line => line.startsWith('n'))
         ?.slice(1)
@@ -342,7 +357,8 @@ function executableForPid(pid) {
       encoding: 'utf8',
       timeout: 5_000,
     })
-    const path = result.stdout.trim()
+    if (result.status !== 0) return null
+    const path = spawnText(result.stdout).trim()
     return path ? realpathSync(path) : null
   } catch {
     return null
@@ -357,7 +373,9 @@ function listPackageProcesses(packageRoot) {
       encoding: 'utf8',
       timeout: 15_000,
     })
-    const parsed = result.stdout.trim() ? JSON.parse(result.stdout) : []
+    if (result.status !== 0) fail(`process inventory failed: ${spawnFailure(result)}`)
+    const stdout = spawnText(result.stdout)
+    const parsed = stdout.trim() ? JSON.parse(stdout) : []
     candidates = (Array.isArray(parsed) ? parsed : [parsed]).map(item => Number(item.ProcessId))
   } else {
     // `lsof -p` once for every system PID made one replay take minutes on
@@ -368,8 +386,8 @@ function listPackageProcesses(packageRoot) {
       encoding: 'utf8',
       timeout: 10_000,
     })
-    if (result.status !== 0) fail(`process inventory failed: ${result.stderr.trim()}`)
-    candidates = result.stdout
+    if (result.status !== 0) fail(`process inventory failed: ${spawnFailure(result)}`)
+    candidates = spawnText(result.stdout)
       .split(/\r?\n/u)
       .flatMap(line => {
         const match = /^\s*(\d+)\s+(.+?)\s*$/u.exec(line)
@@ -509,7 +527,7 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
   if (lingering.length > 0) fail(`package processes survived iteration ${iteration}: ${JSON.stringify(lingering)}`)
 }
 
-async function runInstallerSmoke(archive, installer, version, scratchRoot) {
+async function runInstallerSmoke(archive, installer, version, scratchRoot, baseEnvironment) {
   if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$/u.test(version)) {
     fail(`package manifest version is not canonical SemVer: ${version}`)
   }
@@ -527,7 +545,7 @@ async function runInstallerSmoke(archive, installer, version, scratchRoot) {
   )
 
   const environment = {
-    ...process.env,
+    ...baseEnvironment,
     CRABCODE_ASSET_DIR: assetDirectory,
     CRABCODE_BIN_DIR: binDirectory,
     CRABCODE_VERSION: `v${version}`,
@@ -563,32 +581,96 @@ async function main() {
   const args = parseArguments(process.argv.slice(2))
   const scratchRoot = mkdtempSync(join(tmpdir(), 'crabcode-release-package-smoke-'))
   const extractRoot = join(scratchRoot, 'package')
-  const realStateRoot = defaultRealStateRoot()
-  const before = snapshotState(realStateRoot)
+  // Redirect every default home/config convention into the owned scratch root.
+  // The fallback .crabcode state must remain absent: any product component that
+  // ignores CRABCODE_CONFIG_DIR will create it and fail this gate deterministically.
+  // Third-party runtimes may create their own cache entries elsewhere in HOME.
+  const fallbackHome = join(scratchRoot, 'forbidden-default-home')
+  const fallbackStateRoot = join(fallbackHome, '.crabcode')
+  const xdgConfigHome = join(scratchRoot, 'xdg', 'config')
+  const xdgDataHome = join(scratchRoot, 'xdg', 'data')
+  const xdgStateHome = join(scratchRoot, 'xdg', 'state')
+  const xdgCacheHome = join(scratchRoot, 'xdg', 'cache')
+  const appDataHome = join(scratchRoot, 'windows', 'roaming')
+  const localAppDataHome = join(scratchRoot, 'windows', 'local')
+  for (const directory of [
+    fallbackHome,
+    xdgConfigHome,
+    xdgDataHome,
+    xdgStateHome,
+    xdgCacheHome,
+    appDataHome,
+    localAppDataHome,
+  ]) {
+    mkdirSync(directory, { recursive: true })
+  }
+  const isolatedEnvironment = {
+    ...process.env,
+    HOME: fallbackHome,
+    USERPROFILE: fallbackHome,
+    XDG_CONFIG_HOME: xdgConfigHome,
+    XDG_DATA_HOME: xdgDataHome,
+    XDG_STATE_HOME: xdgStateHome,
+    XDG_CACHE_HOME: xdgCacheHome,
+    APPDATA: appDataHome,
+    LOCALAPPDATA: localAppDataHome,
+  }
+  const fallbackBefore = snapshotState(fallbackStateRoot)
   let packageRoot
   let primaryError
+  let cleanupError
+  let isolationError
+  let scratchCleanupError
   try {
     packageRoot = extractArchive(args.archive, extractRoot)
     const manifest = verifyManifest(packageRoot)
     for (let iteration = 1; iteration <= args.iterations; iteration += 1) {
-      await runIteration(packageRoot, scratchRoot, iteration)
+      await runIteration(packageRoot, scratchRoot, iteration, {
+        extraEnvironment: isolatedEnvironment,
+      })
     }
     if (args.installer) {
-      await runInstallerSmoke(args.archive, args.installer, manifest.version, scratchRoot)
+      await runInstallerSmoke(
+        args.archive,
+        args.installer,
+        manifest.version,
+        scratchRoot,
+        isolatedEnvironment,
+      )
     }
   } catch (error) {
     primaryError = error
   } finally {
-    if (packageRoot) await terminateOwnedProcesses(packageRoot)
-    rmSync(scratchRoot, { recursive: true, force: true })
+    try {
+      if (packageRoot) await terminateOwnedProcesses(packageRoot)
+    } catch (error) {
+      cleanupError = error
+    }
+    try {
+      const fallbackAfter = snapshotState(fallbackStateRoot)
+      if (fallbackBefore !== fallbackAfter) {
+        isolationError = new Error(
+          `default CrabCode state fallback was touched: ${fallbackStateRoot} ${JSON.stringify(snapshotPathSummary(fallbackAfter))}`,
+        )
+      }
+    } catch (error) {
+      isolationError = error
+    }
+    try {
+      rmSync(scratchRoot, { recursive: true, force: true })
+    } catch (error) {
+      scratchCleanupError = error
+    }
   }
-  const after = snapshotState(realStateRoot)
-  if (before !== after) {
-    const isolationError = new Error(`real state sentinel changed: ${realStateRoot}`)
-    if (primaryError) isolationError.cause = primaryError
-    throw isolationError
+  const secondaryErrors = [cleanupError, isolationError, scratchCleanupError].filter(Boolean)
+  if (primaryError) {
+    if (primaryError instanceof Error && secondaryErrors.length > 0 && primaryError.cause === undefined) {
+      primaryError.cause = new AggregateError(secondaryErrors, 'release smoke cleanup failures')
+    }
+    throw primaryError
   }
-  if (primaryError) throw primaryError
+  if (secondaryErrors.length === 1) throw secondaryErrors[0]
+  if (secondaryErrors.length > 1) throw new AggregateError(secondaryErrors, 'release smoke cleanup failures')
   process.stdout.write(
     `${JSON.stringify({
       schema_version: 1,
@@ -600,6 +682,7 @@ async function main() {
       package_process_leaks: 0,
       memory_namespace_leaks: 0,
       installer_replays: args.installer ? '1/1' : '0/0',
+      default_home_changes: 0,
       real_state_changes: 0,
     })}\n`,
   )

@@ -264,7 +264,7 @@ impl ManagedProcess {
         match self.config.stdio_policy {
             StdioPolicy::InheritTerminal => {
                 // TUI 进程：stdin+stdout 继承终端；stderr 走 piped 由 forwarder
-                // 写文件 `~/.crabcode/debug/ts-stderr-<pid>-<ts>.log`。
+                // 写文件 `<config-root>/debug/ts-stderr-<pid>-<ts>.log`。
                 //
                 // 不能 inherit：stderr 直通终端会与 ink 的 ANSI 渲染序列冲突，
                 // 把光标位置/重绘弄花。
@@ -775,22 +775,18 @@ where
 
 /// InheritTerminal 路径下的 stderr 落地目标。
 ///
-/// 路径：`<home>/.crabcode/debug/ts-stderr-<pid>-<unix_ms>.log`。
+/// 路径：`<config-root>/debug/ts-stderr-<pid>-<unix_ms>.log`。
 /// `<pid>` + 启动 ms 时间戳避免同主机多 supervisor 实例覆盖；append 模式
 /// 让单次启动内的所有 stderr 行连续落入同一文件，事故复盘看一份就够。
 ///
-/// Home resolution: prefer `CRABCODE_HOME` so tests and subprocesses can use
-/// an isolated runtime root,
-/// 然后 `HOME`（Unix），再 `USERPROFILE`（Windows），最后退化到 cwd。
+/// 根目录复用仓库统一配置解析器：`CRABCODE_CONFIG_DIR` 是最高优先级的完整
+/// root；否则使用 `<CRABCODE_HOME-or-OS-home>/.crabcode`。不得在这里另建一套
+/// HOME 解析，否则隔离运行仍会把 stderr 写回真实用户目录。
 fn stderr_log_path_for_inherit_terminal(pid: u32) -> std::path::PathBuf {
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let home = std::env::var_os("CRABCODE_HOME")
-        .or_else(|| std::env::var_os("HOME"))
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
-    home.join(".crabcode")
+    acosmi_config::paths::resolve_config_home_dir()
         .join("debug")
         .join(format!("ts-stderr-{pid}-{ts_ms}.log"))
 }
@@ -1192,13 +1188,13 @@ mod tests {
     }
 
     /// 防回归 — `stderr_log_path_for_inherit_terminal` 必须落到
-    /// `<home>/.crabcode/debug/ts-stderr-<pid>-<ts_ms>.log` 形态，
+    /// `<resolved-config-home>/debug/ts-stderr-<pid>-<ts_ms>.log` 形态，
     /// 同 pid 短时间内连续调用得到不同时间戳（避免覆盖）。
     #[test]
+    #[serial_test::serial]
     fn test_stderr_log_path_for_inherit_terminal_shape() {
         let p1 = super::stderr_log_path_for_inherit_terminal(12345);
         let s1 = p1.to_string_lossy().into_owned();
-        assert!(s1.contains(".crabcode"), "路径应含 .crabcode 段: {s1}");
         assert!(s1.contains("debug"), "路径应含 debug 段: {s1}");
         assert!(s1.contains("ts-stderr-12345-"), "路径应含 pid 段: {s1}");
         assert!(s1.ends_with(".log"), "路径应以 .log 结尾: {s1}");
@@ -1207,6 +1203,67 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         let p2 = super::stderr_log_path_for_inherit_terminal(12345);
         assert_ne!(p1, p2, "同 pid 两次调用必须不同时间戳");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_stderr_log_path_honors_config_dir_before_home() {
+        struct EnvRestore {
+            config: Option<std::ffi::OsString>,
+            crabcode_home: Option<std::ffi::OsString>,
+            home: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (name, value) in [
+                    ("CRABCODE_CONFIG_DIR", self.config.take()),
+                    ("CRABCODE_HOME", self.crabcode_home.take()),
+                    ("HOME", self.home.take()),
+                ] {
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        if let Some(value) = value {
+                            std::env::set_var(name, value);
+                        } else {
+                            std::env::remove_var(name);
+                        }
+                    }
+                }
+            }
+        }
+
+        let config = tempfile::tempdir().expect("config tempdir");
+        let other_home = tempfile::tempdir().expect("home tempdir");
+        let _restore = EnvRestore {
+            config: std::env::var_os("CRABCODE_CONFIG_DIR"),
+            crabcode_home: std::env::var_os("CRABCODE_HOME"),
+            home: std::env::var_os("HOME"),
+        };
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("CRABCODE_CONFIG_DIR", config.path());
+            std::env::set_var("CRABCODE_HOME", other_home.path());
+            std::env::set_var("HOME", other_home.path());
+        }
+
+        let path = super::stderr_log_path_for_inherit_terminal(12345);
+        let canonical_config = config
+            .path()
+            .canonicalize()
+            .expect("canonical config tempdir");
+        let canonical_home = other_home
+            .path()
+            .canonicalize()
+            .expect("canonical home tempdir");
+        assert!(
+            path.starts_with(canonical_config.join("debug")),
+            "path={path:?}"
+        );
+        assert!(
+            !path.starts_with(canonical_home),
+            "config override lost to home: {path:?}"
+        );
     }
 
     /// 端到端 — `forward_inherit_terminal_stderr_to_file` 必须把读到的

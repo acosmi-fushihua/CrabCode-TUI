@@ -22,6 +22,7 @@ import {
 } from 'node:fs'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { unzipSync, zipSync } from 'fflate'
+import { comparePortablePaths } from './release-path-order.mjs'
 
 const repositoryRoot = resolve(import.meta.dir, '..')
 const sourceRepository = 'https://github.com/acosmi/CrabCode-TUI'
@@ -169,10 +170,6 @@ function jsonFile(path) {
 
 function portable(path) {
   return path.split(sep).join('/')
-}
-
-function compareText(left, right) {
-  return left < right ? -1 : left > right ? 1 : 0
 }
 
 function writeJson(path, value) {
@@ -667,7 +664,7 @@ function inventoryFiles(packageDirectory, excluded = new Set()) {
       }
     })
     .filter(file => !excluded.has(file.path))
-    .sort((left, right) => compareText(left.path, right.path))
+    .sort((left, right) => comparePortablePaths(left.path, right.path))
 }
 
 function verifyManifest(packageDirectory) {
