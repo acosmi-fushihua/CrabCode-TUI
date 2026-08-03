@@ -12,9 +12,7 @@ CrabCode TUI is CrabCode's terminal-only open-source edition. Rust owns the term
 
 ## Install
 
-> **Current release status (2026-08-03):** the `v1.0.23` fix is merged into `main`, but its TUI Release has not been published. GitHub `latest` is still `v1.0.22`, which contains the known `sources=[]` runtime-stop defect. Do not run the `latest` installer or attempt to download nonexistent `v1.0.23` assets yet.
-
-After `v1.0.23` is published, ordinary installation is one command and does not require GitHub CLI:
+The current stable release is `v1.0.23`. Ordinary installation is one command and does not require GitHub CLI:
 
 macOS / Linux:
 
