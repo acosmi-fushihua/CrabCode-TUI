@@ -5,6 +5,7 @@ import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { mkdtemp, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { createPersistentStreamPoller } from './persistent-stream-poller.mjs'
 import { classifyRuntimeStderr } from './release-runtime-stderr.mjs'
 
 const root = resolve(
@@ -95,6 +96,7 @@ const captureDarwinSample = () => {
     truncated: output.length > 64 * 1024,
   }
 }
+
 process.once('exit', cleanup)
 process.once('SIGINT', () => process.exit(130))
 process.once('SIGTERM', () => process.exit(143))
@@ -132,6 +134,7 @@ const writeInitialize = async () => {
 const decoder = new TextDecoder()
 const stdout = child.stdout.getReader()
 const stderrPromise = new Response(child.stderr).text()
+const pollStdout = createPersistentStreamPoller(stdout)
 const deadline = Date.now() + timeoutMs
 const frameTypes = []
 let buffer = ''
@@ -147,12 +150,7 @@ let turnSubmitted = false
 await writeInitialize()
 
 while (Date.now() < deadline && !endAcknowledged) {
-  const read = await Promise.race([
-    stdout.read(),
-    new Promise(resolveRead =>
-      setTimeout(() => resolveRead({ timeout: true }), 1_000),
-    ),
-  ])
+  const read = await pollStdout(1_000)
   if (read.timeout) continue
   if (read.done) break
 

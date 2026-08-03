@@ -206,6 +206,7 @@ const exactScripts = new Set([
   'scripts/generate-renderer-capability-contract.mjs',
   'scripts/install.ps1',
   'scripts/install.sh',
+  'scripts/persistent-stream-poller.mjs',
   'scripts/repository-boundary.mjs',
   'scripts/release-bun-pins.mjs',
   'scripts/release-package-smoke.mjs',

@@ -1,7 +1,45 @@
 # Changelog / 更新日志
 
+## v1.0.26 — 2026-08-03
+
+- Forward-fixes the failed, unpublished `v1.0.25` tag without moving, deleting,
+  rerunning, or creating Releases for `v1.0.23` through `v1.0.25`.
+- Corrects the release-failure attribution. The runtime produced and flushed its
+  initialize response; the smoke observer dropped it by starting a new
+  `stdout.read()` after every one-second `Promise.race` timeout while the old
+  read remained alive and consumed the next chunk.
+- Reuses exactly one pending stream read across poll timeouts. A focused
+  regression test forces three consecutive timeouts, proves that `read()` was
+  called once, and then verifies delivery of the delayed frame and recovery
+  after a rejected read.
+- Reverted every diagnostic-only runtime experiment after proving the observer
+  defect. Product protocol, TypeScript runtime, Rust renderer, Gateway, SDK
+  `2.15.0`, configuration, sessions, and package layout remain unchanged.
+- Preserves the native Intel preflight ahead of the five-platform matrix and the
+  reviewed x64 macOS Bun `1.3.14` baseline identity. The final minimal fix
+  completed `100/100` supplemental Rosetta lifecycles with zero process or
+  temporary-directory leakage; native Intel CI remains the release authority.
+
+---
+
+- 对失败且未公开的 `v1.0.25` 标签执行前滚修复；不移动、不删除、不重跑
+  `v1.0.23` 至 `v1.0.25`，也不为这些失败标签补建 Release。
+- 纠正发布失败归因：runtime 实际已经生成并刷新 initialize 响应；smoke 观察器每次
+  一秒 `Promise.race` 超时后又启动新的 `stdout.read()`，旧读取仍存活并吞掉下一块
+  数据，导致观察端永久丢帧。
+- 轮询超时后复用同一个未决读取，始终只允许一个 `read()`。专项回归测试强制连续
+  三次超时，证明只调用一次读取，随后验证延迟帧不丢失以及读取失败后可恢复。
+- 根因成立后撤回全部仅用于排障的 runtime 实验改动。产品协议、TypeScript runtime、
+  Rust renderer、Gateway、SDK `2.15.0`、配置、会话和包布局均不改变。
+- 保留五平台矩阵之前的原生 Intel 预检，以及已审查的 x64 macOS Bun `1.3.14`
+  baseline 身份。最终最小修复完成 Rosetta 补充控制 `100/100`，进程与临时目录零
+  泄漏；正式发布授权仍只来自原生 Intel CI。
+
 ## v1.0.25 — 2026-08-03
 
+- This signed release attempt failed its native Intel preflight and has no
+  GitHub Release or public assets. `v1.0.26` later proved that the preflight
+  observer, not runtime module evaluation, dropped delayed stdout frames.
 - Forward-fixes the failed, unpublished `v1.0.24` tag without moving or deleting
   that signed historical record. `v1.0.24` has no GitHub Release or public
   assets and must not be installed.
@@ -25,6 +63,8 @@
 
 ---
 
+- 此次已签名发布未通过原生 Intel 预检，没有 GitHub Release 或公开资产。
+  `v1.0.26` 后续证明是预检观察器丢弃延迟 stdout 帧，并非 runtime 模块求值停滞。
 - 对失败且未公开的 `v1.0.24` 标签执行前滚修复，不移动或删除该已签名历史记录。
   `v1.0.24` 没有 GitHub Release 或公开资产，不得安装。
 - 仅将 x64 macOS 发布包切换到经审查的 Bun `1.3.14` baseline 归档，同时固定精确
@@ -46,10 +86,10 @@
   was deliberately cancelled before the remaining matrix consumed more CI.
   It has no GitHub Release or public assets and is retained only as immutable
   failure evidence.
-- Both Bun `1.3.11` standard and baseline executables could launch, but the
-  complete CrabCode top-level-await/dynamic-import graph stalled before the
-  renderer handshake. The failure was therefore runtime module evaluation, not
-  installer selection or inability to execute the Bun binary.
+- Both Bun `1.3.11` standard and baseline executables could launch. This was
+  initially attributed to the complete module graph stalling before the
+  renderer handshake; `v1.0.26` disproved that attribution and identified
+  overlapping timed-out smoke reads as the frame-loss mechanism.
 - Forward-fixed the earlier unpublished `v1.0.23` release candidate without
   moving or deleting its signed tag.
 - Classified only Bun's exact no-AVX compatibility warning, and only when the
@@ -71,9 +111,9 @@
 - 此次已签名发布在 GitHub 原生 Intel macOS runner 上失败；为避免其余矩阵继续
   消耗 CI，失败后已主动取消。该版本没有 GitHub Release 或公开资产，仅作为不可变
   的失败证据保留。
-- Bun `1.3.11` 的 standard 与 baseline 可执行文件本身都能启动，但执行 CrabCode
-  完整 top-level-await/dynamic-import 模块图时均在 renderer 握手前停滞。因此故障位于
-  运行时模块求值，不是安装器选错版本，也不是 Bun 二进制无法执行。
+- Bun `1.3.11` 的 standard 与 baseline 可执行文件本身都能启动。当时曾归因为完整
+  模块图在 renderer 握手前停滞；`v1.0.26` 已推翻该归因，并确认是 smoke 中多个
+  已超时但仍存活的读取竞争并吞掉协议帧。
 - 对更早的未公开 `v1.0.23` 候选版执行前滚修复，不移动或删除其已签名标签。
 - 仅当包内发布材料同时绑定预期平台、版本、资产 URL 与 SHA-256 时，才分类接纳
   Bun 唯一一条精确的无 AVX 兼容提示；其他任何 stderr 字节仍使 runtime smoke 失败。
