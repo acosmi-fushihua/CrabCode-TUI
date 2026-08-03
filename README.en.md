@@ -10,59 +10,25 @@
 
 CrabCode TUI is CrabCode's terminal-only open-source edition. Rust owns the terminal, rendering, and local process lifecycle; it directly launches the TypeScript business runtime. An isolated Go Account Bridge starts only when account OAuth is needed. This repository contains no desktop/web GUI, React/Ink UI, AppServer, shared-application communication layer, archived implementation, or internal project plans.
 
-## Install or choose a product
+## Install
 
-### TUI (this open-source repository)
+> **Current release status (2026-08-03):** the `v1.0.23` fix is merged into `main`, but its TUI Release has not been published. GitHub `latest` is still `v1.0.22`, which contains the known `sources=[]` runtime-stop defect. Do not run the `latest` installer or attempt to download nonexistent `v1.0.23` assets yet.
+
+After `v1.0.23` is published, ordinary installation is one command and does not require GitHub CLI:
 
 macOS / Linux:
 
 ```bash
-VERSION=v1.0.23
-case "$(uname -m)-$(uname -s)" in
-  arm64-Darwin|aarch64-Darwin) PLATFORM=arm64-darwin ;;
-  x86_64-Darwin|amd64-Darwin) PLATFORM=x64-darwin ;;
-  arm64-Linux|aarch64-Linux) PLATFORM=arm64-linux ;;
-  x86_64-Linux|amd64-Linux) PLATFORM=x64-linux ;;
-  *) echo "unsupported platform" >&2; exit 1 ;;
-esac
-ASSET="crabcode-${VERSION#v}-${PLATFORM}.tar.gz"
-VERIFIED_DIR="$(mktemp -d)"
-gh release download "$VERSION" --repo acosmi/CrabCode-TUI --dir "$VERIFIED_DIR" \
-  --pattern install.sh --pattern checksums-sha256.txt --pattern "$ASSET"
-for FILE in "$VERIFIED_DIR/install.sh" "$VERIFIED_DIR/checksums-sha256.txt" "$VERIFIED_DIR/$ASSET"; do
-  gh attestation verify "$FILE" --repo acosmi/CrabCode-TUI \
-    --source-ref "refs/tags/$VERSION" \
-    --signer-workflow github.com/acosmi/CrabCode-TUI/.github/workflows/release.yml
-done
-CRABCODE_VERSION="$VERSION" CRABCODE_ASSET_DIR="$VERIFIED_DIR" sh "$VERIFIED_DIR/install.sh"
-rm -rf "$VERIFIED_DIR"
+curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-$Version = 'v1.0.23'
-$Asset = "crabcode-$($Version.TrimStart('v'))-x64-win32.zip"
-$VerifiedDir = Join-Path $env:TEMP "crabcode-verified-$([Guid]::NewGuid().ToString('N'))"
-New-Item -ItemType Directory -Path $VerifiedDir | Out-Null
-gh release download $Version --repo acosmi/CrabCode-TUI --dir $VerifiedDir `
-  --pattern install.ps1 --pattern checksums-sha256.txt --pattern $Asset
-@('install.ps1', 'checksums-sha256.txt', $Asset) | ForEach-Object {
-  gh attestation verify (Join-Path $VerifiedDir $_) --repo acosmi/CrabCode-TUI `
-    --source-ref "refs/tags/$Version" `
-    --signer-workflow github.com/acosmi/CrabCode-TUI/.github/workflows/release.yml
-  if ($LASTEXITCODE -ne 0) { throw "attestation verification failed: $_" }
-}
-$env:CRABCODE_VERSION = $Version
-$env:CRABCODE_ASSET_DIR = $VerifiedDir
-& (Join-Path $VerifiedDir 'install.ps1')
-Remove-Item Env:CRABCODE_VERSION, Env:CRABCODE_ASSET_DIR
-Remove-Item -LiteralPath $VerifiedDir -Recurse -Force
+irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex
 ```
 
-This primary flow pins a version and verifies GitHub build provenance for the installer, checksum list, and current-platform archive before executing anything. Local-asset mode performs no further network access. It requires an installed and authenticated [GitHub CLI `gh`](https://cli.github.com/). Archives bundle `crabcode`, the native TUI, Bun, memory and cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge, so users do not need a separate Rust, Bun, or Go toolchain. Installers additionally verify the release SHA-256 and package per-file manifest. Supported targets are macOS/Linux arm64 and x64, plus Windows x64.
-
-The mutable `latest/download/install.sh | sh` and `install.ps1 | iex` routes remain executable for old automation, but their bootstrap source cannot be authenticated before execution and they are not the recommended install path.
+The installer verifies the release SHA-256 and package per-file manifest. Users who require additional GitHub build-provenance verification can download the matching assets from [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest) and run `gh attestation verify`; that audit flow is no longer presented as the ordinary installer. Release archives support macOS/Linux arm64 and x64 plus Windows x64, and bundle `crabcode`, the native TUI, Bun, memory/cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge.
 
 The open-source TUI and GUI have separate programs, installation roots, and release chains. For state isolation during same-machine testing or multi-product use, set `CRABCODE_CONFIG_DIR` to an absolute dedicated directory; the same authority covers Rust, TypeScript, memory, cron, and renderer diagnostics. Upgrades retain the historical default state location so existing TUI sessions and settings are not silently abandoned.
 

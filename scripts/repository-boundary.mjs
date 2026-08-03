@@ -75,6 +75,23 @@ for (const path of requiredFiles) {
   if (!trackedSet.has(path)) fail(`required open-source TUI file is not tracked: ${path}`)
 }
 
+const readmes = ['README.md', 'README.en.md'].map(path => ({
+  path,
+  text: readFileSync(resolve(root, path), 'utf8'),
+}))
+const canonicalInstallCommands = [
+  'curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.sh | sh',
+  'irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex',
+]
+for (const { path, text } of readmes) {
+  for (const command of canonicalInstallCommands) {
+    if (!text.includes(command)) fail(`${path} is missing the canonical one-command installer: ${command}`)
+  }
+  if (/^VERSION=v\d+\.\d+\.\d+$/mu.test(text) || /^\$Version\s*=\s*['"]v\d+\.\d+\.\d+['"]$/mu.test(text)) {
+    fail(`${path} must not advertise a hard-coded release before its GitHub assets exist`)
+  }
+}
+
 const allowedTopLevelDirectories = new Set([
   '.github',
   'audits',

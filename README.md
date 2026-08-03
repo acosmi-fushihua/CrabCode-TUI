@@ -10,59 +10,25 @@
 
 CrabCode TUI 是 CrabCode 的纯终端开源版本。Rust 进程独占终端、渲染和本地进程生命周期，直接拉起 TypeScript 业务运行时；需要账户 OAuth 登录时，再按需启动隔离的 Go Account Bridge。这里没有桌面/Web GUI、React/Ink 界面、AppServer、应用统一通信层、归档源码或内部项目方案。
 
-## 选择版本与安装
+## 安装
 
-### TUI（本仓库，开源）
+> **当前发布状态（2026-08-03）：** `v1.0.23` 修复源码已经进入 `main`，但 TUI Release 尚未发布；GitHub `latest` 仍是包含已知 `sources=[]` 停机缺陷的 `v1.0.22`。因此现在不要执行 `latest` 安装命令，也不要尝试下载不存在的 `v1.0.23` 资产。
+
+`v1.0.23` 正式发布后，普通安装只需要一条命令，不需要 GitHub CLI：
 
 macOS / Linux：
 
 ```bash
-VERSION=v1.0.23
-case "$(uname -m)-$(uname -s)" in
-  arm64-Darwin|aarch64-Darwin) PLATFORM=arm64-darwin ;;
-  x86_64-Darwin|amd64-Darwin) PLATFORM=x64-darwin ;;
-  arm64-Linux|aarch64-Linux) PLATFORM=arm64-linux ;;
-  x86_64-Linux|amd64-Linux) PLATFORM=x64-linux ;;
-  *) echo "unsupported platform" >&2; exit 1 ;;
-esac
-ASSET="crabcode-${VERSION#v}-${PLATFORM}.tar.gz"
-VERIFIED_DIR="$(mktemp -d)"
-gh release download "$VERSION" --repo acosmi/CrabCode-TUI --dir "$VERIFIED_DIR" \
-  --pattern install.sh --pattern checksums-sha256.txt --pattern "$ASSET"
-for FILE in "$VERIFIED_DIR/install.sh" "$VERIFIED_DIR/checksums-sha256.txt" "$VERIFIED_DIR/$ASSET"; do
-  gh attestation verify "$FILE" --repo acosmi/CrabCode-TUI \
-    --source-ref "refs/tags/$VERSION" \
-    --signer-workflow github.com/acosmi/CrabCode-TUI/.github/workflows/release.yml
-done
-CRABCODE_VERSION="$VERSION" CRABCODE_ASSET_DIR="$VERIFIED_DIR" sh "$VERIFIED_DIR/install.sh"
-rm -rf "$VERIFIED_DIR"
+curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.sh | sh
 ```
 
 Windows PowerShell：
 
 ```powershell
-$Version = 'v1.0.23'
-$Asset = "crabcode-$($Version.TrimStart('v'))-x64-win32.zip"
-$VerifiedDir = Join-Path $env:TEMP "crabcode-verified-$([Guid]::NewGuid().ToString('N'))"
-New-Item -ItemType Directory -Path $VerifiedDir | Out-Null
-gh release download $Version --repo acosmi/CrabCode-TUI --dir $VerifiedDir `
-  --pattern install.ps1 --pattern checksums-sha256.txt --pattern $Asset
-@('install.ps1', 'checksums-sha256.txt', $Asset) | ForEach-Object {
-  gh attestation verify (Join-Path $VerifiedDir $_) --repo acosmi/CrabCode-TUI `
-    --source-ref "refs/tags/$Version" `
-    --signer-workflow github.com/acosmi/CrabCode-TUI/.github/workflows/release.yml
-  if ($LASTEXITCODE -ne 0) { throw "attestation verification failed: $_" }
-}
-$env:CRABCODE_VERSION = $Version
-$env:CRABCODE_ASSET_DIR = $VerifiedDir
-& (Join-Path $VerifiedDir 'install.ps1')
-Remove-Item Env:CRABCODE_VERSION, Env:CRABCODE_ASSET_DIR
-Remove-Item -LiteralPath $VerifiedDir -Recurse -Force
+irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex
 ```
 
-以上主流程固定版本，并在执行安装器前分别验证安装器、SHA-256 清单和当前平台 archive 的 GitHub build provenance；本地资产模式不会再次联网。需要先安装并登录 [GitHub CLI `gh`](https://cli.github.com/)。正式包内含 `crabcode`、原生 TUI、Bun、记忆与定时任务侧车、ripgrep、浏览器后端、图像原生库和 Account Bridge，不要求用户另行安装 Rust、Bun 或 Go。安装器还会校验发布级 SHA-256 和包内逐文件清单；支持 macOS/Linux 的 arm64、x64 和 Windows x64。
-
-为兼容旧自动化，mutable `latest/download/install.sh | sh` 与 `install.ps1 | iex` 仍可执行，但 bootstrap 本身无法在执行前验证来源，因此不属于推荐安装路径。
+安装器会校验发布级 SHA-256 和包内逐文件 manifest。需要额外验证 GitHub build provenance 的用户，可从 [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest) 下载对应资产后运行 `gh attestation verify`；该审计流程不再冒充普通安装入口。正式包支持 macOS/Linux arm64、x64 和 Windows x64，并内含 `crabcode`、原生 TUI、Bun、Memory/cron 侧车、ripgrep、浏览器后端、图像原生库和 Account Bridge。
 
 开源 TUI 与 GUI 的程序、安装目录和发布链完全分离。为避免同机测试或多产品复用默认 `~/.crabcode` 状态根，隔离运行时显式设置绝对路径 `CRABCODE_CONFIG_DIR`；该变量同时约束 Rust、TypeScript、memory、cron 与 renderer diagnostics。升级版继续保留默认状态位置，避免破坏既有 TUI 会话与配置。
 
