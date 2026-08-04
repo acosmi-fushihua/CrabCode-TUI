@@ -255,7 +255,11 @@ function createTextCapture(stream) {
   }
 }
 
-async function collectProcessText(captures, timeoutMs) {
+async function cancelProcessText(captures, reason) {
+  await Promise.all(captures.map(capture => capture.cancel(reason)))
+}
+
+async function collectProcessText(captures, timeoutMs, options = {}) {
   let timer
   const outcome = await Promise.race([
     Promise.all(captures.map(capture => capture.completion)).then(
@@ -272,15 +276,16 @@ async function collectProcessText(captures, timeoutMs) {
   clearTimeout(timer)
 
   if (outcome.type === 'error') {
-    await Promise.all(captures.map(capture => capture.cancel(outcome.error)))
+    await cancelProcessText(captures, outcome.error)
     throw outcome.error
   }
   if (outcome.type === 'timeout') {
-    await Promise.all(
-      captures.map(capture =>
-        capture.cancel(new Error(`stdio drain exceeded ${timeoutMs}ms`)),
-      ),
-    )
+    if (options.cancelOnTimeout !== false) {
+      await cancelProcessText(
+        captures,
+        new Error(`stdio drain exceeded ${timeoutMs}ms`),
+      )
+    }
     return {
       closed: false,
       texts: captures.map(capture => capture.snapshot()),
@@ -289,6 +294,51 @@ async function collectProcessText(captures, timeoutMs) {
   return {
     closed: outcome.results.every(result => result.closed),
     texts: captures.map(capture => capture.snapshot()),
+  }
+}
+
+function createProcessObserverLease(command, child, captures, expectedTexts) {
+  let retainedChild = child
+  let active = true
+  const releaseChildReference = () => {
+    const childReference = retainedChild
+    retainedChild = null
+    if (childReference) void childReference.pid
+  }
+  return {
+    async finalize(timeoutMs = 5_000) {
+      if (!active) fail(`${basename(command)} process observer lease was already released`)
+      let captured
+      try {
+        captured = await collectProcessText(captures, timeoutMs)
+      } finally {
+        active = false
+        // The explicit reference is the Windows ownership contract: retain
+        // subprocess observation and any associated Job/pipe resources until
+        // the package daemon has completed promotion and exited.
+        releaseChildReference()
+      }
+      const [stdout, stderr] = captured.texts
+      if (!captured.closed) {
+        fail(
+          `${basename(command)} descendants kept stdio open after the package lifecycle completed`,
+        )
+      }
+      if (stdout !== expectedTexts[0] || stderr !== expectedTexts[1]) {
+        fail(
+          `${basename(command)} emitted data after its stdout/stderr contract was accepted; stdout=${diagnosticTail(stdout)}; stderr=${diagnosticTail(stderr)}`,
+        )
+      }
+    },
+    async cancel(reason = new Error('process observer lease cancelled')) {
+      if (!active) return
+      active = false
+      try {
+        await cancelProcessText(captures, reason)
+      } finally {
+        releaseChildReference()
+      }
+    },
   }
 }
 
@@ -347,6 +397,7 @@ export async function runProcess(command, args, options = {}) {
     captured = await collectProcessText(
       [stdoutCapture, stderrCapture],
       options.streamDrainTimeoutMs ?? 5_000,
+      { cancelOnTimeout: false },
     )
   } catch (error) {
     fail(
@@ -355,34 +406,78 @@ export async function runProcess(command, args, options = {}) {
   }
   const [stdout, stderr] = captured.texts
   if (outcome.type === 'timeout') {
+    if (!captured.closed) {
+      await cancelProcessText(
+        [stdoutCapture, stderrCapture],
+        new Error(`${basename(command)} execution timed out`),
+      )
+    }
     fail(
       `${basename(command)} timed out after ${timeoutMs}ms; termination=${termination}; stdout=${diagnosticTail(stdout)}; stderr=${diagnosticTail(stderr)}`,
     )
   }
   if (outcome.type === 'exit-error') {
+    if (!captured.closed) {
+      await cancelProcessText(
+        [stdoutCapture, stderrCapture],
+        new Error(`${basename(command)} exit observation failed`),
+      )
+    }
     fail(
       `${basename(command)} exit observation failed: ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}; stdout=${diagnosticTail(stdout)}; stderr=${diagnosticTail(stderr)}`,
     )
   }
   if (outcome.code !== 0) {
+    if (!captured.closed) {
+      await cancelProcessText(
+        [stdoutCapture, stderrCapture],
+        new Error(`${basename(command)} exited ${outcome.code}`),
+      )
+    }
     fail(`${basename(command)} exited ${outcome.code}: ${stderr.trim() || stdout.trim()}`)
   }
   if (!captured.closed) {
     if (!options.allowInheritedPipeHandles) {
+      await cancelProcessText(
+        [stdoutCapture, stderrCapture],
+        new Error(`${basename(command)} inherited stdio is unauthorized`),
+      )
       fail(
         `${basename(command)} exited 0 but descendant processes kept stdio open; stdout=${diagnosticTail(stdout)}; stderr=${diagnosticTail(stderr)}`,
       )
     }
     if (!stdout.endsWith(options.requiredStdoutSuffix ?? '\n')) {
+      await cancelProcessText(
+        [stdoutCapture, stderrCapture],
+        new Error(`${basename(command)} stdout contract is incomplete`),
+      )
       fail(`${basename(command)} left stdio open before stdout completed its contract`)
     }
     if (options.requireEmptyStderrWhenPipesOpen !== false && stderr.length > 0) {
+      await cancelProcessText(
+        [stdoutCapture, stderrCapture],
+        new Error(`${basename(command)} stderr contract is not empty`),
+      )
       fail(
         `${basename(command)} left stdio open with stderr: ${diagnosticTail(stderr)}`,
       )
     }
   }
-  return { pid: child.pid, stdout, stderr, streamsClosed: captured.closed }
+  return {
+    pid: child.pid,
+    stdout,
+    stderr,
+    streamsClosed: captured.closed,
+    processObserverLease:
+      options.retainProcessObserverUntilReleased === true || !captured.closed
+        ? createProcessObserverLease(
+          command,
+          child,
+          [stdoutCapture, stderrCapture],
+          [stdout, stderr],
+        )
+        : null,
+  }
 }
 
 function writeIterationPhase(iteration, phase, detail = '') {
@@ -625,6 +720,50 @@ async function terminateOwnedProcesses(packageRoot) {
   }
 }
 
+function memoryLifecycleFailure(
+  endpoint,
+  method,
+  reason,
+  stateRoot,
+  ownershipRoot,
+) {
+  let processes
+  try {
+    processes = listPackageProcesses(ownershipRoot)
+  } catch (inventoryError) {
+    processes = {
+      inventoryError:
+        inventoryError instanceof Error
+          ? inventoryError.message
+          : String(inventoryError),
+    }
+  }
+  const logPath = join(stateRoot, 'logs', 'memory-orchestrator.log')
+  let logTail = '<missing>'
+  try {
+    if (existsSync(logPath)) logTail = diagnosticTail(readFileSync(logPath, 'utf8'))
+  } catch (logError) {
+    logTail = `<unreadable: ${logError instanceof Error ? logError.message : String(logError)}>`
+  }
+  fail(
+    `Memory ${method} failed at ${endpoint}: ${reason}; packageProcesses=${JSON.stringify(processes)}; logTail=${logTail}`,
+  )
+}
+
+async function memoryLifecycleRequest(endpoint, request, stateRoot, ownershipRoot) {
+  try {
+    return await endpointRequest(endpoint, request)
+  } catch (error) {
+    memoryLifecycleFailure(
+      endpoint,
+      String(request.method),
+      error instanceof Error ? error.message : String(error),
+      stateRoot,
+      ownershipRoot,
+    )
+  }
+}
+
 async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
   const extension = process.platform === 'win32' ? '.exe' : ''
   const launcher = options.launcher ?? join(packageRoot, `crabcode${extension}`)
@@ -633,7 +772,8 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
   const stateRoot = mkdtempSync(join(scratchRoot, `state-${iteration}-`))
   const endpoint = memoryEndpoint(stateRoot)
   const baseEnvironment = { ...process.env, ...options.extraEnvironment }
-  let promotionAcknowledged = false
+  let packageProcessesExited = false
+  let launcherObserverLease = null
   try {
     writeIterationPhase(iteration, 'launcher-start')
     const launcherResult = await runProcess(launcher, ['__release-package-smoke'], {
@@ -641,6 +781,7 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
       timeoutMs: 30_000,
       streamDrainTimeoutMs: 500,
       allowInheritedPipeHandles: true,
+      retainProcessObserverUntilReleased: true,
       requiredStdoutSuffix: '\n',
       env: {
         ...baseEnvironment,
@@ -648,6 +789,10 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
         CRABCODE_RELEASE_PACKAGE_SMOKE: '1',
       },
     })
+    launcherObserverLease = launcherResult.processObserverLease
+    if (!launcherObserverLease) {
+      fail('launcher process observer lease was not retained')
+    }
     const replay = JSON.parse(launcherResult.stdout.trim())
     if (
       replay.incident_sequence !== 6034 ||
@@ -661,7 +806,7 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
     writeIterationPhase(
       iteration,
       'launcher-complete',
-      `stdio=${launcherResult.streamsClosed ? 'closed' : 'bounded-cancel'}`,
+      `observer=retained stdio=${launcherResult.streamsClosed ? 'closed' : 'open'}`,
     )
 
     writeIterationPhase(iteration, 'runtime-start')
@@ -680,42 +825,80 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
     }
     writeIterationPhase(iteration, 'runtime-complete')
 
-    const identity = await endpointRequest(endpoint, { method: 'memory.ping' })
+    const identity = await memoryLifecycleRequest(
+      endpoint,
+      { method: 'memory.ping' },
+      stateRoot,
+      ownershipRoot,
+    )
     if (
       identity.ok !== true ||
       identity.protocol_version !== 1 ||
       identity.schema_id !== incidentSchema ||
       !Number.isSafeInteger(identity.pid)
     ) {
-      fail(`packaged Memory identity is invalid: ${JSON.stringify(identity)}`)
+      memoryLifecycleFailure(
+        endpoint,
+        'memory.ping',
+        `invalid response ${JSON.stringify(identity)}`,
+        stateRoot,
+        ownershipRoot,
+      )
     }
     writeIterationPhase(iteration, 'memory-ping-complete')
-    const promotion = await endpointRequest(endpoint, {
-      method: 'memory.coordinator.promote',
-      payload: {
-        successor_build_id: '2.0.0+release-smoke-cleanup',
-        protocol_version: 1,
-        schema_id: incidentSchema,
+    const promotion = await memoryLifecycleRequest(
+      endpoint,
+      {
+        method: 'memory.coordinator.promote',
+        payload: {
+          successor_build_id: '2.0.0+release-smoke-cleanup',
+          protocol_version: 1,
+          schema_id: incidentSchema,
+        },
       },
-    })
+      stateRoot,
+      ownershipRoot,
+    )
     if (
       promotion.ok !== true ||
       promotion.promote !== true ||
       promotion.successor_build_id !== '2.0.0+release-smoke-cleanup'
     ) {
-      fail(`Memory promotion was not acknowledged: ${JSON.stringify(promotion)}`)
+      memoryLifecycleFailure(
+        endpoint,
+        'memory.coordinator.promote',
+        `invalid response ${JSON.stringify(promotion)}`,
+        stateRoot,
+        ownershipRoot,
+      )
     }
-    promotionAcknowledged = true
     writeIterationPhase(iteration, 'memory-promotion-acknowledged')
     await waitForPackageProcessesToExit(ownershipRoot, endpoint, 10_000)
+    packageProcessesExited = true
     writeIterationPhase(iteration, 'package-processes-exited')
-  } finally {
-    if (!promotionAcknowledged) {
-      writeIterationPhase(iteration, 'failure-cleanup-start')
-      await terminateOwnedProcesses(ownershipRoot)
-      writeIterationPhase(iteration, 'failure-cleanup-complete')
+    if (launcherObserverLease) {
+      const lease = launcherObserverLease
+      launcherObserverLease = null
+      await lease.finalize()
+      writeIterationPhase(iteration, 'launcher-observer-finalized')
     }
-    rmSync(stateRoot, { recursive: true, force: true })
+  } finally {
+    try {
+      if (!packageProcessesExited) {
+        writeIterationPhase(iteration, 'failure-cleanup-start')
+        await terminateOwnedProcesses(ownershipRoot)
+        writeIterationPhase(iteration, 'failure-cleanup-complete')
+      }
+    } finally {
+      if (launcherObserverLease) {
+        await launcherObserverLease.cancel(
+          new Error(`release package iteration ${iteration} ended before observer finalization`),
+        )
+        launcherObserverLease = null
+        writeIterationPhase(iteration, 'launcher-observer-cancelled')
+      }
+      rmSync(stateRoot, { recursive: true, force: true })
+    }
   }
   if (existsSync(stateRoot)) fail(`iteration state root survived cleanup: ${stateRoot}`)
   const lingering = listPackageProcesses(ownershipRoot)

@@ -136,9 +136,34 @@ jobs:
       - name: Exercise the pinned runtime before allocating the build matrix
         run: bun scripts/release-x64-darwin-runtime-preflight.mjs --iterations 10
 
+  x64-win32-process-observer-preflight:
+    name: Preflight retained package observation on Windows
+    needs: verify-source
+    if: github.repository == 'acosmi/CrabCode-TUI'
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install exact JavaScript dependency graph
+        run: bun install --frozen-lockfile
+
+      - name: Prove launcher observation survives until explicit finalization
+        run: bun test tests/unit/release-package-process-runner.test.ts
+
   build:
     name: Build ${{ matrix.platform }}
-    needs: [verify-source, x64-darwin-runtime-preflight]
+    needs:
+      - verify-source
+      - x64-darwin-runtime-preflight
+      - x64-win32-process-observer-preflight
     if: github.repository == 'acosmi/CrabCode-TUI'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeoutMinutes }}

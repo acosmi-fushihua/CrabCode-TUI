@@ -1,5 +1,41 @@
 # Changelog / 更新日志
 
+## v1.0.28 — 2026-08-03
+
+- Forward-fixes the failed, unpublished `v1.0.27` tag without moving,
+  deleting, or rerunning it. Its only workflow run failed closed on the first
+  Windows replay and published no Release or asset.
+- Retains the successful launcher observation and its Windows process/pipe
+  ownership until Memory promotion and package-process exit are complete.
+  This preserves the stable Memory coordinator across the intervening runtime
+  replay without restoring the former unbounded stdout/stderr wait.
+- Finalizes deferred pipes only after the complete package lifecycle. EOF must
+  then arrive within a separate deadline, and any late stdout/stderr data is
+  rejected; failure cleanup cancels the lease and terminates only verified
+  package-owned processes.
+- Adds Memory log-tail and process-inventory evidence to lifecycle failures,
+  plus a fast Windows preflight that proves deferred ownership before the
+  five-platform build matrix is allocated.
+- Product runtime, renderer protocol, SDK `2.15.0`, Gateway, Memory IPC,
+  installers, package layout, and user configuration remain unchanged.
+
+---
+
+- 对失败且未公开的 `v1.0.27` 标签执行前滚修复，不移动、不删除、不重跑。
+  其唯一一次 workflow 在 Windows 第一轮快速失败，没有发布 Release 或资产。
+- launcher 成功返回完整契约后，无论 stdout/stderr 是否已 EOF，都将 Windows
+  进程观察租约保留到 Memory 晋升确认与包进程退出完成；若后代仍持管道则同时保留
+  pending readers。由此跨过中间 runtime 回放继续保持稳定 Memory coordinator，
+  同时不恢复旧版无界等待。
+- 完整包生命周期结束后才收束延迟管道；此时必须在独立期限内得到 EOF，任何晚到的
+  stdout/stderr 都会失败。异常路径取消租约，并只终止经包路径所有权验证的进程。
+- Memory 生命周期错误新增日志尾部和进程清单证据；新增快速 Windows 前置门禁，先
+  证明延迟所有权语义，再分配五平台构建矩阵，避免浪费 CI。
+- 产品 runtime、renderer 协议、SDK `2.15.0`、Gateway、Memory IPC、安装器、包布局
+  和用户配置均不改变。
+
+---
+
 ## v1.0.27 — 2026-08-03
 
 - Forward-fixes the failed, unpublished `v1.0.26` tag without moving, deleting,

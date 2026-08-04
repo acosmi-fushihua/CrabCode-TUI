@@ -63,6 +63,32 @@ describe('release package bounded process runner', () => {
     expect(result.streamsClosed).toBe(false)
     expect(JSON.parse(result.stdout)).toEqual({ descendantPid })
     expect(result.stderr).toBe('')
+    expect(result.processObserverLease).not.toBeNull()
+
+    // The lease must keep the Windows Bun Job/pipe ownership alive until the
+    // package-level daemon lifecycle is explicitly complete.
+    await Bun.sleep(250)
+    expect(() => process.kill(descendantPid!, 0)).not.toThrow()
+    process.kill(descendantPid!, 'SIGKILL')
+    await result.processObserverLease!.finalize(2_000)
+  })
+
+  test('retains an explicitly requested observer after both streams reach EOF', async () => {
+    const pidFile = join(scratch(), 'unused.pid')
+    const result = await runProcess(
+      process.execPath,
+      [fixture, 'closed', pidFile],
+      {
+        timeoutMs: 2_000,
+        streamDrainTimeoutMs: 100,
+        retainProcessObserverUntilReleased: true,
+      },
+    )
+
+    expect(result.streamsClosed).toBe(true)
+    expect(JSON.parse(result.stdout)).toEqual({ closed: true })
+    expect(result.processObserverLease).not.toBeNull()
+    await result.processObserverLease!.finalize(2_000)
   })
 
   test('fails closed when inherited pipe handles are not authorized', async () => {
@@ -79,6 +105,27 @@ describe('release package bounded process runner', () => {
 
     await expect(outcome).rejects.toThrow('descendant processes kept stdio open')
     rememberDescendant(pidFile)
+    expect(Date.now() - started).toBeLessThan(1_500)
+  })
+
+  test('bounds finalization when a deferred descendant never closes its pipes', async () => {
+    const pidFile = join(scratch(), 'descendant.pid')
+    const result = await runProcess(
+      process.execPath,
+      [fixture, 'exit', pidFile],
+      {
+        timeoutMs: 2_000,
+        streamDrainTimeoutMs: 100,
+        allowInheritedPipeHandles: true,
+        requiredStdoutSuffix: '\n',
+      },
+    )
+    rememberDescendant(pidFile)
+    const started = Date.now()
+
+    await expect(result.processObserverLease!.finalize(100)).rejects.toThrow(
+      'descendants kept stdio open after the package lifecycle completed',
+    )
     expect(Date.now() - started).toBeLessThan(1_500)
   })
 
@@ -133,5 +180,25 @@ describe('release package bounded process runner', () => {
     await expect(outcome).rejects.toThrow('timed out after 100ms')
     rememberDescendant(pidFile)
     expect(Date.now() - started).toBeLessThan(1_500)
+  })
+
+  test('rejects output emitted after a deferred contract was accepted', async () => {
+    const pidFile = join(scratch(), 'descendant.pid')
+    const result = await runProcess(
+      process.execPath,
+      [fixture, 'late', pidFile],
+      {
+        timeoutMs: 2_000,
+        streamDrainTimeoutMs: 100,
+        allowInheritedPipeHandles: true,
+        requiredStdoutSuffix: '\n',
+      },
+    )
+    rememberDescendant(pidFile)
+
+    expect(result.processObserverLease).not.toBeNull()
+    await expect(result.processObserverLease!.finalize(2_000)).rejects.toThrow(
+      'emitted data after its stdout/stderr contract was accepted',
+    )
   })
 })
