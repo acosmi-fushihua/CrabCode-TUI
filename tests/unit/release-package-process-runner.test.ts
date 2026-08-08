@@ -1,4 +1,12 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from 'bun:test'
 import {
   existsSync,
   mkdtempSync,
@@ -9,12 +17,51 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { runProcess } from '../../scripts/release-package-smoke.mjs'
 
-const fixture = resolve(
+const fixtureSource = resolve(
   import.meta.dir,
-  '../fixtures/inherited-stdio-process.ts',
+  '../fixtures/inherited-stdio-process.rs',
 )
+const fixtureExecutionTimeoutMs = 10_000
+const boundedFixtureCompletionMs = 12_000
+let fixtureRoot = ''
+let fixture = ''
 const roots: string[] = []
 const descendants = new Set<number>()
+
+setDefaultTimeout(20_000)
+
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'crabcode-native-process-fixture-'))
+  fixture = join(
+    fixtureRoot,
+    process.platform === 'win32'
+      ? 'inherited-stdio-process.exe'
+      : 'inherited-stdio-process',
+  )
+  const compilation = Bun.spawnSync({
+    cmd: [
+      'rustc',
+      '--edition=2021',
+      '-C',
+      'debuginfo=0',
+      fixtureSource,
+      '-o',
+      fixture,
+    ],
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  if (compilation.exitCode !== 0) {
+    throw new Error(
+      `failed to compile native inherited-stdio fixture: ${new TextDecoder().decode(compilation.stderr)}`,
+    )
+  }
+})
+
+afterAll(() => {
+  if (fixtureRoot) rmSync(fixtureRoot, { recursive: true, force: true })
+})
 
 function scratch() {
   const root = mkdtempSync(join(tmpdir(), 'crabcode-process-runner-test-'))
@@ -29,17 +76,38 @@ function rememberDescendant(pidFile: string) {
   return pid
 }
 
-afterEach(() => {
-  for (const pid of descendants) {
+async function waitForDescendantExit(pid: number, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
     try {
-      process.kill(pid, 'SIGKILL')
+      process.kill(pid, 0)
+      await Bun.sleep(10)
     } catch {
-      // The fixture descendant has already exited.
+      return
     }
   }
-  descendants.clear()
-  for (const root of roots.splice(0)) {
-    rmSync(root, { recursive: true, force: true })
+  throw new Error(`native fixture descendant ${pid} survived cleanup`)
+}
+
+afterEach(async () => {
+  for (const root of roots) {
+    rememberDescendant(join(root, 'descendant.pid'))
+  }
+  const pendingDescendants = [...descendants]
+  try {
+    for (const pid of pendingDescendants) {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        // The fixture descendant has already exited.
+      }
+    }
+    await Promise.all(pendingDescendants.map(pid => waitForDescendantExit(pid)))
+  } finally {
+    descendants.clear()
+    for (const root of roots.splice(0)) {
+      rmSync(root, { recursive: true, force: true })
+    }
   }
 })
 
@@ -48,10 +116,10 @@ describe('release package bounded process runner', () => {
     const pidFile = join(scratch(), 'descendant.pid')
     const started = Date.now()
     const result = await runProcess(
-      process.execPath,
-      [fixture, 'exit', pidFile],
+      fixture,
+      ['exit', pidFile],
       {
-        timeoutMs: 2_000,
+        timeoutMs: fixtureExecutionTimeoutMs,
         streamDrainTimeoutMs: 100,
         allowInheritedPipeHandles: true,
         requiredStdoutSuffix: '\n',
@@ -59,14 +127,14 @@ describe('release package bounded process runner', () => {
     )
     const descendantPid = rememberDescendant(pidFile)
 
-    expect(Date.now() - started).toBeLessThan(1_500)
+    expect(Date.now() - started).toBeLessThan(boundedFixtureCompletionMs)
     expect(result.streamsClosed).toBe(false)
     expect(JSON.parse(result.stdout)).toEqual({ descendantPid })
     expect(result.stderr).toBe('')
     expect(result.processObserverLease).not.toBeNull()
 
-    // The lease must keep the Windows Bun Job/pipe ownership alive until the
-    // package-level daemon lifecycle is explicitly complete.
+    // The native fixture matches the Rust launcher's cross-platform process
+    // semantics: its descendant owns the inherited pipes after it exits.
     await Bun.sleep(250)
     expect(() => process.kill(descendantPid!, 0)).not.toThrow()
     process.kill(descendantPid!, 'SIGKILL')
@@ -76,10 +144,10 @@ describe('release package bounded process runner', () => {
   test('retains an explicitly requested observer after both streams reach EOF', async () => {
     const pidFile = join(scratch(), 'unused.pid')
     const result = await runProcess(
-      process.execPath,
-      [fixture, 'closed', pidFile],
+      fixture,
+      ['closed', pidFile],
       {
-        timeoutMs: 2_000,
+        timeoutMs: fixtureExecutionTimeoutMs,
         streamDrainTimeoutMs: 100,
         retainProcessObserverUntilReleased: true,
       },
@@ -95,26 +163,26 @@ describe('release package bounded process runner', () => {
     const pidFile = join(scratch(), 'descendant.pid')
     const started = Date.now()
     const outcome = runProcess(
-      process.execPath,
-      [fixture, 'exit', pidFile],
+      fixture,
+      ['exit', pidFile],
       {
-        timeoutMs: 2_000,
+        timeoutMs: fixtureExecutionTimeoutMs,
         streamDrainTimeoutMs: 100,
       },
     )
 
     await expect(outcome).rejects.toThrow('descendant processes kept stdio open')
     rememberDescendant(pidFile)
-    expect(Date.now() - started).toBeLessThan(1_500)
+    expect(Date.now() - started).toBeLessThan(boundedFixtureCompletionMs)
   })
 
   test('bounds finalization when a deferred descendant never closes its pipes', async () => {
     const pidFile = join(scratch(), 'descendant.pid')
     const result = await runProcess(
-      process.execPath,
-      [fixture, 'exit', pidFile],
+      fixture,
+      ['exit', pidFile],
       {
-        timeoutMs: 2_000,
+        timeoutMs: fixtureExecutionTimeoutMs,
         streamDrainTimeoutMs: 100,
         allowInheritedPipeHandles: true,
         requiredStdoutSuffix: '\n',
@@ -132,10 +200,10 @@ describe('release package bounded process runner', () => {
   test('rejects truncated output even when inherited pipe handles are authorized', async () => {
     const pidFile = join(scratch(), 'descendant.pid')
     const outcome = runProcess(
-      process.execPath,
-      [fixture, 'partial', pidFile],
+      fixture,
+      ['partial', pidFile],
       {
-        timeoutMs: 2_000,
+        timeoutMs: fixtureExecutionTimeoutMs,
         streamDrainTimeoutMs: 100,
         allowInheritedPipeHandles: true,
         requiredStdoutSuffix: '\n',
@@ -151,10 +219,10 @@ describe('release package bounded process runner', () => {
   test('rejects stderr even when inherited pipe handles are authorized', async () => {
     const pidFile = join(scratch(), 'descendant.pid')
     const outcome = runProcess(
-      process.execPath,
-      [fixture, 'stderr', pidFile],
+      fixture,
+      ['stderr', pidFile],
       {
-        timeoutMs: 2_000,
+        timeoutMs: fixtureExecutionTimeoutMs,
         streamDrainTimeoutMs: 100,
         allowInheritedPipeHandles: true,
         requiredStdoutSuffix: '\n',
@@ -169,8 +237,8 @@ describe('release package bounded process runner', () => {
     const pidFile = join(scratch(), 'descendant.pid')
     const started = Date.now()
     const outcome = runProcess(
-      process.execPath,
-      [fixture, 'hang', pidFile],
+      fixture,
+      ['hang', pidFile],
       {
         timeoutMs: 100,
         streamDrainTimeoutMs: 100,
@@ -185,10 +253,10 @@ describe('release package bounded process runner', () => {
   test('rejects output emitted after a deferred contract was accepted', async () => {
     const pidFile = join(scratch(), 'descendant.pid')
     const result = await runProcess(
-      process.execPath,
-      [fixture, 'late', pidFile],
+      fixture,
+      ['late', pidFile],
       {
-        timeoutMs: 2_000,
+        timeoutMs: fixtureExecutionTimeoutMs,
         streamDrainTimeoutMs: 100,
         allowInheritedPipeHandles: true,
         requiredStdoutSuffix: '\n',

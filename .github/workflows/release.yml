@@ -152,10 +152,14 @@ jobs:
         with:
           bun-version: ${{ env.BUN_VERSION }}
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
       - name: Install exact JavaScript dependency graph
         run: bun install --frozen-lockfile
 
-      - name: Prove launcher observation survives until explicit finalization
+      - name: Prove native launcher observation survives until explicit finalization
         run: bun test tests/unit/release-package-process-runner.test.ts
 
   build:

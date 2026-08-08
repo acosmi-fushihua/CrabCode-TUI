@@ -313,9 +313,8 @@ function createProcessObserverLease(command, child, captures, expectedTexts) {
         captured = await collectProcessText(captures, timeoutMs)
       } finally {
         active = false
-        // The explicit reference is the Windows ownership contract: retain
-        // subprocess observation and any associated Job/pipe resources until
-        // the package daemon has completed promotion and exited.
+        // Retain the subprocess observation object and its capture readers
+        // until the package daemon has completed promotion and exited.
         releaseChildReference()
       }
       const [stdout, stderr] = captured.texts

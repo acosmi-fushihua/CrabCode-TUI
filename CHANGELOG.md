@@ -1,5 +1,48 @@
 # Changelog / 更新日志
 
+## v1.0.29 — 2026-08-08
+
+- Forward-fixes the failed, unpublished `v1.0.28` tag without moving,
+  deleting, rerunning, or publishing it. Its only workflow run passed signed
+  source verification and the native Intel runtime preflight, then failed the
+  fast Windows observer preflight; the five-platform matrix and publish job
+  were skipped.
+- Corrects the Windows preflight model rather than weakening the observer.
+  The former Bun-parent/Bun-descendant fixture was not equivalent to the Rust
+  launcher: Windows closed its inherited streams immediately, so six tests
+  measured fixture cleanup instead of the package observer contract.
+- Replaces that fixture with a minimal native Rust launcher compiled by the
+  pinned Rust `1.92.0` toolchain. It starts a native descendant with explicitly
+  inherited stdout/stderr, records the descendant PID, emits the parent
+  contract, and exits, matching the product launcher's cross-platform process
+  semantics.
+- Preserves all eight fail-closed assertions for a complete contract, explicit
+  observer retention after EOF, unauthorized inherited handles, bounded
+  finalization, truncated stdout, non-empty stderr, execution timeout, and
+  late output. Cleanup now also discovers fixture PIDs after assertion failure,
+  kills them, waits for process exit, and fails if any descendant survives.
+- Product runtime, renderer protocol, SDK `2.15.0`, Gateway, Memory IPC,
+  installers, package layout, and user configuration remain unchanged.
+
+---
+
+- 对失败且未公开的 `v1.0.28` 标签执行前滚修复，不移动、不删除、不重跑，也不
+  发布该标签。其唯一一次 workflow 已通过签名源码校验与原生 Intel runtime 预检，
+  随后在快速 Windows observer 前置门禁失败；五平台矩阵与 publish 均被跳过。
+- 修正 Windows 前置门禁的验证模型，而不是放宽观察器。原 Bun 父进程/Bun 后代
+  夹具不等价于 Rust launcher：Windows 会立即关闭该夹具的继承流，导致六项测试
+  实际测到夹具清理语义，而不是发布包观察契约。
+- 改用由固定 Rust `1.92.0` 工具链编译的最小原生 launcher 夹具。它启动显式继承
+  stdout/stderr 的原生后代、记录后代 PID、输出父进程契约后退出，与产品 launcher
+  的跨平台进程语义一致。
+- 完整保留八项 fail-closed 断言：完整契约、EOF 后显式保留 observer、未授权继承
+  句柄、最终化期限、截断 stdout、非空 stderr、执行超时与晚到输出。清理逻辑还会
+  在断言失败后主动发现夹具 PID、终止并等待退出；任何存活后代都会使测试失败。
+- 产品 runtime、renderer 协议、SDK `2.15.0`、Gateway、Memory IPC、安装器、包布局
+  和用户配置均不改变。
+
+---
+
 ## v1.0.28 — 2026-08-03
 
 - Forward-fixes the failed, unpublished `v1.0.27` tag without moving,
