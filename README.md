@@ -12,9 +12,7 @@ CrabCode TUI 是 CrabCode 的纯终端开源版本。Rust 进程独占终端、�
 
 ## 安装
 
-> **当前发布状态（2026-08-03）：** `v1.0.23` 修复源码已经进入 `main`，但 TUI Release 尚未发布；GitHub `latest` 仍是包含已知 `sources=[]` 停机缺陷的 `v1.0.22`。因此现在不要执行 `latest` 安装命令，也不要尝试下载不存在的 `v1.0.23` 资产。
-
-`v1.0.23` 正式发布后，普通安装只需要一条命令，不需要 GitHub CLI：
+稳定版始终以 GitHub `latest` Release 的公开资产为准。普通安装只需要一条命令，不需要 GitHub CLI：
 
 macOS / Linux：
 

@@ -64,5 +64,16 @@ export async function runTuiRuntimeEntrypoint(
 }
 
 if (import.meta.main) {
-  await runTuiRuntimeEntrypoint()
+  // Keep the entry module itself synchronously evaluated. The v1.0.23/v1.0.24
+  // package evidence showed Bun 1.3.11 stalling before the first frame, and
+  // upstream later fixed related TLA/dynamic-import deadlock classes. Do not
+  // retain the application side of that risk. The runtime promise still owns
+  // the full lifecycle; a rejected bootstrap remains process-fatal after
+  // stderr is flushed.
+  void runTuiRuntimeEntrypoint().catch(error => {
+    const message =
+      error instanceof Error ? (error.stack ?? error.message) : String(error)
+    process.exitCode = 1
+    process.stderr.write(`${message}\n`, () => process.exit(1))
+  })
 }

@@ -101,26 +101,95 @@ jobs:
       - name: Enforce tagged source boundary
         run: node scripts/repository-boundary.mjs --source-only
 
-  build:
-    name: Build ${{ matrix.platform }}
+  x64-darwin-runtime-preflight:
+    name: Preflight complete runtime on native Intel macOS
     needs: verify-source
     if: github.repository == 'acosmi/CrabCode-TUI'
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install exact JavaScript dependency graph
+        run: bun install --frozen-lockfile
+
+      - name: Establish cross-language build identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CRABCODE_BUILD_ID=${{ needs.verify-source.outputs.build_id }}" >> "${GITHUB_ENV}"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Build closed TypeScript business runtime
+        run: bun run build:ts
+
+      - name: Enforce complete source and executable boundary
+        run: node scripts/repository-boundary.mjs
+
+      - name: Exercise the pinned runtime before allocating the build matrix
+        run: bun scripts/release-x64-darwin-runtime-preflight.mjs --iterations 10
+
+  x64-win32-process-observer-preflight:
+    name: Preflight retained package observation on Windows
+    needs: verify-source
+    if: github.repository == 'acosmi/CrabCode-TUI'
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install exact JavaScript dependency graph
+        run: bun install --frozen-lockfile
+
+      - name: Prove native launcher observation survives until explicit finalization
+        run: bun test tests/unit/release-package-process-runner.test.ts
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs:
+      - verify-source
+      - x64-darwin-runtime-preflight
+      - x64-win32-process-observer-preflight
+    if: github.repository == 'acosmi/CrabCode-TUI'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.timeoutMinutes }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - platform: arm64-darwin
             runner: macos-15
+            timeoutMinutes: 120
           - platform: x64-darwin
             runner: macos-15-intel
+            timeoutMinutes: 120
           - platform: arm64-linux
             runner: ubuntu-24.04-arm
+            timeoutMinutes: 120
           - platform: x64-linux
             runner: ubuntu-24.04
+            timeoutMinutes: 120
           - platform: x64-win32
             runner: windows-2025
+            timeoutMinutes: 180
     steps:
       - uses: actions/checkout@v5
         with:
@@ -186,7 +255,7 @@ jobs:
           cargo build --locked --release --manifest-path libs/acosmi-memory/Cargo.toml \
             --bin acosmi-memory-orchestrator
 
-      - name: Assemble, verify, and archive complete native package
+      - name: Assemble and verify one compiled product closure
         shell: bash
         run: |
           set -euo pipefail
@@ -207,7 +276,7 @@ jobs:
             --version "${VERSION}" \
             --output-dir dist/release
           cmp -s "${BASELINE}" "${ASSET}" || {
-            echo "::error::release archive is not byte-for-byte reproducible"; exit 1;
+            echo "::error::repeated assembly from one compiled closure is not byte-for-byte reproducible"; exit 1;
           }
           rm -f "${BASELINE}"
 

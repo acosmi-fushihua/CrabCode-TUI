@@ -34,6 +34,8 @@ describe('dedicated native TUI runtime boundary', () => {
     )
     expect(entry).toContain("await import('../cli/tuiRuntimeBootstrap.js')")
     expect(entry).toContain('await runRuntime(options, rendererSession)')
+    expect(entry).toContain('void runTuiRuntimeEntrypoint().catch')
+    expect(entry).not.toContain('await runTuiRuntimeEntrypoint()')
     expect(entry.indexOf('await startRendererSession()')).toBeLessThan(
       entry.lastIndexOf("'../cli/tuiRuntimeOptions.js'"),
     )

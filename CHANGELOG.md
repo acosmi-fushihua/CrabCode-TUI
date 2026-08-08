@@ -1,5 +1,249 @@
 # Changelog / 更新日志
 
+## v1.0.29 — 2026-08-08
+
+- Forward-fixes the failed, unpublished `v1.0.28` tag without moving,
+  deleting, rerunning, or publishing it. Its only workflow run passed signed
+  source verification and the native Intel runtime preflight, then failed the
+  fast Windows observer preflight; the five-platform matrix and publish job
+  were skipped.
+- Corrects the Windows preflight model rather than weakening the observer.
+  The former Bun-parent/Bun-descendant fixture was not equivalent to the Rust
+  launcher: Windows closed its inherited streams immediately, so six tests
+  measured fixture cleanup instead of the package observer contract.
+- Replaces that fixture with a minimal native Rust launcher compiled by the
+  pinned Rust `1.92.0` toolchain. It starts a native descendant with explicitly
+  inherited stdout/stderr, records the descendant PID, emits the parent
+  contract, and exits, matching the product launcher's cross-platform process
+  semantics.
+- Preserves all eight fail-closed assertions for a complete contract, explicit
+  observer retention after EOF, unauthorized inherited handles, bounded
+  finalization, truncated stdout, non-empty stderr, execution timeout, and
+  late output. Cleanup now also discovers fixture PIDs after assertion failure,
+  kills them, waits for process exit, and fails if any descendant survives.
+- Product runtime, renderer protocol, SDK `2.15.0`, Gateway, Memory IPC,
+  installers, package layout, and user configuration remain unchanged.
+
+---
+
+- 对失败且未公开的 `v1.0.28` 标签执行前滚修复，不移动、不删除、不重跑，也不
+  发布该标签。其唯一一次 workflow 已通过签名源码校验与原生 Intel runtime 预检，
+  随后在快速 Windows observer 前置门禁失败；五平台矩阵与 publish 均被跳过。
+- 修正 Windows 前置门禁的验证模型，而不是放宽观察器。原 Bun 父进程/Bun 后代
+  夹具不等价于 Rust launcher：Windows 会立即关闭该夹具的继承流，导致六项测试
+  实际测到夹具清理语义，而不是发布包观察契约。
+- 改用由固定 Rust `1.92.0` 工具链编译的最小原生 launcher 夹具。它启动显式继承
+  stdout/stderr 的原生后代、记录后代 PID、输出父进程契约后退出，与产品 launcher
+  的跨平台进程语义一致。
+- 完整保留八项 fail-closed 断言：完整契约、EOF 后显式保留 observer、未授权继承
+  句柄、最终化期限、截断 stdout、非空 stderr、执行超时与晚到输出。清理逻辑还会
+  在断言失败后主动发现夹具 PID、终止并等待退出；任何存活后代都会使测试失败。
+- 产品 runtime、renderer 协议、SDK `2.15.0`、Gateway、Memory IPC、安装器、包布局
+  和用户配置均不改变。
+
+---
+
+## v1.0.28 — 2026-08-03
+
+- Forward-fixes the failed, unpublished `v1.0.27` tag without moving,
+  deleting, or rerunning it. Its only workflow run failed closed on the first
+  Windows replay and published no Release or asset.
+- Retains the successful launcher observation and its Windows process/pipe
+  ownership until Memory promotion and package-process exit are complete.
+  This preserves the stable Memory coordinator across the intervening runtime
+  replay without restoring the former unbounded stdout/stderr wait.
+- Finalizes deferred pipes only after the complete package lifecycle. EOF must
+  then arrive within a separate deadline, and any late stdout/stderr data is
+  rejected; failure cleanup cancels the lease and terminates only verified
+  package-owned processes.
+- Adds Memory log-tail and process-inventory evidence to lifecycle failures,
+  plus a fast Windows preflight that proves deferred ownership before the
+  five-platform build matrix is allocated.
+- Product runtime, renderer protocol, SDK `2.15.0`, Gateway, Memory IPC,
+  installers, package layout, and user configuration remain unchanged.
+
+---
+
+- 对失败且未公开的 `v1.0.27` 标签执行前滚修复，不移动、不删除、不重跑。
+  其唯一一次 workflow 在 Windows 第一轮快速失败，没有发布 Release 或资产。
+- launcher 成功返回完整契约后，无论 stdout/stderr 是否已 EOF，都将 Windows
+  进程观察租约保留到 Memory 晋升确认与包进程退出完成；若后代仍持管道则同时保留
+  pending readers。由此跨过中间 runtime 回放继续保持稳定 Memory coordinator，
+  同时不恢复旧版无界等待。
+- 完整包生命周期结束后才收束延迟管道；此时必须在独立期限内得到 EOF，任何晚到的
+  stdout/stderr 都会失败。异常路径取消租约，并只终止经包路径所有权验证的进程。
+- Memory 生命周期错误新增日志尾部和进程清单证据；新增快速 Windows 前置门禁，先
+  证明延迟所有权语义，再分配五平台构建矩阵，避免浪费 CI。
+- 产品 runtime、renderer 协议、SDK `2.15.0`、Gateway、Memory IPC、安装器、包布局
+  和用户配置均不改变。
+
+---
+
+## v1.0.27 — 2026-08-03
+
+- Forward-fixes the failed, unpublished `v1.0.26` tag without moving, deleting,
+  rerunning, or creating a Release for it. The single `v1.0.26` workflow run
+  passed signed-source verification, the native Intel preflight, and all 100
+  package replays on four platforms; Windows was cancelled at its 180-minute
+  job limit before publishing any asset.
+- Separates child execution deadlines from stdout/stderr drain deadlines in the
+  release-package observer. The verifier can no longer block forever after a
+  parent exits or is terminated while pipe EOF remains unavailable.
+- On execution timeout, terminates the complete Windows process tree with
+  `taskkill /T /F`, bounds the final pipe drain, then fails with captured output
+  instead of waiting indefinitely.
+- Permits a bounded open-pipe recovery only for the packaged launcher and only
+  after exit code zero, a complete newline-terminated JSON contract, and empty
+  stderr.
+  The subsequent Memory identity, promotion, package-process exit, and isolation
+  checks remain mandatory; every other open-pipe condition is fail-closed.
+- Adds real parent/descendant process regressions for authorized inherited
+  handles, unauthorized handles, and timeout cleanup, plus per-iteration start
+  and completion evidence. Product runtime, protocol, SDK `2.15.0`, Gateway,
+  installers, configuration, sessions, and package layout remain unchanged.
+
+---
+
+- 对失败且未公开的 `v1.0.26` 标签执行前滚修复；不移动、不删除、不重跑，也不为其
+  补建 Release。唯一一次 `v1.0.26` 流水线已通过签名源码校验、原生 Intel 预检，
+  并在四个平台跑满各 100 次正式包回放；Windows 在任何资产发布前达到 180 分钟
+  作业上限并被取消。
+- 将发布包观察器中的“子进程执行期限”和“stdout/stderr 排空期限”彻底分离。父进程
+  已退出或被终止但管道 EOF 仍不可用时，验证器也不再无限阻塞。
+- 执行超时时，Windows 使用 `taskkill /T /F` 终止完整进程树，再以独立期限排空并
+  取消管道，最后携带已捕获输出失败，不再无界等待。
+- 仅对正式包 launcher 接纳有界的未关闭管道恢复，而且必须同时满足退出码为零、
+  stdout 是完整换行结尾 JSON 契约、stderr 为空；后续 Memory 身份、promotion、包内
+  进程退出和隔离检查仍全部强制执行，其他未关闭管道仍全部 fail-closed。
+- 新增真实父/后代进程回归，覆盖授权继承句柄、未授权句柄与超时回收，并逐轮记录
+  开始/完成证据。产品 runtime、协议、SDK `2.15.0`、Gateway、安装器、配置、会话和
+  包布局均不改变。
+
+## v1.0.26 — 2026-08-03
+
+- Forward-fixes the failed, unpublished `v1.0.25` tag without moving, deleting,
+  rerunning, or creating Releases for `v1.0.23` through `v1.0.25`.
+- Corrects the release-failure attribution. The runtime produced and flushed its
+  initialize response; the smoke observer dropped it by starting a new
+  `stdout.read()` after every one-second `Promise.race` timeout while the old
+  read remained alive and consumed the next chunk.
+- Reuses exactly one pending stream read across poll timeouts. A focused
+  regression test forces three consecutive timeouts, proves that `read()` was
+  called once, and then verifies delivery of the delayed frame and recovery
+  after a rejected read.
+- Reverted every diagnostic-only runtime experiment after proving the observer
+  defect. Product protocol, TypeScript runtime, Rust renderer, Gateway, SDK
+  `2.15.0`, configuration, sessions, and package layout remain unchanged.
+- Preserves the native Intel preflight ahead of the five-platform matrix and the
+  reviewed x64 macOS Bun `1.3.14` baseline identity. The final minimal fix
+  completed `100/100` supplemental Rosetta lifecycles with zero process or
+  temporary-directory leakage; native Intel CI remains the release authority.
+
+---
+
+- 对失败且未公开的 `v1.0.25` 标签执行前滚修复；不移动、不删除、不重跑
+  `v1.0.23` 至 `v1.0.25`，也不为这些失败标签补建 Release。
+- 纠正发布失败归因：runtime 实际已经生成并刷新 initialize 响应；smoke 观察器每次
+  一秒 `Promise.race` 超时后又启动新的 `stdout.read()`，旧读取仍存活并吞掉下一块
+  数据，导致观察端永久丢帧。
+- 轮询超时后复用同一个未决读取，始终只允许一个 `read()`。专项回归测试强制连续
+  三次超时，证明只调用一次读取，随后验证延迟帧不丢失以及读取失败后可恢复。
+- 根因成立后撤回全部仅用于排障的 runtime 实验改动。产品协议、TypeScript runtime、
+  Rust renderer、Gateway、SDK `2.15.0`、配置、会话和包布局均不改变。
+- 保留五平台矩阵之前的原生 Intel 预检，以及已审查的 x64 macOS Bun `1.3.14`
+  baseline 身份。最终最小修复完成 Rosetta 补充控制 `100/100`，进程与临时目录零
+  泄漏；正式发布授权仍只来自原生 Intel CI。
+
+## v1.0.25 — 2026-08-03
+
+- This signed release attempt failed its native Intel preflight and has no
+  GitHub Release or public assets. `v1.0.26` later proved that the preflight
+  observer, not runtime module evaluation, dropped delayed stdout frames.
+- Forward-fixes the failed, unpublished `v1.0.24` tag without moving or deleting
+  that signed historical record. `v1.0.24` has no GitHub Release or public
+  assets and must not be installed.
+- Pins only the x64 macOS package to the reviewed Bun `1.3.14` baseline archive,
+  including exact URL, archive size/SHA-256, executable size/SHA-256, license
+  URL/SHA-256, and package-local release-material authority. All other platforms
+  retain Bun `1.3.11`, avoiding an unnecessary cross-platform runtime change.
+- Completes entry-module evaluation synchronously instead of suspending it with
+  top-level await. The runtime promise still owns the full lifecycle and a
+  rejected bootstrap remains process-fatal after stderr is flushed.
+- Adds a native Intel macOS preflight that executes the complete bundled runtime
+  through renderer context, initialize, two successor turns, and end-session
+  before the five-platform build matrix is allocated. Ten consecutive preflight
+  lifecycles are mandatory, and matrix fail-fast is enabled to conserve CI.
+- Adds opt-in bounded macOS process sampling when the runtime lifecycle times out,
+  preserving actionable module/runtime evidence without changing normal product
+  behavior or successful smoke output.
+- Removes hard-coded “current stable version” prose from both READMEs. The
+  install command now follows only the public GitHub `latest` Release, preventing
+  documentation from advertising a tag whose assets were never published.
+
+---
+
+- 此次已签名发布未通过原生 Intel 预检，没有 GitHub Release 或公开资产。
+  `v1.0.26` 后续证明是预检观察器丢弃延迟 stdout 帧，并非 runtime 模块求值停滞。
+- 对失败且未公开的 `v1.0.24` 标签执行前滚修复，不移动或删除该已签名历史记录。
+  `v1.0.24` 没有 GitHub Release 或公开资产，不得安装。
+- 仅将 x64 macOS 发布包切换到经审查的 Bun `1.3.14` baseline 归档，同时固定精确
+  URL、归档大小/SHA-256、可执行文件大小/SHA-256、许可证 URL/SHA-256，以及包内
+  发布材料授权；其他平台继续使用 Bun `1.3.11`，避免无必要的跨平台运行时变更。
+- 入口模块改为同步完成求值，不再以 top-level await 悬挂模块；runtime promise
+  仍拥有完整生命周期，bootstrap reject 在 stderr 刷出后仍以进程级失败结束。
+- 新增原生 Intel macOS 发布预检：在分配五平台构建矩阵前，完整执行 renderer
+  context、initialize、连续两轮与 end-session 生命周期，连续十次均成功才放行；
+  同时启用矩阵 fail-fast，控制 CI 消耗。
+- runtime 生命周期超时时可选择采集有界 macOS 进程样本，为模块/运行时故障保留
+  可执行证据；正常产品行为和成功 smoke 输出均不改变。
+- 中英文 README 不再硬编码“当前稳定版本”。安装命令只跟随公开 GitHub `latest`
+  Release，杜绝文档提前宣传尚未产出资产的标签。
+
+## v1.0.24 — 2026-08-03
+
+- This signed release attempt failed on GitHub's native Intel macOS runner and
+  was deliberately cancelled before the remaining matrix consumed more CI.
+  It has no GitHub Release or public assets and is retained only as immutable
+  failure evidence.
+- Both Bun `1.3.11` standard and baseline executables could launch. This was
+  initially attributed to the complete module graph stalling before the
+  renderer handshake; `v1.0.26` disproved that attribution and identified
+  overlapping timed-out smoke reads as the frame-loss mechanism.
+- Forward-fixed the earlier unpublished `v1.0.23` release candidate without
+  moving or deleting its signed tag.
+- Classified only Bun's exact no-AVX compatibility warning, and only when the
+  package-local release materials bind the expected platform, version, asset
+  URL, and SHA-256. Every other stderr byte still fails the runtime smoke.
+- Removed the unused `ffmpeg-static` dependency and its install-time network
+  fetch. Media rendering continues to use the existing explicit system FFmpeg
+  contract.
+- Removed the Windows replay's process-per-system-PID inventory loop. One CIM
+  snapshot is now name-prefiltered before canonical package-ownership checks;
+  all 100 incident replays remain, with platform-specific CI budgets and
+  progress every ten iterations.
+- Corrected release evidence terminology: repeated assembly proves byte-level
+  determinism for one compiled product closure, not independent-build
+  reproducibility.
+
+---
+
+- 此次已签名发布在 GitHub 原生 Intel macOS runner 上失败；为避免其余矩阵继续
+  消耗 CI，失败后已主动取消。该版本没有 GitHub Release 或公开资产，仅作为不可变
+  的失败证据保留。
+- Bun `1.3.11` 的 standard 与 baseline 可执行文件本身都能启动。当时曾归因为完整
+  模块图在 renderer 握手前停滞；`v1.0.26` 已推翻该归因，并确认是 smoke 中多个
+  已超时但仍存活的读取竞争并吞掉协议帧。
+- 对更早的未公开 `v1.0.23` 候选版执行前滚修复，不移动或删除其已签名标签。
+- 仅当包内发布材料同时绑定预期平台、版本、资产 URL 与 SHA-256 时，才分类接纳
+  Bun 唯一一条精确的无 AVX 兼容提示；其他任何 stderr 字节仍使 runtime smoke 失败。
+- 移除从未被源码引用、安装时还会额外联网取包的 `ffmpeg-static` 死依赖；媒体渲染
+  继续遵循原有的显式系统 FFmpeg 契约。
+- 移除 Windows 回放中“每个系统 PID 再启动一个 PowerShell”的进程盘点循环；改为
+  单次 CIM 快照先按名称过滤，再做 canonical 包归属核验。每平台 100 次事故回放
+  全部保留，另按平台设置 CI 时限并每十次输出进度。
+- 纠正发布证据表述：重复组装只能证明同一编译闭包的字节级确定性，不能冒充独立
+  构建之间的完整可复现性。
+
 ## v1.0.23 — 2026-08-02
 
 - Fixed the P1 `sources: []` crash across Gateway, `@acosmi/sdk-ts 2.15.0`,

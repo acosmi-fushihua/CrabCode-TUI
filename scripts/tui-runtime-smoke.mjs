@@ -1,9 +1,12 @@
 #!/usr/bin/env bun
 
-import { rmSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { mkdtemp, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { createPersistentStreamPoller } from './persistent-stream-poller.mjs'
+import { classifyRuntimeStderr } from './release-runtime-stderr.mjs'
 
 const root = resolve(
   process.env.CRABCODE_SMOKE_PACKAGE_ROOT ?? resolve(import.meta.dir, '..'),
@@ -12,6 +15,10 @@ const runtime = join(root, 'dist/tui-runtime/index.js')
 const runtimeExecutable = resolve(
   process.env.CRABCODE_SMOKE_BUN ?? process.execPath,
 )
+const releaseMaterialsPath = join(root, 'release-materials.json')
+const releaseMaterials = existsSync(releaseMaterialsPath)
+  ? JSON.parse(readFileSync(releaseMaterialsPath, 'utf8'))
+  : null
 const timeoutMs = 45_000
 const rendererNotificationChannels = new Set([
   'auto',
@@ -66,6 +73,30 @@ const cleanup = () => {
   }
   rmSync(configDir, { recursive: true, force: true })
 }
+
+const captureDarwinSample = () => {
+  if (
+    process.platform !== 'darwin' ||
+    process.env.CRABCODE_SMOKE_CAPTURE_DARWIN_SAMPLE !== '1' ||
+    !Number.isSafeInteger(child.pid)
+  ) {
+    return null
+  }
+  const sample = spawnSync('/usr/bin/sample', [String(child.pid), '2', '1'], {
+    encoding: 'utf8',
+    timeout: 10_000,
+    maxBuffer: 4 * 1024 * 1024,
+  })
+  const output = `${sample.stdout ?? ''}${sample.stderr ?? ''}`
+  return {
+    status: sample.status,
+    signal: sample.signal,
+    error: sample.error?.message ?? null,
+    output: output.slice(0, 64 * 1024),
+    truncated: output.length > 64 * 1024,
+  }
+}
+
 process.once('exit', cleanup)
 process.once('SIGINT', () => process.exit(130))
 process.once('SIGTERM', () => process.exit(143))
@@ -103,6 +134,7 @@ const writeInitialize = async () => {
 const decoder = new TextDecoder()
 const stdout = child.stdout.getReader()
 const stderrPromise = new Response(child.stderr).text()
+const pollStdout = createPersistentStreamPoller(stdout)
 const deadline = Date.now() + timeoutMs
 const frameTypes = []
 let buffer = ''
@@ -118,12 +150,7 @@ let turnSubmitted = false
 await writeInitialize()
 
 while (Date.now() < deadline && !endAcknowledged) {
-  const read = await Promise.race([
-    stdout.read(),
-    new Promise(resolveRead =>
-      setTimeout(() => resolveRead({ timeout: true }), 1_000),
-    ),
-  ])
+  const read = await pollStdout(1_000)
   if (read.timeout) continue
   if (read.done) break
 
@@ -254,6 +281,7 @@ if (
   turnResults.length !== 2 ||
   !endAcknowledged
 ) {
+  const darwinSample = captureDarwinSample()
   child.kill()
   const [exitAfterKill, stderr] = await Promise.all([
     Promise.race([
@@ -279,6 +307,7 @@ if (
       frameTypes,
       exitAfterKill,
       stderr,
+      darwinSample,
     })}`,
   )
 }
@@ -288,15 +317,19 @@ const exitCode = await Promise.race([
   new Promise(resolveExit => setTimeout(() => resolveExit('timeout'), 10_000)),
 ])
 if (exitCode === 'timeout') {
+  const darwinSample = captureDarwinSample()
   child.kill()
-  throw new Error('runtime did not exit after end_session')
+  throw new Error(
+    `runtime did not exit after end_session: ${JSON.stringify({ darwinSample })}`,
+  )
 }
 if (exitCode !== 0) {
   throw new Error(`runtime exited with code ${exitCode}`)
 }
 
 const stderr = await stderrPromise
-if (stderr.length > 0) {
+const stderrDisposition = classifyRuntimeStderr(stderr, releaseMaterials)
+if (stderrDisposition === 'unexpected') {
   throw new Error(`runtime emitted stderr during smoke:\n${stderr}`)
 }
 
@@ -318,6 +351,7 @@ process.stdout.write(
         ? initializePayload.models.length
         : null,
       outputStyle: initializePayload.output_style,
+      stderr: stderrDisposition,
       frameTypes,
       exitCode,
     },
