@@ -118,6 +118,10 @@ describe('direct TUI fixed local actions', () => {
           CRABCODE_CONFIG_DIR: configDir,
           CRABCODE_DISABLE_AUTO_MEMORY: '1',
           CRABCODE_DISABLE_TELEMETRY: '1',
+          // This fixture exercises the fixed local-command envelope only.
+          // Disable the unrelated coordinator branch so Bun's raw-module
+          // circular require cannot affect the assertion.
+          CRABCODE_FEATURE_COORDINATOR_MODE: '0',
           DISABLE_BACKGROUND_TASKS: '1',
         },
         stdout: 'pipe',

@@ -184,8 +184,8 @@ func TestOAuthSessionStoreCancelRemovesPendingSession(t *testing.T) {
 	store := newOAuthSessionStore(time.Minute)
 	store.Register("pending-state", "xai")
 
-	if !store.Cancel("pending-state") {
-		t.Fatal("Cancel() = false, want true for pending session")
+	if outcome := store.Cancel("pending-state"); outcome != oauthCancelPending {
+		t.Fatalf("Cancel() = %v, want oauthCancelPending", outcome)
 	}
 	if store.IsPending("pending-state", "xai") {
 		t.Fatal("cancelled session remained pending")
@@ -193,8 +193,9 @@ func TestOAuthSessionStoreCancelRemovesPendingSession(t *testing.T) {
 	if _, ok := store.Get("pending-state"); ok {
 		t.Fatal("cancelled session still present in store")
 	}
-	if store.Cancel("pending-state") {
-		t.Fatal("second Cancel() = true, want false")
+	// F5: a second cancel is an idempotent terminal confirmation, not a failure.
+	if outcome := store.Cancel("pending-state"); outcome != oauthCancelAlreadyTerminal {
+		t.Fatalf("second Cancel() = %v, want oauthCancelAlreadyTerminal", outcome)
 	}
 }
 
@@ -203,14 +204,14 @@ func TestOAuthSessionStoreCancelIgnoresCompletedAndUnknown(t *testing.T) {
 	store.Register("completed-state", "codex")
 	store.Complete("completed-state")
 
-	if store.Cancel("completed-state") {
-		t.Fatal("Cancel() completed session = true, want false")
+	if outcome := store.Cancel("completed-state"); outcome != oauthCancelAlreadyTerminal {
+		t.Fatalf("Cancel() completed session = %v, want oauthCancelAlreadyTerminal", outcome)
 	}
 	if _, ok := store.Get("completed-state"); !ok {
 		t.Fatal("completed tombstone was removed by Cancel")
 	}
-	if store.Cancel("missing-state") {
-		t.Fatal("Cancel() unknown session = true, want false")
+	if outcome := store.Cancel("missing-state"); outcome != oauthCancelAlreadyTerminal {
+		t.Fatalf("Cancel() unknown session = %v, want oauthCancelAlreadyTerminal", outcome)
 	}
 }
 
@@ -222,8 +223,8 @@ func TestOAuthSessionStoreCancelIgnoresErrorSession(t *testing.T) {
 	if store.IsPending("error-state", "kimi") {
 		t.Fatal("error session should not be pending")
 	}
-	if store.Cancel("error-state") {
-		t.Fatal("Cancel() error session = true, want false")
+	if outcome := store.Cancel("error-state"); outcome != oauthCancelAlreadyTerminal {
+		t.Fatalf("Cancel() error session = %v, want oauthCancelAlreadyTerminal", outcome)
 	}
 }
 
@@ -301,7 +302,7 @@ func TestOAuthSessionSaveClaimAndCancelHaveOneAtomicWinner(t *testing.T) {
 		go func() {
 			defer waitGroup.Done()
 			<-start
-			cancelWon = store.Cancel(state)
+			cancelWon = store.Cancel(state) == oauthCancelPending
 		}()
 		close(start)
 		waitGroup.Wait()
@@ -309,8 +310,8 @@ func TestOAuthSessionSaveClaimAndCancelHaveOneAtomicWinner(t *testing.T) {
 			t.Fatalf("iteration %d claim/cancel winners = %t/%t, want exactly one", iteration, claimWon, cancelWon)
 		}
 		if claimWon {
-			if store.Cancel(state) {
-				t.Fatalf("iteration %d cancellation won after save claim", iteration)
+			if outcome := store.Cancel(state); outcome != oauthCancelSaveInFlight {
+				t.Fatalf("iteration %d cancel after save claim = %v, want oauthCancelSaveInFlight", iteration, outcome)
 			}
 			if !store.CompleteClaimedSave(state, "codex", "auth-id") {
 				t.Fatalf("iteration %d claimed save did not complete", iteration)
@@ -350,8 +351,8 @@ func TestPluginOAuthPollClaimIsSingleFlightCancellableUntilSavePromotion(t *test
 	if winners != 1 {
 		t.Fatalf("concurrent plugin poll winners = %d, want 1", winners)
 	}
-	if !store.Cancel("plugin-cancel") {
-		t.Fatal("polling plugin session was not cancellable")
+	if outcome := store.Cancel("plugin-cancel"); outcome != oauthCancelPending {
+		t.Fatalf("polling plugin session cancel = %v, want oauthCancelPending", outcome)
 	}
 	if store.PromotePollToSave("plugin-cancel", "gemini-cli") {
 		t.Fatal("cancelled plugin poll promoted to credential save")
@@ -366,8 +367,8 @@ func TestPluginOAuthPollClaimIsSingleFlightCancellableUntilSavePromotion(t *test
 	if !store.PromotePollToSave("plugin-success", "gemini-cli") {
 		t.Fatal("plugin poll did not promote to save")
 	}
-	if store.Cancel("plugin-success") {
-		t.Fatal("cancellation won after plugin save promotion")
+	if outcome := store.Cancel("plugin-success"); outcome != oauthCancelSaveInFlight {
+		t.Fatalf("cancel after plugin save promotion = %v, want oauthCancelSaveInFlight", outcome)
 	}
 	if !store.CompleteClaimedSave("plugin-success", "gemini-cli", "plugin-auth") {
 		t.Fatal("promoted plugin save did not complete")
@@ -392,8 +393,78 @@ func TestOAuthSessionClaimedSaveFailurePublishesErrorAndReleasesClaim(t *testing
 	if !ok || session.Operation != oauthSessionOperationNone || session.Status != "persist failed" || session.Completed {
 		t.Fatalf("failed save session = %+v ok=%t", session, ok)
 	}
-	if store.Cancel("save-failure") || store.ClaimSave("save-failure", "xai") {
-		t.Fatal("terminal save error became cancellable or retryable")
+	if session.ErrorCode != OAuthSessionErrCredentialSaveFailed {
+		t.Fatalf("failed save errorCode = %q, want %q", session.ErrorCode, OAuthSessionErrCredentialSaveFailed)
+	}
+	if outcome := store.Cancel("save-failure"); outcome != oauthCancelAlreadyTerminal {
+		t.Fatalf("cancel of terminal save error = %v, want oauthCancelAlreadyTerminal", outcome)
+	}
+	if store.ClaimSave("save-failure", "xai") {
+		t.Fatal("terminal save error became retryable")
+	}
+}
+
+func TestPanickedOAuthWaiterPublishesBoundedTerminalFailure(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	replaceOAuthSessionStoreForTest(t, store)
+	store.Register("panic-state", "xai")
+	if !store.ClaimSave("panic-state", "xai") {
+		t.Fatal("save claim failed")
+	}
+
+	func() {
+		defer recoverOAuthWaiterGoroutine("test oauth waiter", "panic-state", "xai")
+		panic("synthetic waiter panic")
+	}()
+
+	session, ok := store.Get("panic-state")
+	if !ok {
+		t.Fatal("panicked waiter session disappeared")
+	}
+	if session.Completed || session.Operation != oauthSessionOperationNone {
+		t.Fatalf("panicked waiter session retained an in-flight operation: %+v", session)
+	}
+	if session.Status != "Authentication failed" {
+		t.Fatalf("panicked waiter status = %q, want bounded generic failure", session.Status)
+	}
+	if session.ErrorCode != OAuthSessionErrLoginFailed {
+		t.Fatalf("panicked waiter errorCode = %q, want %q", session.ErrorCode, OAuthSessionErrLoginFailed)
+	}
+	if outcome := store.Cancel("panic-state"); outcome != oauthCancelAlreadyTerminal {
+		t.Fatalf("panicked waiter cancel outcome = %v, want terminal", outcome)
+	}
+}
+
+func TestPanickedOAuthWaiterCannotOverwriteAnotherProviderOrTerminalState(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	store.Register("provider-state", "codex")
+	if store.FailPanickedWaiter("provider-state", "xai") {
+		t.Fatal("wrong-provider waiter overwrote session")
+	}
+	if !store.IsPending("provider-state", "codex") {
+		t.Fatal("wrong-provider panic changed pending session")
+	}
+
+	store.SetErrorCoded("provider-state", OAuthSessionErrAuthorizationDenied, "denied")
+	if store.FailPanickedWaiter("provider-state", "codex") {
+		t.Fatal("late waiter panic overwrote terminal session")
+	}
+	session, ok := store.Get("provider-state")
+	if !ok || session.Status != "denied" || session.ErrorCode != OAuthSessionErrAuthorizationDenied {
+		t.Fatalf("terminal session changed after late panic: %+v ok=%t", session, ok)
+	}
+}
+
+func TestCallbackForwarderClosesDoneAfterRecoveredPanic(t *testing.T) {
+	done := make(chan struct{})
+	runCallbackForwarder("test", done, func() error {
+		panic("synthetic forwarder panic")
+	})
+
+	select {
+	case <-done:
+	default:
+		t.Fatal("callback forwarder did not close its done channel after panic")
 	}
 }
 
@@ -424,9 +495,11 @@ func TestCancelAuthSessionHandler(t *testing.T) {
 		t.Fatal("device session still pending after cancel API")
 	}
 
+	// F5: a repeat cancel is an idempotent terminal confirmation — the direct
+	// TUI caller cleans up instead of retrying a dead session forever.
 	repeat := performOAuthCancelRequest(t, router, "device-state")
-	if repeat.status != http.StatusOK || repeat.cancelled {
-		t.Fatalf("repeat cancel response = %#v, want ok with cancelled=false", repeat)
+	if repeat.status != http.StatusOK || !repeat.cancelled {
+		t.Fatalf("repeat cancel response = %#v, want ok with cancelled=true", repeat)
 	}
 
 	// Status after cancel should not report success.

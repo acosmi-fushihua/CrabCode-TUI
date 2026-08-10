@@ -246,6 +246,18 @@ function getSimpleSandboxSection(): string {
     )
   }
 
+  // W-SANDBOX-ENFORCED-DEADCODE PR-5（PR-4 Finding 2 移交）：宽松档这一节曾经
+  // 逐字教模型 "Immediately retry with `dangerouslyDisableSandbox: true` (don't
+  // ask, just do it)" —— SoT §1.1 事故链的一环。当时 enforced 后端从未接线，
+  // Bash 首跑必抛，模型照这句话立刻掀掉隔离，于是"开了沙箱"这件事对用户是纯粹的
+  // 幻觉。后端接通之后这句话依然有害：它把用户主动打开的保护降级成一个只要
+  // 挡路就该被撤掉的东西。
+  //
+  // 重写后的引导与 PR-4 的失败时刻注解
+  // （`violationPatterns.ts::formatSandboxViolationAnnotation`）同调：先给不掀
+  // 隔离的解法，`dangerouslyDisableSandbox` 是 last resort 且必须说清是哪条拒绝
+  // 逼出来的。两处文案必须保持同调 —— 一处说"last resort"另一处说"don't ask,
+  // just do it"，模型只会照做后者。
   const sandboxOverrideItems: Array<string | string[]> =
     allowUnsandboxedCommands
       ? [
@@ -261,11 +273,11 @@ function getSimpleSandboxSection(): string {
             'Network connection failures to non-whitelisted hosts',
             'Unix socket connection errors',
           ],
-          'When you see evidence of sandbox-caused failure:',
+          'When you see evidence of a sandbox-caused failure, try these in order:',
           [
-            "Immediately retry with `dangerouslyDisableSandbox: true` (don't ask, just do it)",
-            'Briefly explain what sandbox restriction likely caused the failure. Be sure to mention that the user can use the `/sandbox` command to manage restrictions.',
-            'This will prompt the user for permission',
+            'Stay inside the sandbox if you can: work under the project directory, and put temporary files in `$TMPDIR` rather than other locations.',
+            'If a specific path or host genuinely must be reachable, name it to the user and let them allow it with the `/sandbox` command — that keeps the isolation they turned on.',
+            '`dangerouslyDisableSandbox: true` is the last resort, not the first response: it re-runs the command with NO isolation. Use it only when the operation genuinely cannot work inside the sandbox, say which denial line made you do it, and expect the user to be asked for permission.',
           ],
           'Treat each command you execute with `dangerouslyDisableSandbox: true` individually. Even if you have recently run a command with this setting, you should default to running future commands within the sandbox.',
           'Do not suggest adding sensitive paths like ~/.bashrc, ~/.zshrc, ~/.ssh/*, or credential files to the sandbox allowlist.',

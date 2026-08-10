@@ -648,6 +648,34 @@ export type ReadFileRangeResult = {
   bytesTotal: number
 }
 
+/** Stable identity of an already-opened file. */
+export type FileIdentity = {
+  dev: bigint
+  ino: bigint
+}
+
+function assertFileIdentity(
+  actual: fs.BigIntStats,
+  expected: FileIdentity | undefined,
+  path: string,
+): void {
+  if (expected === undefined) {
+    return
+  }
+  if (
+    actual.isFile() &&
+    actual.dev === expected.dev &&
+    actual.ino === expected.ino
+  ) {
+    return
+  }
+  const error = new Error(
+    `file identity changed before host read: ${path}`,
+  ) as NodeJS.ErrnoException
+  error.code = 'ESTALE'
+  throw error
+}
+
 /**
  * Read up to `maxBytes` from a file starting at `offset`.
  * Returns a flat string from Buffer — no sliced string references to a
@@ -657,9 +685,24 @@ export async function readFileRange(
   path: string,
   offset: number,
   maxBytes: number,
+  expectedIdentity?: FileIdentity,
 ): Promise<ReadFileRangeResult | null> {
-  await using fh = await open(path, 'r')
-  const size = (await fh.stat()).size
+  await using fh = await open(
+    path,
+    expectedIdentity === undefined
+      ? 'r'
+      : process.platform === 'win32'
+        ? 'r'
+        : fs.constants.O_RDONLY | fs.constants.O_NONBLOCK,
+  )
+  const stats =
+    expectedIdentity === undefined
+      ? await fh.stat()
+      : await fh.stat({ bigint: true })
+  if (expectedIdentity !== undefined) {
+    assertFileIdentity(stats as fs.BigIntStats, expectedIdentity, path)
+  }
+  const size = Number(stats.size)
   if (size <= offset) {
     return null
   }
@@ -694,9 +737,24 @@ export async function readFileRange(
 export async function tailFile(
   path: string,
   maxBytes: number,
+  expectedIdentity?: FileIdentity,
 ): Promise<ReadFileRangeResult> {
-  await using fh = await open(path, 'r')
-  const size = (await fh.stat()).size
+  await using fh = await open(
+    path,
+    expectedIdentity === undefined
+      ? 'r'
+      : process.platform === 'win32'
+        ? 'r'
+        : fs.constants.O_RDONLY | fs.constants.O_NONBLOCK,
+  )
+  const stats =
+    expectedIdentity === undefined
+      ? await fh.stat()
+      : await fh.stat({ bigint: true })
+  if (expectedIdentity !== undefined) {
+    assertFileIdentity(stats as fs.BigIntStats, expectedIdentity, path)
+  }
+  const size = Number(stats.size)
   if (size === 0) {
     return { content: '', bytesRead: 0, bytesTotal: 0 }
   }

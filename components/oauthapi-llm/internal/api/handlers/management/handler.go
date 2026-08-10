@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/acosmi/OAuthAPI-LLM/internal/buildinfo"
@@ -60,6 +61,23 @@ type Handler struct {
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginReleaseCacheMu    sync.Mutex
 	pluginReleaseCache      map[string]pluginReleaseCacheEntry
+	// runtimeListenPort is the OS-assigned loopback port observed after the
+	// server's listener bind. In account-bridge mode cfg.Port is pinned to 0
+	// by config.ValidateAccountBridgeSecurity and is never written back, so
+	// this explicit injection (F1/V1, 2026-08-08 账户接入审计 §7 PR-α-1) is
+	// the only way managementCallbackURL can compose a real callback target.
+	// The cfg.Port==0 contract stays untouched.
+	runtimeListenPort atomic.Int32
+}
+
+// SetRuntimeListenPort publishes the real bound loopback port after listener
+// bind. Out-of-range values are ignored so a bad caller cannot poison the
+// callback URL composition.
+func (h *Handler) SetRuntimeListenPort(port int) {
+	if h == nil || port <= 0 || port > 65535 {
+		return
+	}
+	h.runtimeListenPort.Store(int32(port))
 }
 
 type configReloadSnapshot struct {

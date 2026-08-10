@@ -1045,9 +1045,11 @@ version = "1.0.29"
 dependencies = [
  "acosmi-daemon-launcher",
  "acosmi-generation-lease",
+ "acosmi-sandbox",
  "acosmi-supervisor",
  "anyhow",
  "dirs",
+ "libc",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

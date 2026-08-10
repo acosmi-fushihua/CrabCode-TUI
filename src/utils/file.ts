@@ -95,6 +95,7 @@ export function writeTextContent(
   }
 
   writeFileSyncAndFlush_DEPRECATED(filePath, toWrite, { encoding })
+
 }
 
 export function detectFileEncoding(filePath: string): BufferEncoding {
@@ -352,6 +353,102 @@ export function readFileSyncCached(filePath: string): string {
 }
 
 /**
+ * Errno codes for which a rename is worth attempting again.
+ *
+ * Windows does not block a rename against a path another process holds a
+ * handle on — it fails it, with EPERM (sometimes EBUSY or EACCES). Both
+ * primitives below commit by renaming a temp file we finished writing
+ * microseconds earlier onto a live target, so anything that opportunistically
+ * opens that target (an editor, a real-time scanner, an indexer, a backup
+ * agent) turns a perfectly good write into a hard failure — on a race that
+ * clears itself unaided.
+ *
+ * Deliberately absent: ENOENT (the staged temp is gone; retrying cannot bring
+ * it back), EXDEV (temp and target are siblings by construction, so this means
+ * the target moved and retrying will not fix it), and the ENOTEMPTY / EEXIST
+ * family (a directory occupies the target). None of those change on a retry —
+ * retrying them would only delay an honest failure.
+ *
+ * This set is intentionally narrow: only short-lived lock/contention errors
+ * are retried. Contract tests pin both the retryable and terminal errno sets.
+ */
+export const TRANSIENT_RENAME_CODES: ReadonlySet<string> = new Set([
+  'EPERM',
+  'EBUSY',
+  'EACCES',
+])
+
+/**
+ * Backoff before each successive retry, in ms. Six retries, ~630ms worst case:
+ * sized for a scanner that holds a handle for tens of milliseconds, not for a
+ * target something long-lived has genuinely locked.
+ *
+ * This blocks the event loop, which is affordable only because it is reached
+ * exclusively from an already-failed rename — the success path never sleeps.
+ * `settings.ts::saveSettings` already accepts a longer (~2.75s) synchronous
+ * wait while acquiring its `ELOCKED` lock, so this is the more conservative of
+ * the two synchronous waits on the settings write path.
+ *
+ * Accepted cost: on POSIX these three codes usually mean a genuine permission
+ * problem rather than a passing lock, so such a failure is now reported ~630ms
+ * later than it used to be. EBUSY on a network or mounted filesystem can still
+ * be transient, so a delayed honest failure is the safer tradeoff.
+ *
+ * Before lengthening this: some callers run inside a cross-process lock
+ * (`installedPluginsManager` holds one via `withCrossProcessResourceLockSync`),
+ * so the ladder extends a critical section whose holder is expected to keep it
+ * bounded. Two budgets constrain it. Stale takeover is not one of them —
+ * `LOCK_STALE_MS` is 120s, and even a fully blocked event loop delays the 10s
+ * lock refresh by under a second. The binding one is the *waiter*: eight
+ * attempts of `min(25·2ⁿ, 200)`ms ≈ 975ms, so a ladder much longer than this
+ * would start converting "the holder retried and succeeded" into "a concurrent
+ * writer failed to acquire". That trade is currently favourable — the holder
+ * would otherwise lose a credential or settings write outright, while the
+ * waiter gets a loud, retryable acquisition error — but it does not survive an
+ * arbitrarily long ladder.
+ */
+export const RENAME_RETRY_BACKOFF_MS: readonly number[] = [
+  10, 20, 40, 80, 160, 320,
+]
+
+/**
+ * `renameSync` that rides out the transient locks described above.
+ *
+ * `renameImpl` is required rather than defaulted: both callers below reach the
+ * filesystem through their own indirection (`getFsImplementation()` /
+ * `ops.renameSync`), and a default here would quietly invite a third caller to
+ * bypass that layer. `sleep` is injectable because the failure this exists for
+ * cannot be provoked on demand — the OS produces it or it does not — so tests
+ * drive this exact retry loop rather than a re-implementation of it.
+ */
+export function renameSyncWithTransientRetry(
+  from: string,
+  to: string,
+  renameImpl: (from: string, to: string) => void,
+  sleep: (ms: number) => void = ms => Bun.sleepSync(ms),
+): void {
+  const backoffs = [...RENAME_RETRY_BACKOFF_MS]
+  for (;;) {
+    try {
+      renameImpl(from, to)
+      return
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | null)?.code
+      // `shift()` running dry is how "retries exhausted" is spelled.
+      const backoffMs = backoffs.shift()
+      if (
+        backoffMs === undefined ||
+        code === undefined ||
+        !TRANSIENT_RENAME_CODES.has(code)
+      ) {
+        throw err
+      }
+      sleep(backoffMs)
+    }
+  }
+}
+
+/**
  * Writes to a file and flushes the file to disk
  * @param filePath The path to the file to write to
  * @param content The content to write to the file
@@ -432,9 +529,15 @@ export function writeFileSyncAndFlush_DEPRECATED(
     }
 
     // Atomic rename (on POSIX systems, this is atomic)
-    // On Windows, this will overwrite the destination if it exists
+    // On Windows, this will overwrite the destination if it exists — or fail
+    // outright while another process holds the target open, which is the race
+    // `renameSyncWithTransientRetry` rides out. Only once the retry ladder is
+    // exhausted does the non-atomic fallback below come into play, so a
+    // transient lock no longer costs this write its atomicity.
     logForDebugging(`Renaming ${tempPath} to ${targetPath}`)
-    fs.renameSync(tempPath, targetPath)
+    renameSyncWithTransientRetry(tempPath, targetPath, (from, to) =>
+      fs.renameSync(from, to),
+    )
     logForDebugging(`File ${targetPath} written atomically`)
   } catch (atomicError) {
     logForDebugging(`Failed to write file atomically: ${atomicError}`, {
@@ -488,6 +591,12 @@ export interface AtomicReplaceFileSyncOperations {
   chmodSync(path: string, mode: number): void
   renameSync(oldPath: string, newPath: string): void
   unlinkSync(path: string): void
+  /**
+   * Synchronous backoff seam for the rename retry ladder. Production callers
+   * omit it and get `Bun.sleepSync`; tests supply a recorder so the ladder is
+   * asserted without actually waiting out ~630ms.
+   */
+  sleepSync?(ms: number): void
 }
 
 let atomicReplaceSequence = 0
@@ -553,7 +662,18 @@ export function writeFileSyncAtomicNoFallback(
     }
     // rename is the commit point. Do not perform any throwing durability step
     // afterwards: callers must never receive an ambiguous post-commit error.
-    ops.renameSync(tempPath, targetPath)
+    //
+    // Retrying here does not weaken that guarantee: every attempt either
+    // commits or leaves the previous generation untouched, so the ladder only
+    // changes how long we wait before declaring the commit impossible. Without
+    // it a transient Windows handle lock costs a credential or settings write
+    // outright — this primitive has no fallback by design.
+    renameSyncWithTransientRetry(
+      tempPath,
+      targetPath,
+      (from, to) => ops.renameSync(from, to),
+      ops.sleepSync?.bind(ops),
+    )
   } catch (error) {
     try {
       ops.unlinkSync(tempPath)

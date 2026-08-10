@@ -1,7 +1,6 @@
 import type { ToolResultBlockParam } from '../../types/api-types.js'
 import { feature } from '../../utils/featurePolyfill.js';
 
-import { copyFile, stat as fsStat, truncate as fsTruncate, link } from 'fs/promises';
 import type { CanUseToolFn } from 'src/types/canUseTool.js';
 import type { AppState } from 'src/state/AppState.js';
 import { z } from 'zod/v4';
@@ -25,11 +24,15 @@ import { maybeRecordPluginHint } from '../../utils/plugins/hintRecommendation.js
 import { exec } from '../../utils/Shell.js';
 import type { ExecResult } from '../../utils/ShellCommand.js';
 import { SandboxManager } from '../../utils/sandbox/sandbox-adapter.js';
+import { isWindowsSandboxPolicyViolation, strictSandboxRefusalOrNull, WINDOWS_SANDBOX_POLICY_REFUSAL } from '../../utils/sandbox/strictSandboxPolicy.js';
 import { semanticBoolean } from '../../utils/semanticBoolean.js';
 import { semanticNumber } from '../../utils/semanticNumber.js';
 import { getCachedPowerShellPath } from '../../utils/shell/powershellDetection.js';
 import { EndTruncatingAccumulator } from '../../utils/stringUtils.js';
-import { getTaskOutputPath } from '../../utils/task/diskOutput.js';
+import {
+  getTaskOutputPath,
+  persistTaskOutputFile
+} from '../../utils/task/diskOutput.js';
 import { TaskOutput } from '../../utils/task/TaskOutput.js';
 import { isOutputLineTruncated } from '../../utils/outputLineTruncation.js';
 import { buildLargeToolResultMessage, ensureToolResultsDir, generatePreview, getToolResultPath, PREVIEW_SIZE_BYTES } from '../../utils/toolResultStorage.js';
@@ -205,20 +208,18 @@ export function detectBlockedSleepPattern(command: string): string | null {
 }
 
 /**
- * On Windows native, sandbox is unavailable (bwrap/sandbox-exec are
- * POSIX-only). If enterprise policy has sandbox.enabled AND forbids
- * unsandboxed commands, PowerShell cannot comply — refuse execution
- * rather than silently bypass the policy. On Linux/macOS/WSL2, pwsh
- * runs as a native binary under the sandbox same as bash, so this
- * gate does not apply.
+ * 这条 pwsh 命令会不会被隔离 —— **单点判据**（W-SANDBOX-ENFORCED-DEADCODE PR-4）。
  *
- * Checked in BOTH validateInput (clean tool-runner error) and call()
- * (covers direct callers like promptShellExecution.ts that skip
- * validateInput). The call() guard is the load-bearing one.
+ * 两个消费者：spawn 时决定要不要走 helper，以及结果组装时决定能不能把输出里的
+ * `Permission denied` 定性成沙箱拒绝、要不要在 tool result meta 里报后端名。
+ * 抽成函数是因为第二处是 PR-4 新增的：把那个三元表达式抄第二遍，就等于给
+ * 「Windows 恒不沙箱化」这条不变式开了第二个可以单独漂移的真源。
  */
-const WINDOWS_SANDBOX_POLICY_REFUSAL = 'Enterprise policy requires sandboxing, but sandboxing is not available on native Windows. Shell command execution is blocked on this platform by policy.';
-function isWindowsSandboxPolicyViolation(): boolean {
-  return getPlatform() === 'windows' && SandboxManager.isSandboxEnabledInSettings() && !SandboxManager.areUnsandboxedCommandsAllowed();
+function shouldSandboxPowerShell(input: {
+  command?: string;
+  dangerouslyDisableSandbox?: boolean;
+}): boolean {
+  return getPlatform() === 'windows' ? false : shouldUseSandbox(input);
 }
 
 // Check if background tasks are disabled at module load time
@@ -252,7 +253,8 @@ const outputSchema = lazySchema(() => z.object({
   persistedOutputSize: z.number().optional().describe('Total output size in bytes when persisted'),
   backgroundTaskId: z.string().optional().describe('ID of the background task if command is running in background'),
   backgroundedByUser: z.boolean().optional().describe('True if the user manually backgrounded the command with Ctrl+B'),
-  assistantAutoBackgrounded: z.boolean().optional().describe('True if the command was auto-backgrounded by the assistant-mode blocking budget')
+  assistantAutoBackgrounded: z.boolean().optional().describe('True if the command was auto-backgrounded by the assistant-mode blocking budget'),
+  sandboxBackend: z.string().optional().describe('Identifier of the sandbox backend that isolated this command; absent when the command ran without sandbox isolation')
 }));
 type OutputSchema = ReturnType<typeof outputSchema>;
 export type Out = z.infer<OutputSchema>;
@@ -350,6 +352,19 @@ export const PowerShellTool = buildTool({
     return true;
   },
   async validateInput(input: PowerShellToolInput): Promise<ValidationResult> {
+    // W-SANDBOX-ENFORCED-DEADCODE PR-0：严格档 + 执行后端未接线 ⇒ 确定性拒绝。
+    //
+    // 排在 Windows 门**之前**，因为它说的是更准确的真话：Windows 上沙箱不可用
+    // 的当前原因不是「这个平台注定不行」，而是「执行后端还没接线」（PR-3 会接）。
+    // 后端接通后本条自然不再命中，Windows 门重新成为该平台的判据。
+    const strictSandboxRefusal = strictSandboxRefusalOrNull();
+    if (strictSandboxRefusal !== null) {
+      return {
+        result: false,
+        message: strictSandboxRefusal,
+        errorCode: 12
+      };
+    }
     // Defense-in-depth: also guarded in call() for direct callers.
     if (isWindowsSandboxPolicyViolation()) {
       return {
@@ -443,6 +458,14 @@ export const PowerShellTool = buildTool({
     // call PowerShellTool.call() directly, bypassing validateInput. This is
     // the check that covers ALL callers. See isWindowsSandboxPolicyViolation
     // comment for the policy rationale.
+    //
+    // Strict-mode refusal goes FIRST, for the same reason it does in
+    // validateInput: it states the more accurate truth ("the execution backend
+    // is not wired") instead of "this platform cannot ever do it".
+    const strictSandboxRefusal = strictSandboxRefusalOrNull();
+    if (strictSandboxRefusal !== null) {
+      throw new Error(strictSandboxRefusal);
+    }
     if (isWindowsSandboxPolicyViolation()) {
       throw new Error(WINDOWS_SANDBOX_POLICY_REFUSAL);
     }
@@ -575,6 +598,23 @@ export const PowerShellTool = buildTool({
         for (const hint of extracted.hints) maybeRecordPluginHint(hint);
       }
 
+      // 沙箱违规反馈环（PR-4，与 BashTool 同形）。第三个参数是承重的：判据表里
+      // 的 `Permission denied` 在没有沙箱的机器上同样天天出现，只有确认这条命令
+      // 真经 helper 跑过才允许把它定性成隔离拒绝。副作用（违规计数）在这里发生，
+      // 所以放在两个 throw 之前 —— 命令失败与否都该计数。
+      const ranInSandbox = shouldSandboxPowerShell({
+        command: input.command,
+        dangerouslyDisableSandbox: input.dangerouslyDisableSandbox
+      });
+      // 只扫 stdout：`Shell.ts::exec` 的 pipe 模式由 `onStdout` 开关，而全仓
+      // 没有任何调用点传它（`grep -rn "onStdout:" src/` 零命中），所以两个 shell
+      // 工具都跑在文件模式下 —— stdout 与 stderr 共用同一个 fd，拒绝行必然落在
+      // `result.stdout` 里。扫第二遍 stderr 只会带来重复计数的风险，换不到任何
+      // 覆盖面。若将来真接了 pipe 模式，这里要同步扫 stderr。
+      const annotatedStdout = SandboxManager.annotateStderrWithSandboxFailures(input.command, stdout, {
+        sandboxed: ranInSandbox
+      });
+
       // preSpawnError means exec() succeeded but the inner shell failed before
       // the command ran (e.g. CWD deleted). createFailedCommand sets code=1,
       // which interpretCommandResult can mistake for grep-no-match / findstr
@@ -583,7 +623,7 @@ export const PowerShellTool = buildTool({
         throw new Error(result.preSpawnError);
       }
       if (interpretation.isError && !isInterrupt) {
-        throw new ShellError(stdout, result.stderr || '', result.code, result.interrupted);
+        throw new ShellError(annotatedStdout, result.stderr || '', result.code, result.interrupted);
       }
 
       // Large output: file on disk has more than getMaxOutputLength() bytes.
@@ -600,18 +640,13 @@ export const PowerShellTool = buildTool({
       let persistedOutputSize: number | undefined;
       if (result.outputFilePath && result.outputTaskId) {
         try {
-          const fileStat = await fsStat(result.outputFilePath);
-          persistedOutputSize = fileStat.size;
           await ensureToolResultsDir();
           const dest = getToolResultPath(result.outputTaskId, false);
-          if (fileStat.size > MAX_PERSISTED_SIZE) {
-            await fsTruncate(result.outputFilePath, MAX_PERSISTED_SIZE);
-          }
-          try {
-            await link(result.outputFilePath, dest);
-          } catch {
-            await copyFile(result.outputFilePath, dest);
-          }
+          persistedOutputSize = await persistTaskOutputFile(
+            result.outputTaskId,
+            dest,
+            MAX_PERSISTED_SIZE
+          );
           persistedOutputPath = dest;
         } catch {
           // File may already be gone — stdout preview is sufficient
@@ -624,7 +659,11 @@ export const PowerShellTool = buildTool({
       let isImage = isImageOutput(stdout);
       let compressedStdout = stdout;
       if (isImage) {
-        const resized = await resizeShellImageOutput(stdout, result.outputFilePath, persistedOutputSize);
+        const resized = await resizeShellImageOutput(
+          stdout,
+          persistedOutputPath,
+          persistedOutputSize
+        );
         if (resized) {
           compressedStdout = resized;
         } else {
@@ -650,6 +689,8 @@ export const PowerShellTool = buildTool({
           interrupted: result.interrupted,
           returnCodeInterpretation: interpretation.message,
           isImage,
+          // PR-4：命令真被隔离时才带后端名，否则**缺字段**（与 BashTool 同规矩）。
+          sandboxBackend: ranInSandbox ? SandboxManager.getSandboxBackend() : undefined,
           persistedOutputPath,
           persistedOutputSize
         }
@@ -740,12 +781,21 @@ async function* runPowerShellCommand({
       },
       preventCwdChanges,
       // Sandbox works on Linux/macOS/WSL2 — pwsh there is a native binary and
-      // SandboxManager.wrapWithSandbox wraps it same as bash (Shell.ts uses
-      // /bin/sh for the outer spawn to parse the POSIX-quoted bwrap/sandbox-exec
-      // string). On Windows native, sandbox is unsupported; shouldUseSandbox()
-      // returns false via isSandboxingEnabled() → isSupportedPlatform() → false.
-      // The explicit platform check is redundant-but-obvious.
-      shouldUseSandbox: getPlatform() === 'windows' ? false : shouldUseSandbox({
+      // Shell.ts runs it through the helper the same way it runs bash, using
+      // /bin/sh for the outer spawn so `-EncodedCommand` survives the quoting
+      // layers.
+      //
+      // On Windows this stays `false`, and since W-SANDBOX-ENFORCED-DEADCODE
+      // PR-3 that is a **load-bearing** check rather than the redundant one the
+      // old comment described. The old reason ("sandbox is unsupported on
+      // native Windows") stopped being true when PR-3 wired the Windows
+      // backend — `isSandboxingEnabled()` can now return true here. What is
+      // still true is narrower: the *sandboxed PowerShell* form is POSIX-only,
+      // because it spawns `/bin/sh` as the outer shell and Windows has none.
+      // Wiring pwsh into the Windows sandbox needs its own design (a Windows
+      // outer shell, or handing pwsh.exe to the helper directly) and its own
+      // review — it is not a comment fix.
+      shouldUseSandbox: shouldSandboxPowerShell({
         command,
         dangerouslyDisableSandbox
       }),

@@ -1,7 +1,6 @@
 import type { ToolResultBlockParam } from '../../types/api-types.js'
 import { feature } from '../../utils/featurePolyfill.js';
 
-import { copyFile, stat as fsStat, truncate as fsTruncate, link } from 'fs/promises';
 import type { CanUseToolFn } from 'src/types/canUseTool.js';
 import type { AppState } from 'src/state/AppState.js';
 import { z } from 'zod/v4';
@@ -31,10 +30,14 @@ import { maybeRecordPluginHint } from '../../utils/plugins/hintRecommendation.js
 import { exec } from '../../utils/Shell.js';
 import type { ExecResult } from '../../utils/ShellCommand.js';
 import { SandboxManager } from '../../utils/sandbox/sandbox-adapter.js';
+import { strictSandboxRefusalOrNull } from '../../utils/sandbox/strictSandboxPolicy.js';
 import { semanticBoolean } from '../../utils/semanticBoolean.js';
 import { semanticNumber } from '../../utils/semanticNumber.js';
 import { EndTruncatingAccumulator } from '../../utils/stringUtils.js';
-import { getTaskOutputPath } from '../../utils/task/diskOutput.js';
+import {
+  getTaskOutputPath,
+  persistTaskOutputFile
+} from '../../utils/task/diskOutput.js';
 import { TaskOutput } from '../../utils/task/TaskOutput.js';
 import { isOutputLineTruncated } from '../../utils/outputLineTruncation.js';
 import { buildLargeToolResultMessage, ensureToolResultsDir, generatePreview, getToolResultPath, PREVIEW_SIZE_BYTES } from '../../utils/toolResultStorage.js';
@@ -287,6 +290,7 @@ const outputSchema = lazySchema(() => z.object({
   backgroundedByUser: z.boolean().optional().describe('True if the user manually backgrounded the command with Ctrl+B'),
   assistantAutoBackgrounded: z.boolean().optional().describe('True if assistant-mode auto-backgrounded a long-running blocking command'),
   dangerouslyDisableSandbox: z.boolean().optional().describe('Flag to indicate if sandbox mode was overridden'),
+  sandboxBackend: z.string().optional().describe('Identifier of the sandbox backend that isolated this command; absent when the command ran without sandbox isolation'),
   returnCodeInterpretation: z.string().optional().describe('Semantic interpretation for non-error exit codes with special meaning'),
   noOutputExpected: z.boolean().optional().describe('Whether the command is expected to produce no output on success'),
   structuredContent: z.array(z.any()).optional().describe('Structured content blocks'),
@@ -523,6 +527,17 @@ export const BashTool = buildTool({
     return `Running ${desc}`;
   },
   async validateInput(input: BashToolInput): Promise<ValidationResult> {
+    // W-SANDBOX-ENFORCED-DEADCODE PR-0：严格沙箱档（sandbox.enabled=true 且
+    // allowUnsandboxedCommands=false）+ 执行后端未接线 ⇒ 确定性拒绝。
+    // 这条排在最前面：策略上不允许跑的命令，不必再去谈它别的毛病。
+    const strictSandboxRefusal = strictSandboxRefusalOrNull();
+    if (strictSandboxRefusal !== null) {
+      return {
+        result: false,
+        message: strictSandboxRefusal,
+        errorCode: 11
+      };
+    }
     if (feature('MONITOR_TOOL') && !isBackgroundTasksDisabled && !input.run_in_background) {
       const sleepPattern = detectBlockedSleepPattern(input.command);
       if (sleepPattern !== null) {
@@ -626,6 +641,19 @@ export const BashTool = buildTool({
     };
   },
   async call(input: BashToolInput, toolUseContext, _canUseTool?: CanUseToolFn, parentMessage?: AssistantMessage, onProgress?: ToolCallProgress<BashProgress>) {
+    // Load-bearing guard: promptShellExecution.ts calls BashTool.call() directly,
+    // bypassing validateInput (its file header states any load-bearing check must
+    // live in call() itself). This is the check that covers ALL callers — the
+    // validateInput copy only buys a clean tool-runner error for the model path.
+    // Same shape as PowerShellTool.call()'s isWindowsSandboxPolicyViolation guard.
+    //
+    // First statement in the body on purpose: the strict-mode refusal says this
+    // command may not run at all, so it outranks even the simulated-sed shortcut
+    // (that branch still writes to the user's disk).
+    const strictSandboxRefusal = strictSandboxRefusalOrNull();
+    if (strictSandboxRefusal !== null) {
+      throw new Error(strictSandboxRefusal);
+    }
     // Handle simulated sed edit - apply directly instead of running sed
     // This ensures what the user previewed is exactly what gets written
     if (input._simulatedSedEdit) {
@@ -643,6 +671,10 @@ export const BashTool = buildTool({
     let progressCounter = 0;
     let wasInterrupted = false;
     let result: ExecResult;
+    // 这条命令到底有没有被隔离。在 try 外声明，因为它有两个消费者：try 内的
+    // 违规注解判据，以及 try 后组装 tool result meta 的 `sandboxBackend`
+    // （SoT §3 关联方 #21/#22）。赋值点只有一个（见下方 annotate 处的注释）。
+    let ranInSandbox = false;
     const isMainThread = !toolUseContext.agentId;
     const preventCwdChanges = !isMainThread;
     try {
@@ -710,8 +742,21 @@ export const BashTool = buildTool({
         }
       }
 
-      // Annotate output with sandbox violations if any (stderr is in stdout)
-      const outputWithSbFailures = SandboxManager.annotateStderrWithSandboxFailures(input.command, result.stdout || '');
+      // Annotate output with sandbox violations if any (stderr is in stdout).
+      //
+      // W-SANDBOX-ENFORCED-DEADCODE PR-4：第三个参数是承重的。判据表里的
+      // `Permission denied` / `Operation not permitted` 在没有沙箱的机器上同样
+      // 天天出现，annotate 只在**这条命令确实经 helper 跑过**时才允许把它们
+      // 定性成隔离拒绝；不传就当没跑在沙箱里（默认 false，凭空造证据比不注解
+      // 糟得多）。
+      //
+      // 这里重算 `shouldUseSandbox(input)`，但绝不根据退出码或 stderr 标记修改
+      // 会话状态：两者都可由不可信命令伪造。helper 初始化失败时命令未运行，
+      // 下面最多会对诊断文本做保守注解，不会触发无沙箱重跑或策略降级。
+      ranInSandbox = shouldUseSandbox(input);
+      const outputWithSbFailures = SandboxManager.annotateStderrWithSandboxFailures(input.command, result.stdout || '', {
+        sandboxed: ranInSandbox
+      });
       if (result.preSpawnError) {
         throw new Error(result.preSpawnError);
       }
@@ -738,18 +783,13 @@ export const BashTool = buildTool({
     let persistedOutputSize: number | undefined;
     if (result.outputFilePath && result.outputTaskId) {
       try {
-        const fileStat = await fsStat(result.outputFilePath);
-        persistedOutputSize = fileStat.size;
         await ensureToolResultsDir();
         const dest = getToolResultPath(result.outputTaskId, false);
-        if (fileStat.size > MAX_PERSISTED_SIZE) {
-          await fsTruncate(result.outputFilePath, MAX_PERSISTED_SIZE);
-        }
-        try {
-          await link(result.outputFilePath, dest);
-        } catch {
-          await copyFile(result.outputFilePath, dest);
-        }
+        persistedOutputSize = await persistTaskOutputFile(
+          result.outputTaskId,
+          dest,
+          MAX_PERSISTED_SIZE
+        );
         persistedOutputPath = dest;
       } catch {
         // File may already be gone — stdout preview is sufficient
@@ -793,7 +833,11 @@ export const BashTool = buildTool({
     // before we build the output Out object.
     let compressedStdout = strippedStdout;
     if (isImage) {
-      const resized = await resizeShellImageOutput(strippedStdout, result.outputFilePath, persistedOutputSize);
+      const resized = await resizeShellImageOutput(
+        strippedStdout,
+        persistedOutputPath,
+        persistedOutputSize
+      );
       if (resized) {
         compressedStdout = resized;
       } else {
@@ -815,6 +859,10 @@ export const BashTool = buildTool({
       backgroundedByUser: result.backgroundedByUser,
       assistantAutoBackgrounded: result.assistantAutoBackgrounded,
       dangerouslyDisableSandbox: 'dangerouslyDisableSandbox' in input ? input.dangerouslyDisableSandbox as boolean | undefined : undefined,
+      // PR-4：命令真被隔离时才带后端名，否则**缺字段**。写 'none' 之类的占位
+      // 会让消费者分不清「没被隔离」和「隔离了但叫不出名字」——后者是 bug，
+      // 前者是常态。
+      sandboxBackend: ranInSandbox ? SandboxManager.getSandboxBackend() : undefined,
       persistedOutputPath,
       persistedOutputSize
     };

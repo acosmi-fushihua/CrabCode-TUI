@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,10 +12,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/acosmi/OAuthAPI-LLM/internal/auth/autherrors"
 	"github.com/acosmi/OAuthAPI-LLM/internal/config"
 	"github.com/acosmi/OAuthAPI-LLM/internal/util"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
+)
+
+// V3 (2026-08-08 账户接入审计 §12.3): transient exchange failures get at most
+// 2 extra attempts with exponential backoff (2s then 4s, 6s total — under the
+// 10s budget). Values are pinned by TestPollForTokenRetriesTransientFailures.
+const (
+	transientExchangeRetryLimit = 2
+	transientExchangeRetryBase  = 2 * time.Second
 )
 
 // XAIAuth performs xAI OAuth discovery, device-code login, and refresh.
@@ -229,13 +239,14 @@ func (a *XAIAuth) PollForToken(ctx context.Context, deviceCode *DeviceCodeRespon
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
+	transientRetries := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("xai device code: context cancelled: %w", ctx.Err())
 		case <-timer.C:
 			if !firstAttempt && time.Now().After(deadline) {
-				return nil, fmt.Errorf("xai device code expired")
+				return nil, autherrors.Classify(autherrors.ErrAuthorizationTimeout, fmt.Errorf("xai device code expired"))
 			}
 			firstAttempt = false
 
@@ -244,8 +255,20 @@ func (a *XAIAuth) PollForToken(ctx context.Context, deviceCode *DeviceCodeRespon
 				return token, nil
 			}
 			if !shouldContinue {
+				// V3 (2026-08-08 账户接入审计 §12.3): only transient exchange
+				// failures (transport / read / parse / 5xx — all classified
+				// ErrUpstreamUnavailable) get a bounded retry: ≤2 attempts,
+				// exponential 2s→4s, 6s total. Deterministic failures
+				// (denied / expired / oauth error / missing token) terminate
+				// immediately — #16 终态签名原则.
+				if errors.Is(pollErr, autherrors.ErrUpstreamUnavailable) && transientRetries < transientExchangeRetryLimit {
+					transientRetries++
+					timer.Reset(transientExchangeRetryBase << (transientRetries - 1))
+					continue
+				}
 				return nil, pollErr
 			}
+			transientRetries = 0
 			interval = nextInterval
 			timer.Reset(interval)
 		}
@@ -270,7 +293,7 @@ func (a *XAIAuth) exchangeDeviceCode(ctx context.Context, tokenEndpoint, deviceC
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("xai device token request failed: %w", err), interval, false
+		return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("xai device token request failed: %w", err)), interval, false
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -280,7 +303,7 @@ func (a *XAIAuth) exchangeDeviceCode(ctx context.Context, tokenEndpoint, deviceC
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("xai device token: read response: %w", err), interval, false
+		return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("xai device token: read response: %w", err)), interval, false
 	}
 
 	var payload struct {
@@ -293,7 +316,7 @@ func (a *XAIAuth) exchangeDeviceCode(ctx context.Context, tokenEndpoint, deviceC
 		ExpiresIn        int    `json:"expires_in"`
 	}
 	if err = json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("xai device token: parse response: %w", err), interval, false
+		return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("xai device token: parse response: %w", err)), interval, false
 	}
 
 	if payload.Error != "" {
@@ -304,9 +327,9 @@ func (a *XAIAuth) exchangeDeviceCode(ctx context.Context, tokenEndpoint, deviceC
 			nextInterval := interval + defaultPollInterval
 			return nil, nil, nextInterval, true
 		case "expired_token":
-			return nil, fmt.Errorf("xai device code expired"), interval, false
+			return nil, autherrors.Classify(autherrors.ErrAuthorizationTimeout, fmt.Errorf("xai device code expired")), interval, false
 		case "access_denied":
-			return nil, fmt.Errorf("xai device authorization denied"), interval, false
+			return nil, autherrors.Classify(autherrors.ErrAuthorizationDenied, fmt.Errorf("xai device authorization denied")), interval, false
 		default:
 			desc := strings.TrimSpace(payload.ErrorDescription)
 			if desc != "" {
@@ -317,10 +340,14 @@ func (a *XAIAuth) exchangeDeviceCode(ctx context.Context, tokenEndpoint, deviceC
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("xai device token request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))), interval, false
+		statusErr := fmt.Errorf("xai device token request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		if resp.StatusCode >= http.StatusInternalServerError {
+			return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, statusErr), interval, false
+		}
+		return nil, statusErr, interval, false
 	}
 	if strings.TrimSpace(payload.AccessToken) == "" {
-		return nil, fmt.Errorf("xai device token response missing access_token"), interval, false
+		return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("xai device token response missing access_token")), interval, false
 	}
 
 	email, subject := parseJWTIdentity(payload.IDToken)

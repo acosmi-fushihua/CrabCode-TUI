@@ -1,0 +1,23 @@
+{
+  "$comment": "Component-local login contract consumed by the Go sidecar tests and direct TUI runtime tests.",
+  "pollErrorCodes": [
+    "authorization_denied",
+    "login_timeout",
+    "upstream_unavailable",
+    "token_exchange_failed",
+    "provisioning_failed",
+    "credential_save_failed",
+    "state_mismatch",
+    "login_failed"
+  ],
+  "pollReservedCodes": ["login_account_association_unavailable"],
+  "connectors": [
+    { "connectorId": "openai", "flow": "browser" },
+    { "connectorId": "anthropic", "flow": "browser" },
+    { "connectorId": "google", "flow": "browser" },
+    { "connectorId": "xai", "flow": "device", "userCode": "optional", "expiresInFallbackSecs": 1800 },
+    { "connectorId": "qwen", "flow": "device", "userCode": "optional", "expiresInFallbackSecs": 600 },
+    { "connectorId": "kimi", "flow": "device", "userCode": "optional", "expiresInFallbackSecs": 600 },
+    { "connectorId": "zai", "flow": "device", "userCode": "absent", "expiresInFallbackSecs": 600 }
+  ]
+}

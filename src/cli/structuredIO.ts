@@ -95,7 +95,6 @@ function serializeDecisionReason(
       return undefined
     case 'hook':
     case 'asyncAgent':
-    case 'sandboxOverride':
     case 'workingDir':
     case 'safetyCheck':
     case 'other':

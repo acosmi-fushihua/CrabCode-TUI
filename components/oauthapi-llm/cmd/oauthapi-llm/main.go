@@ -168,7 +168,16 @@ func main() {
 
 	bootstrap, errBootstrap := readAccountBridgeBootstrapFD(accountBridgeBootstrapDescriptor(), AccountBridgeEligibilityPublicKeyBase64URL)
 	if errBootstrap != nil {
-		log.Error("Account Bridge bootstrap rejected")
+		// The reason MUST travel with the exit. Discarding it collapsed eight
+		// distinct pre-readiness failures into one indistinguishable string,
+		// and the host could only report `runtime-exited-before-ready` — the
+		// single fact that made this component un-diagnosable from outside for
+		// seven consecutive repair rounds. Every reason produced here is a
+		// fixed phrase built from short, space-separated words: non-sensitive
+		// by construction, and it survives the host's forensics redactor
+		// verbatim (it keeps the "Account Bridge " prefix and contains no
+		// 20-character opaque run).
+		log.Errorf("Account Bridge bootstrap rejected: %v", errBootstrap)
 		os.Exit(1)
 		return
 	}

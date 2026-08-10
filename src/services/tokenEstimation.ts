@@ -1,5 +1,6 @@
 import type { Acosmi, BetaMessageParam as MessageParam } from '../types/api-types.js'
 import type { Attachment } from '../utils/attachments.js'
+import { createCombinedAbortSignal } from '../utils/combinedAbortSignal.js'
 import { logError } from '../utils/log.js'
 import { normalizeAttachmentForAPI } from '../utils/messages.js'
 import {
@@ -17,6 +18,20 @@ import { withTokenCountVCR } from './vcr.js'
 // API constraint: max_tokens must be greater than thinking.budget_tokens
 const TOKEN_COUNT_THINKING_BUDGET = 1024
 const TOKEN_COUNT_MAX_TOKENS = 2048
+
+/**
+ * token 估算调用的墙钟上限 (2026-08-06)。
+ *
+ * 这两处调用此前不传 signal, 于是沿用 SDK 内层 doJSONFullRaw 的 30s 隐式默认值。
+ * sdk-ts 2.16.0 把 chat 链路的真实预算修成了 11min —— 对主对话是必需的修复, 但对
+ * "数一下 token" 这种辅助调用是**失败延迟从 30s 涨到 11min** 的回归: 调用方在等它,
+ * 而它本来就该几秒内返回。
+ *
+ * 所以这里显式声明自己的预算, 不再隐式继承别人的默认值 —— 隐式继承正是本次事故的
+ * 形态。数值取 60s: 比原先的 30s 宽裕 (超大上下文的 estimation 确实可能慢), 又远
+ * 小于主链路的 11min。
+ */
+const TOKEN_COUNT_REQUEST_TIMEOUT_MS = 60_000
 
 /**
  * Check if messages contain thinking blocks
@@ -146,14 +161,27 @@ export async function countMessagesTokensWithAPI(
         ? messages
         : [{ role: 'user' as const, content: 'foo' }]
 
-      const resp = await chatComplete(normalizeModelStringForAPI(model), {
-        rawMessages: messagesToSend,
-        tools: tools.length > 0 ? (tools as unknown) : undefined,
-        max_tokens: containsThinking ? TOKEN_COUNT_MAX_TOKENS : 1,
-        thinking: containsThinking
-          ? { type: 'enabled', budget_tokens: TOKEN_COUNT_THINKING_BUDGET }
-          : undefined,
+      // 显式预算, 不隐式继承 SDK 的 chat 级 11min (见 TOKEN_COUNT_REQUEST_TIMEOUT_MS)。
+      const budget = createCombinedAbortSignal(undefined, {
+        timeoutMs: TOKEN_COUNT_REQUEST_TIMEOUT_MS,
       })
+      let resp
+      try {
+        resp = await chatComplete(
+          normalizeModelStringForAPI(model),
+          {
+            rawMessages: messagesToSend,
+            tools: tools.length > 0 ? (tools as unknown) : undefined,
+            max_tokens: containsThinking ? TOKEN_COUNT_MAX_TOKENS : 1,
+            thinking: containsThinking
+              ? { type: 'enabled', budget_tokens: TOKEN_COUNT_THINKING_BUDGET }
+              : undefined,
+          },
+          budget.signal,
+        )
+      } finally {
+        budget.cleanup()
+      }
 
       const inputTokens = resp.usage?.input_tokens
       if (typeof inputTokens !== 'number') {
@@ -243,14 +271,27 @@ export async function countTokensViaFastModeFallback(
 
   // SDK 直调 token estimation
   const { chatComplete } = await import('./acosmi/client.js')
-  const resp = await chatComplete(normalizeModelStringForAPI(model), {
-    rawMessages: messagesToSend,
-    tools: tools.length > 0 ? (tools as unknown) : undefined,
-    max_tokens: containsThinking ? TOKEN_COUNT_MAX_TOKENS : 1,
-    thinking: containsThinking
-      ? { type: 'enabled', budget_tokens: TOKEN_COUNT_THINKING_BUDGET }
-      : undefined,
+  // 显式预算, 同上 —— 隐式继承别人的默认值正是本次事故的形态。
+  const budget = createCombinedAbortSignal(undefined, {
+    timeoutMs: TOKEN_COUNT_REQUEST_TIMEOUT_MS,
   })
+  let resp
+  try {
+    resp = await chatComplete(
+      normalizeModelStringForAPI(model),
+      {
+        rawMessages: messagesToSend,
+        tools: tools.length > 0 ? (tools as unknown) : undefined,
+        max_tokens: containsThinking ? TOKEN_COUNT_MAX_TOKENS : 1,
+        thinking: containsThinking
+          ? { type: 'enabled', budget_tokens: TOKEN_COUNT_THINKING_BUDGET }
+          : undefined,
+      },
+      budget.signal,
+    )
+  } finally {
+    budget.cleanup()
+  }
   const u = resp.usage
   return (u?.input_tokens ?? 0) +
     (u?.cache_creation_input_tokens ?? 0) +

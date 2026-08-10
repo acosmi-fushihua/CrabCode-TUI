@@ -9,8 +9,6 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
-  ACCOUNT_BRIDGE_PUBLIC_METHODS,
-  ACCOUNT_BRIDGE_TURN_ACCESS_METHOD,
   _setAccountBridgeManagerForTest,
   AccountBridgeError,
   AccountBridgeManager,
@@ -30,6 +28,7 @@ import {
   type AccountBridgeEligibilityConsent,
   type AccountBridgeLocalDiagnosticBundle,
   type AccountBridgeManagerDeps,
+  type AccountBridgeSidecarForensics,
   type AccountBridgeSpawnInput,
   type SignedEligibilityGrant,
 } from "../../src/services/accountBridge/runtimeManager.js";
@@ -89,6 +88,18 @@ function deferred<T>(): Deferred<T> {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+function emptySidecarForensics(): AccountBridgeSidecarForensics {
+  return {
+    exitCode: null,
+    exitSignal: null,
+    spawnErrorCode: null,
+    bannerLine: null,
+    logLines: [],
+    droppedLineCount: 0,
+    readyLineRejected: false,
+  };
 }
 
 function signedGrant(input: {
@@ -326,6 +337,7 @@ function fakeManagerDeps(options: {
   configs: Array<{ managementKey: string; inferenceKey: string }>;
   diagnosticBundles: AccountBridgeLocalDiagnosticBundle[];
   httpURLs: string[];
+  removedRuntimeDirs: string[];
   stopCalls: { terminate: number; kill: number; released: number };
 } {
   const eligibilitySigner = generateKeyPairSync("ed25519");
@@ -352,6 +364,7 @@ function fakeManagerDeps(options: {
   const configs: Array<{ managementKey: string; inferenceKey: string }> = [];
   const diagnosticBundles: AccountBridgeLocalDiagnosticBundle[] = [];
   const httpURLs: string[] = [];
+  const removedRuntimeDirs: string[] = [];
   let randomCall = 0;
   const generation = options.generation ?? "v1";
   const directoryGeneration = options.directoryGeneration ?? generation;
@@ -428,8 +441,9 @@ function fakeManagerDeps(options: {
       configs.push(input);
       return { configPath: "/private/config.json", runtimeDir: "/private/runtime" };
     },
-    removeConfigFile: async () => {},
-    removeRuntimeFiles: async () => {},
+    removeRuntimeFiles: async runtimeDir => {
+      removedRuntimeDirs.push(runtimeDir);
+    },
     spawnSidecar: async input => {
       spawns.push(input);
       bootstrapCopies.push(Buffer.from(input.bootstrap));
@@ -445,6 +459,7 @@ function fakeManagerDeps(options: {
           stopCalls.kill += 1;
           exit.resolve(null);
         },
+        forensics: emptySidecarForensics,
       };
       exits.push(exit);
       children.push(child);
@@ -497,6 +512,7 @@ function fakeManagerDeps(options: {
     configs,
     diagnosticBundles,
     httpURLs,
+    removedRuntimeDirs,
     stopCalls,
   };
 }
@@ -860,6 +876,62 @@ describe("Account Bridge lifecycle", () => {
     });
   });
 
+  test("a package without the bridge artifact is blocked without spawning", async () => {
+    const fixture = fakeManagerDeps();
+    fixture.deps.resolveAndVerifyArtifact = async () => {
+      throw new AccountBridgeError("artifact-missing");
+    };
+    const manager = new AccountBridgeManager(fixture.deps);
+    await expect(manager.ensure()).rejects.toMatchObject({
+      code: "artifact-missing",
+    });
+    expect(manager.status()).toMatchObject({
+      state: "blocked",
+      lastErrorCode: "artifact-missing",
+    });
+    expect(fixture.spawns).toHaveLength(0);
+  });
+
+  test("start-failure forensics keep only the latest five sidecars", async () => {
+    const fixture = fakeManagerDeps();
+    let attempt = 0;
+    fixture.deps.spawnSidecar = async input => {
+      fixture.spawns.push(input);
+      attempt += 1;
+      const exitCode = attempt;
+      return {
+        pid: 5000 + exitCode,
+        endpoint: Promise.reject(
+          new AccountBridgeError("runtime-exited-before-ready"),
+        ),
+        exited: Promise.resolve(exitCode),
+        terminate() {},
+        kill() {},
+        forensics: () => ({
+          ...emptySidecarForensics(),
+          exitCode,
+        }),
+      };
+    };
+    const manager = new AccountBridgeManager(fixture.deps);
+    for (let index = 0; index < 6; index += 1) {
+      await expect(manager.ensure()).rejects.toMatchObject({
+        code: "runtime-exited-before-ready",
+      });
+    }
+    await manager.refreshLocalDiagnostics();
+    const bundle = fixture.diagnosticBundles.at(-1)!;
+    expect(bundle.sidecarProcess?.exitCode).toBe(6);
+    expect(
+      bundle.sidecarProcessHistory.map(record => record.forensics?.exitCode),
+    ).toEqual([2, 3, 4, 5, 6]);
+    expect(
+      bundle.sidecarProcessHistory.every(
+        record => record.readyDurationMs === null,
+      ),
+    ).toBeTrue();
+  });
+
   test("uses private bootstrap, random per-run keys, clean env, and force-kill stop", async () => {
     const fixture = fakeManagerDeps();
     const manager = new AccountBridgeManager(fixture.deps);
@@ -910,12 +982,14 @@ describe("Account Bridge lifecycle", () => {
     ]);
     expect(JSON.stringify(status)).not.toContain(fixture.configs[0]!.managementKey);
     expect(JSON.stringify(status)).not.toContain(fixture.configs[0]!.inferenceKey);
+    expect(fixture.removedRuntimeDirs).toEqual([]);
 
     const stopped = await manager.stop();
     expect(stopped.state).toBe("stopped");
     expect(fixture.stopCalls.terminate).toBe(1);
     expect(fixture.stopCalls.kill).toBe(1);
     expect(fixture.stopCalls.released).toBe(1);
+    expect(fixture.removedRuntimeDirs).toEqual(["/private/runtime"]);
   });
 
   test("process shutdown removes network subscription and awaits the killed child exit witness", async () => {
@@ -937,6 +1011,7 @@ describe("Account Bridge lifecycle", () => {
         kill() {
           fixture.stopCalls.kill += 1;
         },
+        forensics: emptySidecarForensics,
       };
     };
 
@@ -2429,7 +2504,119 @@ describe("Account Bridge fail-closed master key storage", () => {
   });
 });
 
+describe("Account Bridge login lifetime", () => {
+  const zaiConnector = {
+    connectorId: "zai",
+    displayName: "Z Code",
+    authMode: "device-code" as const,
+    enabled: true,
+    disabledReasonCode: null,
+    termsStatus: "signed-off" as const,
+  };
+
+  test("Z.AI device-link login accepts a missing user_code", async () => {
+    const fixture = fakeManagerDeps();
+    const originalHTTP = fixture.deps.http;
+    fixture.deps.http = async input => {
+      if (input.url.includes("/connectors")) {
+        return { connectors: [zaiConnector] };
+      }
+      if (input.url.includes("/login/start")) {
+        return {
+          status: "ok",
+          url: "https://zcode.z.ai/authorize/abc",
+          state: "zai-session-1",
+          flow: "device",
+          expires_in: 600,
+        };
+      }
+      return originalHTTP(input);
+    };
+    const manager = new AccountBridgeManager(fixture.deps);
+    await manager.ensure();
+    await expect(manager.loginStart("zai")).resolves.toEqual({
+      sessionId: "zai-session-1",
+      authMode: "device-code",
+      authorizationUrl: null,
+      userCode: null,
+      verificationUrl: "https://zcode.z.ai/authorize/abc",
+      expiresAt: new Date(NOW + 600_000).toISOString(),
+    });
+    await manager.stop();
+  });
+
+  test("a present device user_code still receives strict validation", async () => {
+    const fixture = fakeManagerDeps();
+    const originalHTTP = fixture.deps.http;
+    fixture.deps.http = async input => {
+      if (input.url.includes("/connectors")) {
+        return { connectors: [zaiConnector] };
+      }
+      if (input.url.includes("/login/start")) {
+        return {
+          status: "ok",
+          url: "https://zcode.z.ai/authorize/abc",
+          state: "zai-session-2",
+          flow: "device",
+          expires_in: 600,
+          user_code: "",
+        };
+      }
+      return originalHTTP(input);
+    };
+    const manager = new AccountBridgeManager(fixture.deps);
+    await manager.ensure();
+    await expect(manager.loginStart("zai")).rejects.toMatchObject({
+      code: "login-start-response-invalid",
+    });
+    await manager.stop();
+  });
+
+  test("an untracked poll is terminal without calling the current sidecar", async () => {
+    const fixture = fakeManagerDeps();
+    const manager = new AccountBridgeManager(fixture.deps);
+    await manager.ensure();
+    const callsBefore = fixture.httpURLs.length;
+    await expect(manager.loginPoll("untracked-session")).resolves.toEqual({
+      state: "session-lost",
+      accountId: null,
+      errorCode: null,
+    });
+    expect(fixture.httpURLs).toHaveLength(callsBefore);
+    await expect(manager.loginCancel("untracked-session")).resolves.toEqual({
+      cancelled: true,
+    });
+    expect(fixture.httpURLs).toHaveLength(callsBefore);
+    await manager.stop();
+  });
+});
+
 describe("Account Bridge supply chain", () => {
+  test("missing packaged paths retain the artifact-missing code", async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), "ab-artifact-missing-"));
+    try {
+      const binDir = join(root, "bin");
+      await fs.mkdir(binDir);
+      const binaryName =
+        process.platform === "win32" ? "oauthapi-llm.exe" : "oauthapi-llm";
+      await expect(
+        verifyPackagedArtifact({
+          binaryPath: join(binDir, binaryName),
+          metadataDir: join(binDir, "account-bridge"),
+          expectedComponentVersion: "1.0.13-account-bridge.1",
+          expectedProtocolVersion: 1,
+          expectedPlatform: "arm64-darwin",
+          artifactPublicKeyBase64URL: Buffer.alloc(32, 1).toString("base64url"),
+          eligibilityPublicKeyBase64URL: Buffer.alloc(32, 2).toString(
+            "base64url",
+          ),
+        }),
+      ).rejects.toMatchObject({ code: "artifact-missing" });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("requires packaged binary, lock/provenance SHA, component and protocol", async () => {
     const root = await fs.mkdtemp(join(process.env.TMPDIR ?? "/tmp", "ab-artifact-"));
     const binDir = join(root, "bin");
@@ -2442,6 +2629,8 @@ describe("Account Bridge supply chain", () => {
     });
     const artifactPublicKeyBytes = artifactSpki.subarray(artifactSpki.length - 32);
     const artifactPublicKey = artifactPublicKeyBytes.toString("base64url");
+    const eligibilityPublicKeyBytes = Buffer.alloc(32, 0x25);
+    const eligibilityPublicKey = eligibilityPublicKeyBytes.toString("base64url");
     const provenanceKeySha256 = createHash("sha256")
       .update(artifactPublicKeyBytes)
       .digest("hex");
@@ -2770,7 +2959,14 @@ describe("Account Bridge supply chain", () => {
       runtimeHelpers,
       platformSignature,
       signatureEvidenceSha256: "",
-      build: { cgoEnabled: false, trimpath: true, buildvcs: false },
+      build: {
+        cgoEnabled: false,
+        trimpath: true,
+        buildvcs: false,
+        eligibilityTrustRootSha256: createHash("sha256")
+          .update(eligibilityPublicKeyBytes)
+          .digest("hex"),
+      },
     };
     const signatureEvidence = Buffer.from(
       JSON.stringify({
@@ -2806,6 +3002,7 @@ describe("Account Bridge supply chain", () => {
       expectedProtocolVersion: 1,
       expectedPlatform: "arm64-darwin",
       artifactPublicKeyBase64URL: artifactPublicKey,
+      eligibilityPublicKeyBase64URL: eligibilityPublicKey,
     });
     expect(verified).toMatchObject({
       componentVersion: "1.0.13-account-bridge.1",
@@ -2819,6 +3016,20 @@ describe("Account Bridge supply chain", () => {
       ],
     });
 
+    await expect(
+      verifyPackagedArtifact({
+        binaryPath,
+        metadataDir,
+        expectedComponentVersion: "1.0.13-account-bridge.1",
+        expectedProtocolVersion: 1,
+        expectedPlatform: "arm64-darwin",
+        artifactPublicKeyBase64URL: artifactPublicKey,
+        eligibilityPublicKeyBase64URL: Buffer.alloc(32, 0x26).toString(
+          "base64url",
+        ),
+      }),
+    ).rejects.toMatchObject({ code: "provenance-invalid" });
+
     await fs.writeFile(pluginPath, "tampered plugin");
     await expect(
       verifyPackagedArtifact({
@@ -2828,6 +3039,7 @@ describe("Account Bridge supply chain", () => {
         expectedProtocolVersion: 1,
         expectedPlatform: "arm64-darwin",
         artifactPublicKeyBase64URL: artifactPublicKey,
+        eligibilityPublicKeyBase64URL: eligibilityPublicKey,
       }),
     ).rejects.toMatchObject({ code: "platform-signature-evidence-invalid" });
     await fs.writeFile(pluginPath, plugin);
@@ -2841,6 +3053,7 @@ describe("Account Bridge supply chain", () => {
         expectedProtocolVersion: 1,
         expectedPlatform: "arm64-darwin",
         artifactPublicKeyBase64URL: artifactPublicKey,
+        eligibilityPublicKeyBase64URL: eligibilityPublicKey,
       }),
     ).rejects.toMatchObject({ code: "platform-signature-evidence-invalid" });
     await fs.writeFile(helperPath, helper);
@@ -2876,6 +3089,7 @@ describe("Account Bridge supply chain", () => {
         expectedProtocolVersion: 1,
         expectedPlatform: "arm64-darwin",
         artifactPublicKeyBase64URL: artifactPublicKey,
+        eligibilityPublicKeyBase64URL: eligibilityPublicKey,
       }),
     ).rejects.toMatchObject({ code: "provenance-invalid" });
     await fs.writeFile(join(metadataDir, "signature.json"), signatureEvidence);
@@ -2893,6 +3107,7 @@ describe("Account Bridge supply chain", () => {
         expectedProtocolVersion: 1,
         expectedPlatform: "arm64-darwin",
         artifactPublicKeyBase64URL: artifactPublicKey,
+        eligibilityPublicKeyBase64URL: eligibilityPublicKey,
       }),
     ).rejects.toMatchObject({ code: "provenance-invalid" });
 
@@ -2907,6 +3122,7 @@ describe("Account Bridge supply chain", () => {
         expectedProtocolVersion: 1,
         expectedPlatform: "arm64-darwin",
         artifactPublicKeyBase64URL: artifactPublicKey,
+        eligibilityPublicKeyBase64URL: eligibilityPublicKey,
       }),
     ).rejects.toMatchObject({ code: "provenance-invalid" });
     await fs.rm(root, { recursive: true, force: true });
@@ -3000,24 +3216,7 @@ describe("Account Bridge supply chain", () => {
 });
 
 describe("Account Bridge direct-runtime and default-model parity", () => {
-  test("classifies the AppServer registry case as removed without changing its frozen backend identifiers", () => {
-    expect(ACCOUNT_BRIDGE_PUBLIC_METHODS).toEqual([
-      "worker.accountBridge/eligibility/read",
-      "worker.accountBridge/connector/list",
-      "worker.accountBridge/runtime/status",
-      "worker.accountBridge/runtime/ensure",
-      "worker.accountBridge/runtime/stop",
-      "worker.accountBridge/account/list",
-      "worker.accountBridge/login/start",
-      "worker.accountBridge/login/poll",
-      "worker.accountBridge/login/cancel",
-      "worker.accountBridge/account/remove",
-      "worker.accountBridge/model/list",
-      "worker.accountBridge/usage/read",
-    ]);
-    expect(ACCOUNT_BRIDGE_TURN_ACCESS_METHOD).toBe(
-      "worker.internal/accountBridge/turnAccess",
-    );
+  test("exposes direct turn access without a host-method registry", () => {
     expect(acquireDirectAccountBridgeTurnAccess).toBeFunction();
   });
 

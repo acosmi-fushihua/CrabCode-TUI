@@ -107,11 +107,39 @@ const NETWORK_SYSCALLS: &[&str] = &[
     "getpeername",
 ];
 
+/// 嵌套沙箱（容器 / 再套一层沙箱）所需的命名空间 syscall。
+///
+/// 默认在 [`DANGEROUS_SYSCALLS`] 里被拒——它们正是「从沙箱里再造一个沙箱然后
+/// 逃出去」的原语。用户显式打开 `sandbox.enableWeakerNestedSandbox` 时按名放行
+/// 这三个，**且仅这三个**：`mount` / `pivot_root` / `umount2` 不在其中，因为
+/// 挂载操作能直接改写沙箱看到的文件系统视图，那是另一个量级的放宽。
+const NESTED_SANDBOX_SYSCALLS: &[&str] = &["unshare", "setns", "clone3"];
+
+/// 用户显式要求的放宽。默认全 false ⇒ 与放宽前逐字同构。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SeccompRelaxations {
+    /// `weaker.nestedSandbox`：放行 [`NESTED_SANDBOX_SYSCALLS`]。
+    pub nested_sandbox: bool,
+    /// `network.allowAllUnixSockets`：`Restricted` 档下不再拦 AF_UNIX。
+    pub all_unix_sockets: bool,
+}
+
 /// Apply a seccomp-BPF filter based on the sandbox configuration.
 ///
 /// Must be called after Landlock (seccomp is more restrictive and harder to debug).
 /// The filter is irrevocable and inherited by exec'd processes.
 pub fn apply_seccomp_filter(config: &SandboxConfig) -> Result<(), SandboxError> {
+    apply_seccomp_filter_with_relaxations(config, SeccompRelaxations::default())
+}
+
+/// [`apply_seccomp_filter`] + 用户显式要求的放宽（W-SANDBOX-ENFORCED-DEADCODE PR-2）。
+///
+/// 放宽项**必须显式传**：默认值在这里不是中性的，漏传一个 `false` 与漏传一个
+/// `true` 的后果完全不对称（前者只是功能受限，后者是隔离被悄悄拆掉）。
+pub fn apply_seccomp_filter_with_relaxations(
+    config: &SandboxConfig,
+    relax: SeccompRelaxations,
+) -> Result<(), SandboxError> {
     let network_policy = config.effective_network_policy();
 
     // Default action: Allow — we deny specific dangerous operations
@@ -120,6 +148,13 @@ pub fn apply_seccomp_filter(config: &SandboxConfig) -> Result<(), SandboxError> 
 
     // ── Always-blocked dangerous syscalls ──────────────────────────────────
     for name in DANGEROUS_SYSCALLS {
+        if relax.nested_sandbox && NESTED_SANDBOX_SYSCALLS.contains(name) {
+            debug!(
+                syscall = name,
+                "seccomp: allowed by enableWeakerNestedSandbox"
+            );
+            continue;
+        }
         if let Ok(syscall) = ScmpSyscall::from_name(name) {
             filter
                 .add_rule(ScmpAction::Errno(libc::EPERM), syscall)
@@ -149,25 +184,34 @@ pub fn apply_seccomp_filter(config: &SandboxConfig) -> Result<(), SandboxError> 
             // socket(domain, type, protocol):
             //   Block if domain == AF_UNIX (1)
             //   Block if domain == AF_LOCAL (1, alias for AF_UNIX)
-            if let Ok(socket_sc) = ScmpSyscall::from_name("socket") {
-                filter
-                    .add_rule_conditional(
-                        ScmpAction::Errno(libc::EPERM),
-                        socket_sc,
-                        &[ScmpArgCompare::new(
-                            0,
-                            ScmpCompareOp::Equal,
-                            libc::AF_UNIX as u64,
-                        )],
-                    )
-                    .map_err(|e| seccomp_err("block socket(AF_UNIX)", e))?;
-            }
+            //
+            // `network.allowAllUnixSockets` 打开时整块跳过：用户显式声明沙箱内
+            // 需要 Unix 域套接字（docker.sock / 本地服务）。**按路径的
+            // `allowUnixSockets` 白名单在这一层表达不了** —— seccomp 的 BPF
+            // 读不到 `connect()` 第二参指向的 `sockaddr_un`，拿不到路径。
+            // 这条差异由 `platform::apply_exec_plan_to_self` 如实报出，方向是
+            // 「比承诺更严」（全拦），不是安全缺口。
+            if !relax.all_unix_sockets {
+                if let Ok(socket_sc) = ScmpSyscall::from_name("socket") {
+                    filter
+                        .add_rule_conditional(
+                            ScmpAction::Errno(libc::EPERM),
+                            socket_sc,
+                            &[ScmpArgCompare::new(
+                                0,
+                                ScmpCompareOp::Equal,
+                                libc::AF_UNIX as u64,
+                            )],
+                        )
+                        .map_err(|e| seccomp_err("block socket(AF_UNIX)", e))?;
+                }
 
-            // socketpair is always AF_UNIX — block entirely
-            if let Ok(sc) = ScmpSyscall::from_name("socketpair") {
-                filter
-                    .add_rule(ScmpAction::Errno(libc::EPERM), sc)
-                    .map_err(|e| seccomp_err("block socketpair", e))?;
+                // socketpair is always AF_UNIX — block entirely
+                if let Ok(sc) = ScmpSyscall::from_name("socketpair") {
+                    filter
+                        .add_rule(ScmpAction::Errno(libc::EPERM), sc)
+                        .map_err(|e| seccomp_err("block socketpair", e))?;
+                }
             }
 
             // S-02 audit fix: Block AF_NETLINK (can manipulate routing/iptables)

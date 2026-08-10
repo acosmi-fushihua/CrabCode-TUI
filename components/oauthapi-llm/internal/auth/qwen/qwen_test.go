@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/acosmi/OAuthAPI-LLM/internal/auth/autherrors"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -20,6 +22,14 @@ type qwenRoundTripFunc func(*http.Request) (*http.Response, error)
 func (f qwenRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
+
+type interruptedQwenResponseBody struct{}
+
+func (interruptedQwenResponseBody) Read(p []byte) (int, error) {
+	return copy(p, `{"access_token":"partial`), io.ErrUnexpectedEOF
+}
+
+func (interruptedQwenResponseBody) Close() error { return nil }
 
 func jsonResponse(req *http.Request, status int, body string) *http.Response {
 	return &http.Response{
@@ -165,6 +175,37 @@ func TestExchangeDeviceCodePendingSlowDownAndTerminalStates(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestExchangeDeviceCodeClassifiesResponseReadFailure(t *testing.T) {
+	client := newTestDeviceFlowClient(qwenRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       interruptedQwenResponseBody{},
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Request:    req,
+		}, nil
+	}))
+
+	token, slowDown, err, shouldContinue := client.exchangeDeviceCode(
+		context.Background(),
+		"device-code-read-error",
+		"verifier-read-error",
+	)
+	if token != nil || slowDown || shouldContinue {
+		t.Fatalf(
+			"read failure returned token=%+v slowDown=%t continue=%t",
+			token,
+			slowDown,
+			shouldContinue,
+		)
+	}
+	if !errors.Is(err, autherrors.ErrUpstreamUnavailable) {
+		t.Fatalf("read failure classification = %v, want upstream unavailable", err)
+	}
+	if !strings.Contains(err.Error(), "failed to read token response") {
+		t.Fatalf("read failure detail lost: %v", err)
 	}
 }
 

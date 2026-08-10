@@ -1,8 +1,8 @@
-import { copyFile, link, stat as fsStat, truncate as fsTruncate } from 'fs/promises'
 import { getCwd } from '../utils/cwd.js'
 import { execFileNoThrowWithCwd } from '../utils/execFileNoThrow.js'
 import { gitExe } from '../utils/git.js'
 import { exec } from '../utils/Shell.js'
+import { persistTaskOutputFile } from '../utils/task/diskOutput.js'
 import {
   ensureToolResultsDir,
   getToolResultPath,
@@ -171,18 +171,13 @@ export const localProcess: LocalProcessRuntime = {
     let persistedOutputSize: number | undefined
     if (result.outputFilePath && result.outputTaskId) {
       try {
-        const fileStat = await fsStat(result.outputFilePath)
-        persistedOutputSize = fileStat.size
         await ensureToolResultsDir()
         const destination = getToolResultPath(result.outputTaskId, false)
-        if (fileStat.size > maxPersistedSize) {
-          await fsTruncate(result.outputFilePath, maxPersistedSize)
-        }
-        try {
-          await link(result.outputFilePath, destination)
-        } catch {
-          await copyFile(result.outputFilePath, destination)
-        }
+        persistedOutputSize = await persistTaskOutputFile(
+          result.outputTaskId,
+          destination,
+          maxPersistedSize,
+        )
         persistedOutputPath = destination
       } catch {
         // The temporary output may already have been cleaned up.

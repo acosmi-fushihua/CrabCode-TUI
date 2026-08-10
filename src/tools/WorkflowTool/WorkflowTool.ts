@@ -40,6 +40,7 @@ import { findWorkflow } from './registry.js'
 import {
   executeWorkflowSource,
   runWorkflowAgent,
+  WorkflowAgentIdleTimeoutError,
   type WorkflowAgentMetrics,
   type WorkflowAgentOptions,
 } from './runtime.js'
@@ -65,7 +66,7 @@ const outputSchema = lazySchema(() =>
   z.object({
     workflow: z.string(),
     task_id: z.string(),
-    status: z.literal('completed'),
+    status: z.enum(['completed', 'incomplete']),
     result: z.unknown(),
     output_file: z.string(),
     duration_ms: z.number(),
@@ -83,6 +84,35 @@ function cleanLogLine(value: string): string {
 
 export function isWorkflowCancellation(error: unknown): boolean {
   return isAbortError(error)
+}
+
+export function isWorkflowAgentCancellation(
+  error: unknown,
+  signal: AbortSignal,
+): boolean {
+  // The idle watchdog aborts this controller only to stop the underlying
+  // generator. That operational timeout remains a failure, never a user
+  // cancellation, even though the same signal is necessarily aborted.
+  if (
+    error instanceof WorkflowAgentIdleTimeoutError ||
+    signal.reason instanceof WorkflowAgentIdleTimeoutError
+  ) {
+    return false
+  }
+  return isWorkflowCancellation(error) || signal.aborted
+}
+
+export function classifyWorkflowResult(result: unknown): {
+  outputStatus: 'completed' | 'incomplete'
+  taskStatus: 'completed' | 'incomplete'
+} {
+  const isIncomplete =
+    typeof result === 'object' &&
+    result !== null &&
+    (result as { status?: unknown }).status === 'incomplete'
+  return isIncomplete
+    ? { outputStatus: 'incomplete', taskStatus: 'incomplete' }
+    : { outputStatus: 'completed', taskStatus: 'completed' }
 }
 
 export function assertWorkflowInvocationIsRoot(
@@ -162,7 +192,9 @@ export const WorkflowTool = buildTool({
     return latest.message
   },
   renderToolResultMessage(output) {
-    return `Workflow ${output.workflow} completed`
+    return output.status === 'incomplete'
+      ? `Workflow ${output.workflow} returned an incomplete result`
+      : `Workflow ${output.workflow} completed`
   },
   mapToolResultToToolResultBlockParam(output, toolUseID) {
     return {
@@ -252,6 +284,7 @@ export const WorkflowTool = buildTool({
     let totalToolUses = 0
     let agentsStarted = 0
     let agentsCompleted = 0
+    const recentLogs: string[] = []
 
     const emitProgress = (message: string): void => {
       const data: WorkflowToolProgress = {
@@ -292,6 +325,8 @@ export const WorkflowTool = buildTool({
       const message = cleanLogLine(rawMessage)
       if (!message) return
       logIndex++
+      recentLogs.push(message)
+      if (recentLogs.length > 100) recentLogs.shift()
       appendTaskOutput(taskId, `[${currentPhaseLabel ?? 'Workflow'}] ${message}\n`)
       updateTaskState<LocalWorkflowTaskState>(
         taskId,
@@ -414,8 +449,10 @@ export const WorkflowTool = buildTool({
         emitProgress(`${label}: completed`)
         return outcome.value
       } catch (error) {
-        const cancelled =
-          isAbortError(error) || agentAbortController.signal.aborted
+        const cancelled = isWorkflowAgentCancellation(
+          error,
+          agentAbortController.signal,
+        )
         agentsCompleted++
         updateAgent(agentRunId, entry => ({
           ...entry,
@@ -444,6 +481,15 @@ export const WorkflowTool = buildTool({
         signal: abortController.signal,
         observer: { log, phase },
         agent,
+        buildPartialResult: () => ({
+          workflow: workflow.name,
+          status: 'incomplete',
+          reason: `Workflow ${workflow.name} reached its runtime budget before returning a result.`,
+          phase: currentPhaseLabel ?? null,
+          agents_started: agentsStarted,
+          agents_completed: agentsCompleted,
+          recent_logs: recentLogs.slice(-20),
+        }),
         onRuntimeTerminated(error) {
           if (!abortController.signal.aborted) {
             abortController.abort(error)
@@ -451,6 +497,7 @@ export const WorkflowTool = buildTool({
         },
       })
       const serializedResult = jsonStringify(result ?? null, null, 2)
+      const completion = classifyWorkflowResult(result)
       appendTaskOutput(taskId, `\n[result]\n${serializedResult}\n`)
       await flushTaskOutput(taskId)
       updateTaskState<LocalWorkflowTaskState>(
@@ -458,7 +505,7 @@ export const WorkflowTool = buildTool({
         rootSetAppState,
         task => ({
           ...task,
-          status: 'completed',
+          status: completion.taskStatus,
           endTime: Date.now(),
           result,
           agentsStarted,
@@ -467,12 +514,12 @@ export const WorkflowTool = buildTool({
           totalToolUses,
         }),
       )
-      emitProgress(`Workflow ${workflow.name} completed`)
+      emitProgress(`Workflow ${workflow.name} ${completion.outputStatus}`)
       return {
         data: {
           workflow: workflow.name,
           task_id: taskId,
-          status: 'completed' as const,
+          status: completion.outputStatus,
           result,
           output_file: taskState.outputFile,
           duration_ms: Date.now() - startedAt,

@@ -1,10 +1,12 @@
 import figures from 'figures'
 import { logError } from 'src/utils/log.js'
+import { pathToFileURL } from 'url'
 import { callIdeRpc } from '../services/mcp/client.js'
 import type { MCPServerConnection } from '../services/mcp/types.js'
 import { CrabCodeError } from '../utils/errors.js'
 import { normalizePathForComparison, pathsEqual } from '../utils/file.js'
 import { getConnectedIdeClient } from '../utils/ide.js'
+import { fileUriToPath } from '../utils/path.js'
 import { jsonParse } from '../utils/slowOperations.js'
 
 class DiagnosticsTrackingError extends CrabCodeError {}
@@ -76,12 +78,17 @@ export class DiagnosticTrackingService {
   }
 
   private normalizeFileUri(fileUri: string): string {
+    // `file://` 必须走真解析（fileUriToPath），不能跟下面两个自定义 scheme 一样
+    // 朴素剥前缀：IDE 回的是规范形态 `file:///C:/…`（三斜杠 + 百分号编码），
+    // 剥 7 字符只会得到 `/C:/…`，与 baseline 里的裸路径永远对不上 —— 那会让
+    // beforeFileEdited 走进 mismatch 分支直接 return，诊断跟踪整条链静默失效。
+    // `_crabcode_fs_*` 是 IDE 侧自定义 scheme、不是 URI，仍按字面剥前缀。
+    if (fileUri.startsWith('file://')) {
+      return normalizePathForComparison(fileUriToPath(fileUri))
+    }
+
     // Remove our protocol prefixes
-    const protocolPrefixes = [
-      'file://',
-      '_crabcode_fs_right:',
-      '_crabcode_fs_left:',
-    ]
+    const protocolPrefixes = ['_crabcode_fs_right:', '_crabcode_fs_left:']
 
     let normalized = fileUri
     for (const prefix of protocolPrefixes) {
@@ -146,7 +153,11 @@ export class DiagnosticTrackingService {
     try {
       const result = await callIdeRpc(
         'getDiagnostics',
-        { uri: `file://${filePath}` },
+        // 发给第三方 IDE 扩展的协议字段，必须是规范 file URI，不能手拼：
+        // Windows 上 `file://` + `C:\…` 既不是三斜杠也没转义反斜杠，按 RFC 3986
+        // 反斜杠根本不是合法 URI 字符（严格解析器会直接拒），宽容解析器则会把
+        // `C:` 读成 authority。pathToFileURL 一并处理空格与非 ASCII 转义。
+        { uri: pathToFileURL(filePath).href },
         this.mcpClient,
       )
       const diagnosticFile = this.parseDiagnosticResult(result)[0]

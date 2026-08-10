@@ -1,5 +1,6 @@
 import type { ChildProcess } from 'child_process'
-import { stat } from 'fs/promises'
+import { createWriteStream, type WriteStream } from 'fs'
+import type { FileHandle } from 'fs/promises'
 import type { Readable } from 'stream'
 import treeKill from 'tree-kill'
 import { generateTaskId } from '../Task.js'
@@ -49,9 +50,10 @@ export type ShellCommand = {
 const SIGKILL = 137
 const SIGTERM = 143
 
-// Background tasks write stdout/stderr directly to a file fd (no JS involvement),
-// so a stuck append loop can fill the disk. Poll file size and kill when exceeded.
+// File-mode output is drained through a host-owned sink. Poll the authoritative
+// descriptor as a second line of defense against writes made through another fd.
 const SIZE_WATCHDOG_INTERVAL_MS = 5_000
+const POST_EXIT_PIPE_DRAIN_GRACE_MS = 100
 
 function prependStderr(prefix: string, stderr: string): string {
   return stderr ? `${prefix} ${stderr}` : prefix
@@ -104,6 +106,116 @@ class StreamWrapper {
 }
 
 /**
+ * Drains stdout and stderr into the host-opened output descriptor.
+ *
+ * The child receives only pipe write ends, never the output-file descriptor.
+ * When the shell leader exits, inherited pipe writers get a short drain grace
+ * and are then disconnected. This prevents an escaped grandchild from filling
+ * an anonymous inode after unlinking the published output path.
+ */
+class FileOutputCollector {
+  #streams: Readable[]
+  #sink: WriteStream
+  #endedStreams = new Set<Readable>()
+  #allStreamsEnded: Promise<void>
+  #resolveAllStreamsEnded: (() => void) | null = null
+  #sinkSettled: Promise<void>
+  #finishPromise: Promise<void> | null = null
+  #bytesSeen = 0
+  #limitTriggered = false
+  #failureTriggered = false
+
+  constructor(
+    streams: Readable[],
+    outputFileHandle: FileHandle,
+    maxOutputBytes: number,
+    onLimit: () => void,
+    onFailure: () => void,
+  ) {
+    this.#streams = streams
+    this.#allStreamsEnded = new Promise(resolve => {
+      this.#resolveAllStreamsEnded = resolve
+    })
+    this.#sink = createWriteStream('', {
+      fd: outputFileHandle.fd,
+      autoClose: false,
+    })
+    this.#sinkSettled = new Promise(resolve => {
+      this.#sink.once('finish', resolve)
+      this.#sink.once('close', resolve)
+      this.#sink.once('error', () => resolve())
+    })
+    this.#sink.on('error', () => {
+      if (!this.#failureTriggered) {
+        this.#failureTriggered = true
+        onFailure()
+      }
+    })
+
+    for (const stream of streams) {
+      stream.on('data', (chunk: Buffer | string) => {
+        this.#bytesSeen +=
+          typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length
+        if (!this.#limitTriggered && this.#bytesSeen > maxOutputBytes) {
+          this.#limitTriggered = true
+          onLimit()
+        }
+      })
+      const markEnded = (): void => {
+        this.#endedStreams.add(stream)
+        if (this.#endedStreams.size === this.#streams.length) {
+          this.#resolveAllStreamsEnded?.()
+          this.#resolveAllStreamsEnded = null
+        }
+      }
+      stream.once('end', markEnded)
+      stream.once('close', markEnded)
+      stream.once('error', () => {
+        if (!this.#failureTriggered) {
+          this.#failureTriggered = true
+          onFailure()
+        }
+        markEnded()
+      })
+      stream.pipe(this.#sink, { end: false })
+    }
+
+    if (streams.length === 0) {
+      this.#resolveAllStreamsEnded?.()
+      this.#resolveAllStreamsEnded = null
+    }
+  }
+
+  finishAfterLeaderExit(): Promise<void> {
+    if (this.#finishPromise !== null) return this.#finishPromise
+    this.#finishPromise = this.#finish()
+    return this.#finishPromise
+  }
+
+  async #finish(): Promise<void> {
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        this.#allStreamsEnded,
+        new Promise<void>(resolve => {
+          graceTimer = setTimeout(resolve, POST_EXIT_PIPE_DRAIN_GRACE_MS)
+          graceTimer.unref()
+        }),
+      ])
+    } finally {
+      if (graceTimer !== undefined) clearTimeout(graceTimer)
+    }
+
+    for (const stream of this.#streams) {
+      stream.unpipe(this.#sink)
+      if (!stream.destroyed) stream.destroy()
+    }
+    this.#sink.end()
+    await this.#sinkSettled
+  }
+}
+
+/**
  * Implementation of ShellCommand that wraps a child process.
  *
  * For bash commands: both stdout and stderr go to a file fd via
@@ -120,6 +232,10 @@ class ShellCommandImpl implements ShellCommand {
   #timeoutId: NodeJS.Timeout | null = null
   #sizeWatchdog: NodeJS.Timeout | null = null
   #killedForSize = false
+  #killedForOutputIntegrity = false
+  #leaderExited = false
+  #outputFileHandle: FileHandle | null
+  #fileOutputCollector: FileOutputCollector | null = null
   #maxOutputBytes: number
   #abortSignal: AbortSignal
   #onTimeoutCallback:
@@ -152,23 +268,49 @@ class ShellCommandImpl implements ShellCommand {
     taskOutput: TaskOutput,
     shouldAutoBackground = false,
     maxOutputBytes = MAX_TASK_OUTPUT_BYTES,
+    outputFileHandle?: FileHandle,
   ) {
     this.#childProcess = childProcess
     this.#abortSignal = abortSignal
     this.#timeout = timeout
     this.#shouldAutoBackground = shouldAutoBackground
     this.#maxOutputBytes = maxOutputBytes
+    this.#outputFileHandle = outputFileHandle ?? null
     this.taskOutput = taskOutput
+    this.result = this.#createResultPromise()
 
-    // In file mode (bash commands), both stdout and stderr go to the
-    // output file fd — childProcess.stdout/.stderr are both null.
-    // In pipe mode (hooks), wrap streams to funnel data into TaskOutput.
-    this.#stderrWrapper = childProcess.stderr
-      ? new StreamWrapper(childProcess.stderr, taskOutput, true)
-      : null
-    this.#stdoutWrapper = childProcess.stdout
-      ? new StreamWrapper(childProcess.stdout, taskOutput, false)
-      : null
+    if (this.#outputFileHandle !== null) {
+      const streams = [childProcess.stdout, childProcess.stderr].filter(
+        (stream): stream is Readable => stream !== null,
+      )
+      this.#fileOutputCollector = new FileOutputCollector(
+        streams,
+        this.#outputFileHandle,
+        this.#maxOutputBytes,
+        () => {
+          if (!this.#killedForSize) {
+            this.#killedForSize = true
+            this.#doKill(SIGKILL)
+          }
+        },
+        () => {
+          if (!this.#killedForOutputIntegrity) {
+            this.#killedForOutputIntegrity = true
+            this.#doKill(SIGKILL)
+          }
+        },
+      )
+      this.#stdoutWrapper = null
+      this.#stderrWrapper = null
+    } else {
+      // Hook/explicit callback mode stays in memory.
+      this.#stderrWrapper = childProcess.stderr
+        ? new StreamWrapper(childProcess.stderr, taskOutput, true)
+        : null
+      this.#stdoutWrapper = childProcess.stdout
+        ? new StreamWrapper(childProcess.stdout, taskOutput, false)
+        : null
+    }
 
     if (shouldAutoBackground) {
       this.onTimeout = (callback): void => {
@@ -176,7 +318,12 @@ class ShellCommandImpl implements ShellCommand {
       }
     }
 
-    this.result = this.#createResultPromise()
+    if (this.#outputFileHandle !== null) {
+      // Keep the host's original descriptor as the authority. A sandboxed
+      // child may unlink or replace the pathname, but cannot redirect fstat on
+      // this handle or evade the disk cap by writing the anonymous inode.
+      this.#startSizeWatchdog()
+    }
   }
 
   get status(): 'running' | 'backgrounded' | 'completed' | 'killed' {
@@ -193,6 +340,7 @@ class ShellCommandImpl implements ShellCommand {
   }
 
   #exitHandler(code: number | null, signal: NodeJS.Signals | null): void {
+    this.#leaderExited = true
     const exitCode =
       code !== null && code !== undefined
         ? code
@@ -237,14 +385,21 @@ class ShellCommandImpl implements ShellCommand {
   }
 
   #startSizeWatchdog(): void {
+    if (this.#sizeWatchdog !== null || this.#outputFileHandle === null) {
+      return
+    }
     this.#sizeWatchdog = setInterval(() => {
-      void stat(this.taskOutput.path).then(
-        s => {
+      const outputFileHandle = this.#outputFileHandle
+      if (outputFileHandle === null) {
+        return
+      }
+      void outputFileHandle.stat().then(
+        stats => {
           // Bail if the watchdog was cleared while this stat was in flight
           // (process exited on its own) — otherwise we'd mislabel stderr.
           if (
-            s.size > this.#maxOutputBytes &&
-            this.#status === 'backgrounded' &&
+            stats.size > this.#maxOutputBytes &&
+            (this.#status === 'running' || this.#status === 'backgrounded') &&
             this.#sizeWatchdog !== null
           ) {
             this.#killedForSize = true
@@ -253,7 +408,14 @@ class ShellCommandImpl implements ShellCommand {
           }
         },
         () => {
-          // ENOENT before first write, or unlinked mid-run — skip this tick
+          if (
+            (this.#status === 'running' || this.#status === 'backgrounded') &&
+            this.#sizeWatchdog !== null
+          ) {
+            this.#killedForOutputIntegrity = true
+            this.#clearSizeWatchdog()
+            this.#doKill(SIGKILL)
+          }
         },
       )
     }, SIZE_WATCHDOG_INTERVAL_MS)
@@ -289,17 +451,35 @@ class ShellCommandImpl implements ShellCommand {
   }
 
   async #handleExit(code: number): Promise<void> {
+    // The leader PID is already terminal (or an explicit kill has begun).
+    // Remove timeout/abort/watchdog callbacks before draining pipe buffers so
+    // a reused PID cannot be targeted during the final flush.
     this.#cleanupListeners()
+    await this.#fileOutputCollector?.finishAfterLeaderExit()
     if (this.#status === 'running' || this.#status === 'backgrounded') {
       this.#status = 'completed'
     }
 
-    const stdout = await this.taskOutput.getStdout()
+    let stdout: string
+    try {
+      stdout = await this.taskOutput.getStdout(this.#outputFileHandle ?? undefined)
+    } finally {
+      const outputFileHandle = this.#outputFileHandle
+      this.#outputFileHandle = null
+      try {
+        await outputFileHandle?.close()
+      } catch {
+        // The child already has its own descriptor; close failures must not
+        // hide the command result.
+      }
+    }
+    const effectiveCode =
+      this.#killedForSize || this.#killedForOutputIntegrity ? SIGKILL : code
     const result: ExecResult = {
-      code,
+      code: effectiveCode,
       stdout,
       stderr: this.taskOutput.getStderr(),
-      interrupted: code === SIGKILL,
+      interrupted: effectiveCode === SIGKILL,
       backgroundTaskId: this.#backgroundTaskId,
     }
 
@@ -315,9 +495,14 @@ class ShellCommandImpl implements ShellCommand {
       }
     }
 
-    if (this.#killedForSize) {
+    if (this.#killedForOutputIntegrity) {
       result.stderr = prependStderr(
-        `Background command killed: output file exceeded ${MAX_TASK_OUTPUT_BYTES_DISPLAY}`,
+        'Command killed: host output descriptor integrity check failed',
+        result.stderr,
+      )
+    } else if (this.#killedForSize) {
+      result.stderr = prependStderr(
+        `Command killed: output file exceeded ${MAX_TASK_OUTPUT_BYTES_DISPLAY}`,
         result.stderr,
       )
     } else if (code === SIGTERM) {
@@ -336,7 +521,7 @@ class ShellCommandImpl implements ShellCommand {
 
   #doKill(code?: number): void {
     this.#status = 'killed'
-    if (this.#childProcess.pid) {
+    if (!this.#leaderExited && this.#childProcess.pid) {
       treeKill(this.#childProcess.pid, 'SIGKILL')
     }
     this.#resolveExitCode(code ?? SIGKILL)
@@ -390,6 +575,7 @@ export function wrapSpawn(
   timeout: number,
   taskOutput: TaskOutput,
   shouldAutoBackground = false,
+  outputFileHandle?: FileHandle,
   maxOutputBytes = MAX_TASK_OUTPUT_BYTES,
 ): ShellCommand {
   return new ShellCommandImpl(
@@ -399,6 +585,7 @@ export function wrapSpawn(
     taskOutput,
     shouldAutoBackground,
     maxOutputBytes,
+    outputFileHandle,
   )
 }
 

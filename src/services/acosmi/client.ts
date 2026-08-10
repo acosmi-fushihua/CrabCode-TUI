@@ -213,6 +213,92 @@ export function _getLastSyncAtForTesting(): number {
 }
 
 // ---------------------------------------------------------------------------
+// Token renewal has one rotator: the SDK token store.
+//
+// The secure-storage and SDK stores are seeded from the same authorization,
+// so letting both refresh the single-use refresh-token chain races one valid
+// credential against the other. Adopt a usable token that another process
+// already wrote first; only the SDK may rotate when adoption cannot recover.
+// ---------------------------------------------------------------------------
+
+interface RenewableClient {
+  syncFromDisk: () => Promise<void>
+  forceRefresh: (signal?: AbortSignal) => Promise<void>
+  getTokenSet: () => TokenSet | null
+}
+
+const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000
+
+function tokenSetIsUsable(
+  tokenSet: TokenSet | null,
+  now: number,
+): tokenSet is TokenSet {
+  if (!tokenSet?.access_token) return false
+  const expiresAt = Date.parse(tokenSet.expires_at ?? '')
+  return (
+    Number.isFinite(expiresAt) &&
+    now + TOKEN_EXPIRY_BUFFER_MS < expiresAt
+  )
+}
+
+interface RenewDeps {
+  getClient: () => Promise<RenewableClient>
+  now: () => number
+}
+
+const defaultRenewDeps: RenewDeps = {
+  getClient: async () => {
+    const client = await getAcosmiClient()
+    return client as unknown as RenewableClient
+  },
+  now: () => Date.now(),
+}
+
+/**
+ * Renew the stored Acosmi credential through the SDK's process/cross-process
+ * lock. `currentAccessToken` is the token the server just rejected; adopting
+ * that same token would turn a forced refresh into a no-op.
+ */
+export async function renewAcosmiTokenSet(
+  currentAccessToken?: string,
+): Promise<TokenSet> {
+  return renewImpl(currentAccessToken, defaultRenewDeps)
+}
+
+export async function _renewAcosmiTokenSetForTesting(
+  currentAccessToken: string | undefined,
+  deps: RenewDeps,
+): Promise<TokenSet> {
+  return renewImpl(currentAccessToken, deps)
+}
+
+async function renewImpl(
+  currentAccessToken: string | undefined,
+  deps: RenewDeps,
+): Promise<TokenSet> {
+  const client = await deps.getClient()
+  try {
+    await client.syncFromDisk()
+  } catch {
+    // The in-memory token may still be usable; disk adoption is best effort.
+  }
+  const onDisk = client.getTokenSet()
+  if (
+    tokenSetIsUsable(onDisk, deps.now()) &&
+    onDisk.access_token !== currentAccessToken
+  ) {
+    return onDisk
+  }
+
+  await client.forceRefresh()
+  const renewed = client.getTokenSet()
+  if (!renewed?.access_token) {
+    throw new Error('token renewal failed: SDK returned no token set')
+  }
+  return renewed
+}
+
+// ---------------------------------------------------------------------------
 // Auth — Y 路径 step 8 (2026-05-01): SDK Client 直调替代原 hub auth.* 3 RPC.
 // loginStream / logout / getAuthStatus 是 7 caller 共享基础设施.
 // M5/M6 (2026-05-02) 后原 bridgeAuth* IPC 中转层全删, 此处保留 caller-facing
@@ -823,6 +909,16 @@ export async function chatComplete(
  */
 export interface ChatStreamAdapter {
   controller: AbortController
+  /**
+   * 上游活性钩子 (2026-08-06)。SDK 对**每一条** SSE 行触发一次, 含被
+   * `isSSECommentLine` 吞掉的保活注释行 —— 那类行有字节、无事件, 空闲看门狗
+   * 单看 yield 出来的事件是**看不见**它们的, 于是会误杀健康连接。
+   *
+   * 刻意做成可写字段而非构造参数: 流在 withRetry 的 operation 回调里构造, 而
+   * 看门狗在外层更晚才装配, 两者不在同一词法作用域。生成器体是惰性的 (首次
+   * next() 才跑), 所以在开始消费前赋值即可。未赋值时行为逐字节不变。
+   */
+  onUpstreamActivity?: () => void
   [Symbol.asyncIterator](): AsyncIterator<unknown>
 }
 
@@ -835,8 +931,12 @@ export function chatStreamAdapter(
     source: 'acosmi.chatStreamAdapter',
   })
   const controller = new AbortController()
-  return {
+  const adapter: ChatStreamAdapter = {
     controller,
+    // 必须显式落键。消费方用 `'onUpstreamActivity' in stream` 做能力探测 (与既有
+    // `'controller' in stream` 同一套路), 而 TS 的可选属性不赋值时**运行时根本
+    // 不存在这个键**, `in` 恒 false —— 钩子会静默永不生效。
+    onUpstreamActivity: undefined,
     async *[Symbol.asyncIterator]() {
       const client = await getAcosmiClient()
       // 取证 2026-05-05 disk-cache 写盘 bug: 与 refreshModelCapabilities log 对照.
@@ -844,7 +944,14 @@ export function chatStreamAdapter(
         `[acosmi-client] chatStream enter modelID=${runtimeModelID} sdkAuthorized=${client.isAuthorized()}`,
       )).catch(() => {})
       try {
-        const stream = client.chatMessagesStream(runtimeModelID, req, controller.signal)
+        // 每次调用都从 adapter 上读, 而不是构造期快照 —— 消费方在开始迭代之前
+        // 才装配看门狗并赋值, 快照会恒为 undefined。
+        const stream = client.chatMessagesStream(
+          runtimeModelID,
+          req,
+          controller.signal,
+          () => adapter.onUpstreamActivity?.(),
+        )
         for await (const evt of stream) {
           if (controller.signal.aborted) break
           const parsed = normalizeAcosmiChatStreamEvent(evt)
@@ -855,6 +962,7 @@ export function chatStreamAdapter(
       }
     },
   }
+  return adapter
 }
 
 /**

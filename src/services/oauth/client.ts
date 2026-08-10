@@ -7,7 +7,6 @@ import {
 import {
   ALL_OAUTH_SCOPES,
   ACOSMI_INFERENCE_SCOPE,
-  ACOSMI_OAUTH_SCOPES,
   getOauthConfig,
 } from '../../constants/oauth.js'
 import {
@@ -102,197 +101,156 @@ export function buildAuthUrl({
   return authUrl.toString()
 }
 
-export async function exchangeCodeForTokens(
-  authorizationCode: string,
-  state: string,
-  codeVerifier: string,
-  port: number,
-  useManualRedirect: boolean = false,
-  expiresIn?: number,
-  tokenEndpoint?: string,
-  clientId?: string,
-): Promise<OAuthTokenExchangeResponse> {
-  const resolvedTokenURL = tokenEndpoint ?? getOauthConfig().TOKEN_URL
-  const resolvedClientId = clientId ?? getOauthConfig().CLIENT_ID
-
-  const requestBody: Record<string, string | number> = {
-    grant_type: 'authorization_code',
-    code: authorizationCode,
-    redirect_uri: useManualRedirect
-      ? getOauthConfig().MANUAL_REDIRECT_URL
-      : `http://127.0.0.1:${port}/callback`,
-    client_id: resolvedClientId,
-    code_verifier: codeVerifier,
-    state,
-  }
-
-  if (expiresIn !== undefined) {
-    requestBody.expires_in = expiresIn
-  }
-
-  const response = await axios.post(resolvedTokenURL, requestBody, {
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 15000,
-  })
-
-  if (response.status !== 200) {
-    throw new Error(
-      response.status === 401
-        ? 'Authentication failed: Invalid authorization code'
-        : `Token exchange failed (${response.status}): ${response.statusText}`,
-    )
-  }
-  logEvent('tengu_oauth_token_exchange_success', {})
-  return response.data
-}
-
-export async function refreshOAuthToken(
-  refreshToken: string,
-  { scopes: requestedScopes, tokenEndpoint, clientId }: { scopes?: string[]; tokenEndpoint?: string; clientId?: string } = {},
+/**
+ * Renew credentials already present in local stores. The SDK is the sole
+ * refresh-token rotator; this function only converts its TokenSet back into
+ * the existing secure-storage shape and refreshes profile metadata.
+ */
+export async function renewStoredOAuthTokens(
+  currentAccessToken?: string,
 ): Promise<OAuthTokens> {
-  // 动态解析：优先使用传入参数，回退到已注册的 client 或配置
-  const { loadClientRegistration } = await import('./registration.js')
-  const cached = loadClientRegistration()
-  const resolvedTokenURL = tokenEndpoint ?? (cached?.server_url ? `${cached.server_url}/oauth/desktop/token` : getOauthConfig().TOKEN_URL)
-  const resolvedClientId = clientId ?? cached?.client_id ?? getOauthConfig().CLIENT_ID
-
-  const requestBody = {
-    grant_type: 'refresh_token',
-    refresh_token: refreshToken,
-    client_id: resolvedClientId,
-    scope: (requestedScopes?.length
-      ? requestedScopes
-      : ACOSMI_OAUTH_SCOPES
-    ).join(' '),
-  }
-
   try {
-    const response = await axios.post(resolvedTokenURL, requestBody, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 15000,
-    })
-
-    if (response.status !== 200) {
-      throw new Error(`Token refresh failed: ${response.statusText}`)
-    }
-
-    const data = response.data as OAuthTokenExchangeResponse
-    const {
-      access_token: accessToken,
-      refresh_token: newRefreshToken = refreshToken,
-      expires_in: expiresIn,
-    } = data
-
-    const expiresAt = Date.now() + (expiresIn ?? 3600) * 1000
-    const scopes = parseScopes(data.scope)
-
-    logEvent('tengu_oauth_token_refresh_success', {})
-
-    // Skip the extra /api/oauth/profile round-trip when we already have both
-    // the global-config profile fields AND the secure-storage subscription data.
-    // Routine refreshes satisfy both, so we cut ~7M req/day fleet-wide.
-    //
-    // Checking secure storage (not just config) matters for the
-    // CRABCODE_OAUTH_REFRESH_TOKEN re-login path: installOAuthTokens clears
-    // local auth state AFTER we return, wiping secure storage. If we returned
-    // null for subscriptionType here, saveOAuthTokensIfNeeded would persist
-    // null ?? (wiped) ?? null = null, and every future refresh would see the
-    // config guard fields satisfied and skip again, permanently losing the
-    // subscription type for paying users. By passing through existing values,
-    // the re-login path writes cached ?? wiped ?? null = cached; and if secure
-    // storage was already empty we fall through to the fetch.
-    const config = getGlobalConfig()
-    const existing = getAcosmiOAuthTokens()
-    const haveProfileAlready =
-      config.oauthAccount?.billingType !== undefined &&
-      config.oauthAccount?.accountCreatedAt !== undefined &&
-      config.oauthAccount?.subscriptionCreatedAt !== undefined &&
-      existing?.subscriptionType != null &&
-      existing?.rateLimitTier != null
-
-    const profileInfo = haveProfileAlready
-      ? null
-      : await fetchProfileInfo(accessToken)
-
-    // Update the stored properties if they have changed
-    if (profileInfo && config.oauthAccount) {
-      const updates: Partial<AccountInfo> = {}
-      if (profileInfo.displayName !== undefined) {
-        updates.displayName = profileInfo.displayName
-      }
-      if (profileInfo.avatarUrl !== undefined) {
-        updates.avatarUrl = profileInfo.avatarUrl
-      }
-      if (profileInfo.imageUrl !== undefined) {
-        updates.imageUrl = profileInfo.imageUrl
-      }
-      if (typeof profileInfo.hasExtraUsageEnabled === 'boolean') {
-        updates.hasExtraUsageEnabled = profileInfo.hasExtraUsageEnabled
-      }
-      if (profileInfo.billingType !== null) {
-        updates.billingType = profileInfo.billingType
-      }
-      if (profileInfo.accountCreatedAt !== undefined) {
-        updates.accountCreatedAt = profileInfo.accountCreatedAt
-      }
-      if (profileInfo.subscriptionCreatedAt !== undefined) {
-        updates.subscriptionCreatedAt = profileInfo.subscriptionCreatedAt
-      }
-      // V116.1 P0-3: 布尔才写入 —— true→false 的解除态也要随 refresh 传播
-      // (用户完成绑定后无需重登即可解除预检拦截);null(老网关)不动现值。
-      if (typeof profileInfo.requiresPhoneBinding === 'boolean') {
-        updates.requiresPhoneBinding = profileInfo.requiresPhoneBinding
-      }
-      if (Object.keys(updates).length > 0) {
-        saveGlobalConfig(current => ({
-          ...current,
-          oauthAccount: current.oauthAccount
-            ? { ...current.oauthAccount, ...updates }
-            : current.oauthAccount,
-        }))
-      }
-    }
-
-    return {
-      accessToken,
-      refreshToken: newRefreshToken,
-      expiresAt,
-      scopes,
-      subscriptionType:
-        profileInfo?.subscriptionType ?? existing?.subscriptionType ?? null,
-      rateLimitTier:
-        profileInfo?.rateLimitTier ?? existing?.rateLimitTier ?? null,
-      // Membership is account state, not token state — it does not change on
-      // refresh. Pass through the stored value (syncMembershipActive owns
-      // populating it); saveOAuthTokensIfNeeded also guards against clobber.
-      membershipActive: existing?.membershipActive ?? null,
-      profile: profileInfo?.rawProfile,
-      tokenAccount: data.account
-        ? {
-            uuid: data.account.uuid,
-            emailAddress: data.account.email_address,
-            organizationUuid: data.organization?.uuid ?? '',
-            displayName: data.account.display_name,
-            avatarUrl: data.account.avatar_url,
-            imageUrl: data.account.image_url,
-          }
-        : undefined,
-    }
+    const { renewAcosmiTokenSet } = await import('../acosmi/client.js')
+    const tokenSet = await renewAcosmiTokenSet(currentAccessToken)
+    const expiresAtMs = Date.parse(tokenSet.expires_at ?? '')
+    return await finalizeTokenResponse(
+      {
+        access_token: tokenSet.access_token,
+        refresh_token: tokenSet.refresh_token || undefined,
+        expires_in: Number.isFinite(expiresAtMs)
+          ? Math.max(60, Math.round((expiresAtMs - Date.now()) / 1000))
+          : 60,
+        scope: tokenSet.scope || undefined,
+      },
+      tokenSet.refresh_token ?? '',
+    )
   } catch (error) {
-    const responseBody =
-      axios.isAxiosError(error) && error.response?.data
-        ? redactSecrets(JSON.stringify(error.response.data))
-        : undefined
-    logEvent('tengu_oauth_token_refresh_failure', {
-      error: (error as Error)
-        .message as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-      ...(responseBody && {
-        responseBody:
-          responseBody as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-      }),
-    })
+    logTokenRefreshFailure(error)
     throw error
   }
+}
+
+async function finalizeTokenResponse(
+  data: OAuthTokenExchangeResponse,
+  fallbackRefreshToken: string,
+): Promise<OAuthTokens> {
+  const {
+    access_token: accessToken,
+    refresh_token: newRefreshToken = fallbackRefreshToken,
+    expires_in: expiresIn,
+  } = data
+
+  const expiresAt = Date.now() + (expiresIn ?? 3600) * 1000
+  logEvent('tengu_oauth_token_refresh_success', {})
+
+  // Skip the extra /api/oauth/profile round-trip when we already have both
+  // the global-config profile fields AND the secure-storage subscription data.
+  // Routine refreshes satisfy both, so we cut ~7M req/day fleet-wide.
+  //
+  // Checking secure storage (not just config) matters for the
+  // CRABCODE_OAUTH_REFRESH_TOKEN re-login path: installOAuthTokens clears
+  // local auth state AFTER we return, wiping secure storage. If we returned
+  // null for subscriptionType here, saveOAuthTokensIfNeeded would persist
+  // null ?? (wiped) ?? null = null, and every future refresh would see the
+  // config guard fields satisfied and skip again, permanently losing the
+  // subscription type for paying users. By passing through existing values,
+  // the re-login path writes cached ?? wiped ?? null = cached; and if secure
+  // storage was already empty we fall through to the fetch.
+  const config = getGlobalConfig()
+  const existing = getAcosmiOAuthTokens()
+  const parsedScopes = parseScopes(data.scope)
+  const scopes =
+    parsedScopes.length > 0 ? parsedScopes : (existing?.scopes ?? [])
+  const haveProfileAlready =
+    config.oauthAccount?.billingType !== undefined &&
+    config.oauthAccount?.accountCreatedAt !== undefined &&
+    config.oauthAccount?.subscriptionCreatedAt !== undefined &&
+    existing?.subscriptionType != null &&
+    existing?.rateLimitTier != null
+
+  const profileInfo = haveProfileAlready
+    ? null
+    : await fetchProfileInfo(accessToken)
+
+  // Update the stored properties if they have changed
+  if (profileInfo && config.oauthAccount) {
+    const updates: Partial<AccountInfo> = {}
+    if (profileInfo.displayName !== undefined) {
+      updates.displayName = profileInfo.displayName
+    }
+    if (profileInfo.avatarUrl !== undefined) {
+      updates.avatarUrl = profileInfo.avatarUrl
+    }
+    if (profileInfo.imageUrl !== undefined) {
+      updates.imageUrl = profileInfo.imageUrl
+    }
+    if (typeof profileInfo.hasExtraUsageEnabled === 'boolean') {
+      updates.hasExtraUsageEnabled = profileInfo.hasExtraUsageEnabled
+    }
+    if (profileInfo.billingType !== null) {
+      updates.billingType = profileInfo.billingType
+    }
+    if (profileInfo.accountCreatedAt !== undefined) {
+      updates.accountCreatedAt = profileInfo.accountCreatedAt
+    }
+    if (profileInfo.subscriptionCreatedAt !== undefined) {
+      updates.subscriptionCreatedAt = profileInfo.subscriptionCreatedAt
+    }
+    // V116.1 P0-3: 布尔才写入 —— true→false 的解除态也要随 refresh 传播
+    // (用户完成绑定后无需重登即可解除预检拦截);null(老网关)不动现值。
+    if (typeof profileInfo.requiresPhoneBinding === 'boolean') {
+      updates.requiresPhoneBinding = profileInfo.requiresPhoneBinding
+    }
+    if (Object.keys(updates).length > 0) {
+      saveGlobalConfig(current => ({
+        ...current,
+        oauthAccount: current.oauthAccount
+          ? { ...current.oauthAccount, ...updates }
+          : current.oauthAccount,
+      }))
+    }
+  }
+
+  return {
+    accessToken,
+    refreshToken: newRefreshToken,
+    expiresAt,
+    scopes,
+    subscriptionType:
+      profileInfo?.subscriptionType ?? existing?.subscriptionType ?? null,
+    rateLimitTier:
+      profileInfo?.rateLimitTier ?? existing?.rateLimitTier ?? null,
+    // Membership is account state, not token state — it does not change on
+    // refresh. Pass through the stored value (syncMembershipActive owns
+    // populating it); saveOAuthTokensIfNeeded also guards against clobber.
+    membershipActive: existing?.membershipActive ?? null,
+    profile: profileInfo?.rawProfile,
+    tokenAccount: data.account
+      ? {
+          uuid: data.account.uuid,
+          emailAddress: data.account.email_address,
+          organizationUuid: data.organization?.uuid ?? '',
+          displayName: data.account.display_name,
+          avatarUrl: data.account.avatar_url,
+          imageUrl: data.account.image_url,
+        }
+      : undefined,
+  }
+}
+
+function logTokenRefreshFailure(error: unknown): void {
+  const responseBody =
+    axios.isAxiosError(error) && error.response?.data
+      ? redactSecrets(JSON.stringify(error.response.data))
+      : undefined
+  logEvent('tengu_oauth_token_refresh_failure', {
+    error: (error as Error)
+      .message as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    ...(responseBody && {
+      responseBody:
+        responseBody as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    }),
+  })
 }
 
 export async function fetchAndStoreUserRoles(
@@ -335,8 +293,7 @@ export async function createAndStoreApiKey(
   accessToken: string,
 ): Promise<string | null> {
   try {
-    // timeout matches the sibling OAuth POSTs (exchangeOAuthCode /
-    // refreshOAuthToken, both 15s). This call is awaited on the login path
+    // timeout matches the sibling OAuth POSTs. This call is awaited on the login path
     // (cli/handlers/auth.ts), so without a timeout a slow/hung proxy blocks
     // login completion indefinitely (axios.defaults.timeout is 0 = unbounded).
     const response = await axios.post(getOauthConfig().API_KEY_URL, null, {
@@ -497,8 +454,8 @@ export async function populateOAuthAccountInfoIfNeeded(): Promise<boolean> {
     }
   }
 
-  // Wait for any in-flight token refresh to complete first, since
-  // refreshOAuthToken already fetches and stores profile info
+  // Wait for any in-flight token refresh to complete first; the SDK refresh
+  // path also fetches and stores profile info.
   await checkAndRefreshOAuthTokenIfNeeded()
 
   const config = getGlobalConfig()

@@ -150,6 +150,13 @@ interface RetryOptions {
   thinkingConfig: ThinkingConfig
   fastMode?: boolean
   signal?: AbortSignal
+  /**
+   * Optional deadline for the retry loop itself. Unlike `signal`, aborting
+   * this deadline is not necessarily a user cancellation, so callers may
+   * provide the error that should escape an interrupted backoff.
+   */
+  retrySignal?: AbortSignal
+  retryAbortError?: () => Error
   querySource?: QuerySource
   /**
    * @deprecated V116.1 P1-3:529 连败计数器随死机器一并删除(见模块头记录),
@@ -209,6 +216,9 @@ export async function* withRetry<T>(
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
     if (options.signal?.aborted) {
       throw new APIUserAbortError()
+    }
+    if (options.retrySignal?.aborted) {
+      throw options.retryAbortError?.() ?? new APIUserAbortError()
     }
 
     try {
@@ -282,7 +292,9 @@ export async function* withRetry<T>(
         provider: getAPIProviderForStatsig(),
       })
 
-      await sleep(delayMs, options.signal, { abortError })
+      await sleep(delayMs, options.retrySignal ?? options.signal, {
+        abortError: options.retryAbortError ?? abortError,
+      })
     }
   }
 

@@ -1,6 +1,7 @@
 
 import type { Base64ImageSource } from '../../types/api-types.js'
 import type { ToolArtifactCandidate } from '../../types/toolArtifact.js'
+import { constants as fsConstants } from 'fs'
 import {
   mkdtemp,
   open as openFileAsync,
@@ -49,7 +50,10 @@ import {
 } from '../../utils/file.js'
 import { logFileOperation } from '../../utils/fileOperationAnalytics.js'
 import { formatFileSize } from '../../utils/format.js'
-import { getFsImplementation } from '../../utils/fsOperations.js'
+import {
+  type FileIdentity,
+  getFsImplementation,
+} from '../../utils/fsOperations.js'
 import {
   compressImageBufferWithTokenLimit,
   createImageMetadataText,
@@ -116,6 +120,10 @@ import { matchWildcardPattern } from '../../utils/permissions/shellRuleMatching.
 import { readFileInRange } from '../../utils/readFileInRange.js'
 import { semanticNumber } from '../../utils/semanticNumber.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+import {
+  getBoundTaskOutputForPath,
+  resolveTaskOutputFileIdentity,
+} from '../../utils/task/diskOutput.js'
 import { BASH_TOOL_NAME } from '../BashTool/toolName.js'
 import { getDefaultFileReadingLimits } from './limits.js'
 import {
@@ -394,10 +402,30 @@ const BINARY_SNIFF_PREFIX_BYTES = 8192
  * file as binary. Returns null when the prefix cannot be read (the main read
  * path will surface its own error).
  */
-async function readRawFilePrefix(filePath: string): Promise<Buffer | null> {
+async function readRawFilePrefix(
+  filePath: string,
+  expectedIdentity?: FileIdentity,
+): Promise<Buffer | null> {
   try {
-    const handle = await openFileAsync(filePath, 'r')
+    const handle = await openFileAsync(
+      filePath,
+      expectedIdentity === undefined
+        ? 'r'
+        : process.platform === 'win32'
+          ? 'r'
+          : fsConstants.O_RDONLY | fsConstants.O_NONBLOCK,
+    )
     try {
+      if (expectedIdentity !== undefined) {
+        const stats = await handle.stat({ bigint: true })
+        if (
+          !stats.isFile() ||
+          stats.dev !== expectedIdentity.dev ||
+          stats.ino !== expectedIdentity.ino
+        ) {
+          return null
+        }
+      }
       const buf = Buffer.alloc(BINARY_SNIFF_PREFIX_BYTES)
       const { bytesRead } = await handle.read(buf, 0, BINARY_SNIFF_PREFIX_BYTES, 0)
       return buf.subarray(0, bytesRead)
@@ -679,11 +707,48 @@ export const FileReadTool = buildTool({
   },
   async checkPermissions(input, context): Promise<PermissionDecision> {
     const appState = context.getAppState()
-    return checkReadPermissionForTool(
+    const boundTaskOutput = getBoundTaskOutputForPath(
+      expandPath(input.file_path),
+    )
+    const decision = checkReadPermissionForTool(
       FileReadTool,
       input,
       appState.toolPermissionContext,
     )
+    if (boundTaskOutput !== null) {
+      const backingDecision = checkReadPermissionForTool(
+        FileReadTool,
+        { ...input, file_path: boundTaskOutput.readPath },
+        appState.toolPermissionContext,
+      )
+      if (
+        backingDecision.behavior === 'deny' ||
+        (backingDecision.behavior === 'ask' &&
+          backingDecision.decisionReason?.type !== 'workingDir')
+      ) {
+        return backingDecision
+      }
+    }
+    // Only a host-registered task artifact receives the old temp-path
+    // convenience. The whole project temp tree is not an automatic trust root:
+    // a sandboxed command can place symlinks there. Explicit deny/ask rules and
+    // every earlier safety decision still win; only the final outside-workdir
+    // prompt is replaced for this inode-bound alias.
+    if (
+      decision.behavior === 'ask' &&
+      decision.decisionReason?.type === 'workingDir' &&
+      boundTaskOutput !== null
+    ) {
+      return {
+        behavior: 'allow',
+        updatedInput: input,
+        decisionReason: {
+          type: 'other',
+          reason: 'Host-bound task output is allowed for reading',
+        },
+      }
+    }
+    return decision
   },
   ...createToolPresentationDelegates(FILE_READ_TOOL_NAME, [
     'renderToolUseMessage',
@@ -819,6 +884,7 @@ export const FileReadTool = buildTool({
     // Use expandPath for consistent path normalization with FileEditTool/FileWriteTool
     // (especially handles whitespace trimming and Windows path separators)
     const fullFilePath = expandPath(file_path)
+    const boundTaskOutput = getBoundTaskOutputForPath(fullFilePath)
 
     // Dedup: if we've already read this exact range and the file hasn't
     // changed on disk, return a stub instead of re-sending the full content.
@@ -837,7 +903,7 @@ export const FileReadTool = buildTool({
       'tengu_read_dedup_killswitch',
       false,
     )
-    const existingState = dedupKillswitch
+    const existingState = dedupKillswitch || boundTaskOutput !== null
       ? undefined
       : readFileState.get(fullFilePath)
     // Only dedup entries that came from a prior Read (offset is always set
@@ -891,10 +957,13 @@ export const FileReadTool = buildTool({
     }
 
     try {
+      const boundIdentity = boundTaskOutput
+        ? await resolveTaskOutputFileIdentity(boundTaskOutput.taskId)
+        : undefined
       return await callInner(
         file_path,
         fullFilePath,
-        fullFilePath,
+        boundTaskOutput?.readPath ?? fullFilePath,
         ext,
         offset,
         limit,
@@ -904,6 +973,7 @@ export const FileReadTool = buildTool({
         readFileState,
         context,
         parentMessage?.message.id,
+        boundIdentity,
       )
     } catch (error) {
       // Handle file-not-found: suggest similar files
@@ -1140,6 +1210,7 @@ async function callInner(
   readFileState: ToolUseContext['readFileState'],
   context: ToolUseContext,
   messageId: string | undefined,
+  expectedIdentity?: FileIdentity,
 ): Promise<{
   data: Output
   artifacts?: ToolArtifactCandidate[]
@@ -1661,7 +1732,10 @@ async function callInner(
   // were mojibake before too — an explicit error with an iconv hint strictly
   // beats silent garbage.
   {
-    const rawPrefix = await readRawFilePrefix(resolvedFilePath)
+    const rawPrefix = await readRawFilePrefix(
+      resolvedFilePath,
+      expectedIdentity,
+    )
     if (rawPrefix !== null && isBinaryContent(rawPrefix)) {
       throw new Error(
         `This file has a text extension but binary content and cannot be read as text. ` +
@@ -1678,6 +1752,8 @@ async function callInner(
       limit,
       limit === undefined ? maxSizeBytes : undefined,
       context.abortController.signal,
+      undefined,
+      expectedIdentity,
     )
 
   await validateContentTokens(content, ext, maxTokens)

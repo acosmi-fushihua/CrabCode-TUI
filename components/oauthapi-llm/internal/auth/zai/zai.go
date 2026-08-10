@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/acosmi/OAuthAPI-LLM/internal/auth/autherrors"
 	"github.com/acosmi/OAuthAPI-LLM/internal/config"
 	"github.com/acosmi/OAuthAPI-LLM/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -185,7 +186,7 @@ func (z *ZaiAuth) WaitForAuthorization(ctx context.Context, init *InitResponse) 
 			return nil, fmt.Errorf("zai: context cancelled: %w", ctx.Err())
 		case <-ticker.C:
 			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("zai: authorization timed out")
+				return nil, autherrors.Classify(autherrors.ErrAuthorizationTimeout, fmt.Errorf("zai: authorization timed out"))
 			}
 			result, done, terminal, err := z.poll(ctx, init)
 			if err != nil {
@@ -197,7 +198,7 @@ func (z *ZaiAuth) WaitForAuthorization(ctx context.Context, init *InitResponse) 
 				// the whole login on the first hiccup.
 				consecutiveErrors++
 				if consecutiveErrors >= maxConsecutivePollErrors {
-					return nil, fmt.Errorf("zai: polling failed after %d consecutive errors: %w", consecutiveErrors, err)
+					return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("zai: polling failed after %d consecutive errors: %w", consecutiveErrors, err))
 				}
 				log.Warnf("zai: transient polling error (%d/%d), will retry: %v", consecutiveErrors, maxConsecutivePollErrors, err)
 				continue
@@ -242,17 +243,17 @@ func (z *ZaiAuth) poll(ctx context.Context, init *InitResponse) (*ReadyResult, b
 		} `json:"zai"`
 	}
 	if err = json.Unmarshal(data, &poll); err != nil {
-		return nil, false, true, fmt.Errorf("zai: failed to parse poll response: %w", err)
+		return nil, false, true, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("zai: failed to parse poll response: %w", err))
 	}
 
 	switch poll.Status {
 	case "pending", "":
 		return nil, false, false, nil
 	case "failed":
-		return nil, false, true, fmt.Errorf("zai: authorization failed or was denied")
+		return nil, false, true, autherrors.Classify(autherrors.ErrAuthorizationDenied, fmt.Errorf("zai: authorization failed or was denied"))
 	case "ready":
 		if strings.TrimSpace(poll.Token) == "" {
-			return nil, false, true, fmt.Errorf("zai: ready response missing token")
+			return nil, false, true, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("zai: ready response missing token"))
 		}
 		return &ReadyResult{
 			Token:          poll.Token,
@@ -262,7 +263,7 @@ func (z *ZaiAuth) poll(ctx context.Context, init *InitResponse) (*ReadyResult, b
 			Name:           poll.User.Name,
 		}, true, false, nil
 	default:
-		return nil, false, true, fmt.Errorf("zai: unexpected poll status %q", poll.Status)
+		return nil, false, true, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("zai: unexpected poll status %q", poll.Status))
 	}
 }
 

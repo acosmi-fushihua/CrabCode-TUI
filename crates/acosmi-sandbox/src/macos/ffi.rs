@@ -80,7 +80,23 @@ pub const SANDBOX_FILTER_PATH: libc::c_int = 1;
 /// 用于 `platform::verify_sandbox_active` 的 macOS 分支，替代原来的
 /// 双路 no-op 弱验证。
 pub fn seatbelt_canary_write_denied(path: &str) -> Result<bool, SandboxError> {
-    let op = CString::new("file-write-data").map_err(|_| SandboxError::Seatbelt {
+    seatbelt_operation_denied(OP_FILE_WRITE_DATA, path)
+}
+
+/// `sandbox_check` 的写操作名。
+pub const OP_FILE_WRITE_DATA: &str = "file-write-data";
+/// `sandbox_check` 的读操作名。
+pub const OP_FILE_READ_DATA: &str = "file-read-data";
+
+/// 问 kernel：当前进程对 `path` 做 `operation` 会不会被策略拒绝？
+///
+/// W-SANDBOX-ENFORCED-DEADCODE PR-2 把它从 canary 专用推广成通用查询：
+/// SBPL 的 deny 规则靠「后写的规则赢」压过先前的 allow，而这条**优先级假设
+/// 本身**没有编译期证据。所以施加层不信它，改成施加完成后逐条问 kernel
+/// ——把一个信念换成一次实测。证不出来就让整条命令失败（125），
+/// 绝不放一个「以为挡住了」的沙箱出去。
+pub fn seatbelt_operation_denied(operation: &str, path: &str) -> Result<bool, SandboxError> {
+    let op = CString::new(operation).map_err(|_| SandboxError::Seatbelt {
         message: "canary op contains null bytes (should never happen)".into(),
     })?;
     let path_c = CString::new(path).map_err(|_| SandboxError::Seatbelt {

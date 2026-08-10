@@ -179,11 +179,28 @@ const REPORT_SCHEMA = {
 // are Promise.all: an agent that rejects would take its whole fan-out with it,
 // so a failure is converted into the same null the user-skip path produces and
 // the callers' existing null handling deals with both uniformly.
+// Agent calls that produced nothing usable, by phase. Every null below is a
+// piece of evidence the report will not contain, and a report that does not say
+// so overstates its own coverage — the 2026-08-03 audit found a claim passing
+// "2-0 (1 abstained)" with nothing anywhere recording that a third of its
+// adjudication had been lost.
+//
+// NOTE: this whole script is a template literal in the enclosing .ts file, so
+// neither a backtick nor a dollar-brace may appear anywhere in it — including
+// inside comments. A backtick ends the literal; a dollar-brace starts an
+// interpolation. Both fail at compile time, which is the good outcome.
+const degraded = { scope: 0, search: 0, fetch: 0, verify: 0, synth: 0, other: 0 }
 const ask = (prompt, options) =>
   agent(prompt, { agentType: AGENT_TYPE, ...options }).catch(error => {
+    const bucket = (options.phase || "other").toLowerCase()
+    if (degraded[bucket] === undefined) degraded.other++
+    else degraded[bucket]++
     log("Agent failed (" + (options.label || AGENT_TYPE) + "): " + ((error && error.message) || error))
     return null
   })
+/** Total agent calls that yielded nothing. */
+const degradedTotal = () =>
+  degraded.scope + degraded.search + degraded.fetch + degraded.verify + degraded.synth + degraded.other
 
 // --- Phase 0: Scope ---
 phase("Scope")
@@ -191,7 +208,14 @@ const QUESTION = (typeof args === "string" && args.trim()) || ""
 if (!QUESTION) {
   return { error: "No research question was provided. Pass one as args: Workflow({name: 'deep-research', args: '<your research question>'})." }
 }
-log("This run sends the question and its search queries to the configured web search service; every source fetch asks for approval under your existing permission settings.")
+// The permission posture of this run is announced by the host before the
+// script starts (WorkflowTool.ts::describePermissionPosture) — only the host
+// can see whether this surface auto-allows or refuses what it cannot ask
+// about, and the sentence the script used to print here was true on no path a
+// workflow actually takes. Do not restate the old wording even in a comment:
+// the drift gate greps this whole file, so quoting the retired phrase would
+// keep it passing forever.
+log("This run sends the question and its search queries to the configured web search service.")
 log("Question: " + QUESTION.slice(0, 80) + (QUESTION.length > 80 ? "…" : ""))
 
 const scope = await ask(
@@ -208,16 +232,55 @@ const scope = await ask(
   { label: "scope", schema: SCOPE_SCHEMA }
 )
 if (!scope) {
-  return { error: "The scoping agent returned nothing, so the research question could not be decomposed." }
+  // Distinguish "the agent failed" from "there was no time left to run it".
+  // The host refuses new agents once the runtime budget is gone, which arrives
+  // here as the same null and would otherwise be reported as an agent fault.
+  return {
+    error: deadline.exceeded()
+      ? "The run reached its time budget before the research question could be decomposed, so nothing was searched."
+      : "The scoping agent returned nothing, so the research question could not be decomposed.",
+  }
 }
 log("Scoped into " + scope.angles.length + " angles: " + scope.angles.map(a => a.label).join(", "))
 
 // --- Dedupe state: accumulates as each search agent finishes ---
+// URL parsing is done with string operations, not the URL constructor: the
+// workflow sandbox is a bare vm context that provides the ECMAScript
+// intrinsics and no host globals at all, so URL is undefined here (see
+// WORKFLOW_SANDBOX_MISSING_GLOBALS in runtime.ts). The original code wrapped
+// new URL in try/catch, which read like defensive programming but was a
+// branch that always fell through to raw lowercasing — five cosmetic variants
+// of one page counted as five distinct sources and each consumed a fetch.
+const stripURLScheme = u => String(u).replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "")
+const authorityHost = authority => {
+  const hostPort = String(authority).split("@").pop()
+  // A bracketed IPv6 literal contains colons that are part of the address,
+  // not a host/port separator. Preserve the complete bracketed host and drop
+  // only a suffix after the closing bracket (normally the port).
+  if (hostPort.startsWith("[")) {
+    const close = hostPort.indexOf("]")
+    return close === -1 ? hostPort : hostPort.slice(0, close + 1)
+  }
+  return hostPort.split(":")[0]
+}
+const urlHost = u => {
+  const hostAndPath = stripURLScheme(u)
+  const end = hostAndPath.search(/[/?#]/)
+  const authority = end === -1 ? hostAndPath : hostAndPath.slice(0, end)
+  // Drop userinfo and port; keep the registrable host only.
+  const host = authorityHost(authority)
+  return host.replace(/^www\./i, "").toLowerCase()
+}
 const normURL = u => {
-  try {
-    const p = new URL(u)
-    return (p.hostname.replace(/^www\./, "") + p.pathname.replace(/\/$/, "")).toLowerCase()
-  } catch { return u.toLowerCase() }
+  const hostAndPath = stripURLScheme(u)
+  // Query strings and fragments are tracking/navigation noise for dedupe
+  // purposes; two links differing only by ?utm_source= are the same page.
+  const withoutQuery = hostAndPath.split("#")[0].split("?")[0]
+  const slash = withoutQuery.indexOf("/")
+  const authority = slash === -1 ? withoutQuery : withoutQuery.slice(0, slash)
+  const path = slash === -1 ? "" : withoutQuery.slice(slash)
+  const host = authorityHost(authority).replace(/^www\./i, "")
+  return (host + path.replace(/\/+$/, "")).toLowerCase()
 }
 const seen = new Map()
 const dupes = []
@@ -271,6 +334,17 @@ const VERIFY_PROMPT = (claim, v) =>
   LANGUAGE_RULE + "\n\nReturn structured output only. Evidence must be specific."
 
 // --- Pipeline: Search -> dedupe -> Fetch+extract (two stages, no barrier) ---
+// Both stages announce themselves. Declaring "Search" and "Fetch" in
+// meta.phases and then only tagging individual agents with them left the run's
+// reported phase sitting on "Scope" from the first search until verification
+// began — the whole expensive middle of the run, and exactly the window a
+// wall-clock handoff or a watchdog kill lands in, named the wrong stage.
+// The two stages genuinely interleave (pipeline has no barrier), so "Fetch" is
+// announced once, when the first source is actually dispatched: by then
+// searching is effectively done and fetching is what the run is spending its
+// time on.
+phase("Search")
+let announcedFetchPhase = false
 const searchResults = await pipeline(
   scope.angles,
 
@@ -309,10 +383,13 @@ const searchResults = await pipeline(
     if (novel.length < searchResult.results.length) {
       log(searchResult.angle + ": " + novel.length + " new sources (" + (searchResult.results.length - novel.length) + " filtered out)")
     }
+    if (novel.length > 0 && !announcedFetchPhase) {
+      announcedFetchPhase = true
+      phase("Fetch")
+    }
     return parallel(
       novel.map(source => () => {
-        let host = "unknown"
-        try { host = new URL(source.url).hostname.replace(/^www\./, "") } catch {}
+        const host = urlHost(source.url) || "unknown"
         return ask(FETCH_PROMPT(source, searchResult.angle), {
           label: "fetch:" + host,
           phase: "Fetch",
@@ -361,6 +438,23 @@ if (rankedClaims.length === 0) {
 }
 
 // --- Verify: 3 adversarial votes ---
+// Verification is the most expensive stage (VOTES_PER_CLAIM agents per claim
+// against a 3-wide scheduler), so it is the one place where entering with no
+// budget left guarantees a wasted, truncated run. Report what the fetch stage
+// already established instead.
+if (deadline.exceeded()) {
+  return {
+    question: QUESTION,
+    status: "incomplete",
+    summary: "The run reached its time budget after fetching sources but before adversarial verification, so these claims are unverified. " +
+      allSources.length + " sources produced " + allClaims.length + " claims.",
+    findings: [],
+    unverifiedClaims: rankedClaims.map(c => ({ claim: c.claim, source: c.sourceUrl, quote: c.quote, quality: c.sourceQuality })),
+    sources: allSources.map(s => ({ url: s.url, quality: s.sourceQuality, claimCount: s.claims.length })),
+    stats: { angles: scope.angles.length, sources: allSources.length, claims: allClaims.length, verified: 0, urlDupes: dupes.length, budgetDropped: budgetDropped.length },
+  }
+}
+
 // The barrier here is deliberate: the full claim pool has to be collected
 // before it can be ranked and the best claims selected for verification.
 phase("Verify")
@@ -391,6 +485,10 @@ const voted = (await parallel(
   )
 )).filter(Boolean)
 
+// Adjudication actually lost, not merely "some votes were null": each claim's
+// missing votes summed. Reported alongside the verdicts so a reader can tell a
+// 3-0 from a 2-0-with-one-vote-missing.
+const abstainedVotes = voted.reduce((sum, c) => sum + (VOTES_PER_CLAIM - c.verdicts.length), 0)
 const confirmed = voted.filter(c => c.survives)
 const killed = voted.filter(c => !c.survives)
 log("Verification complete: " + voted.length + " claims -> " + confirmed.length + " survived, " + killed.length + " eliminated")
@@ -402,11 +500,27 @@ if (confirmed.length === 0) {
     findings: [],
     refuted: killed.map(c => ({ claim: c.claim, vote: (c.verdicts.length - c.refutedVotes) + "-" + c.refutedVotes, source: c.sourceUrl })),
     sources: allSources.map(s => ({ url: s.url, quality: s.sourceQuality, claimCount: s.claims.length })),
-    stats: { angles: scope.angles.length, sources: allSources.length, claims: allClaims.length, verified: voted.length, confirmed: 0, killed: killed.length },
+    stats: { angles: scope.angles.length, sources: allSources.length, claims: allClaims.length, verified: voted.length, confirmed: 0, killed: killed.length, degradedAgentCalls: degradedTotal(), abstainedVotes },
   }
 }
 
 // --- Synthesize ---
+// Synthesis is a single agent, so it is worth attempting even on a thin
+// budget; only skip it once the budget is actually gone, and hand back the
+// verified claims unmerged rather than losing them.
+if (deadline.exceeded()) {
+  return {
+    question: QUESTION,
+    status: "incomplete",
+    summary: "The run reached its time budget after verification but before synthesis — returning the " + confirmed.length + " verified claims directly, unmerged.",
+    findings: [],
+    confirmed: confirmed.map(c => ({ claim: c.claim, source: c.sourceUrl, quote: c.quote, vote: (c.verdicts.length - c.refutedVotes) + "-" + c.refutedVotes })),
+    refuted: killed.map(c => ({ claim: c.claim, vote: (c.verdicts.length - c.refutedVotes) + "-" + c.refutedVotes, source: c.sourceUrl })),
+    sources: allSources.map(s => ({ url: s.url, quality: s.sourceQuality, claimCount: s.claims.length })),
+    stats: { angles: scope.angles.length, sources: allSources.length, claims: allClaims.length, verified: voted.length, confirmed: confirmed.length, killed: killed.length, afterSynthesis: 0, degradedAgentCalls: degradedTotal(), abstainedVotes },
+  }
+}
+
 phase("Synthesize")
 const confRank = { high: 0, medium: 1, low: 2 }
 const block = confirmed.map((c, i) => {
@@ -447,7 +561,7 @@ if (!report) {
     confirmed: confirmed.map(c => ({ claim: c.claim, source: c.sourceUrl, quote: c.quote, vote: (c.verdicts.length - c.refutedVotes) + "-" + c.refutedVotes })),
     refuted: killed.map(c => ({ claim: c.claim, vote: (c.verdicts.length - c.refutedVotes) + "-" + c.refutedVotes, source: c.sourceUrl })),
     sources: allSources.map(s => ({ url: s.url, quality: s.sourceQuality, claimCount: s.claims.length })),
-    stats: { angles: scope.angles.length, sources: allSources.length, claims: allClaims.length, verified: voted.length, confirmed: confirmed.length, killed: killed.length, afterSynthesis: 0 },
+    stats: { angles: scope.angles.length, sources: allSources.length, claims: allClaims.length, verified: voted.length, confirmed: confirmed.length, killed: killed.length, afterSynthesis: 0, degradedAgentCalls: degradedTotal(), abstainedVotes },
   }
 }
 
@@ -467,6 +581,11 @@ return {
     urlDupes: dupes.length,
     budgetDropped: budgetDropped.length,
     agentCalls: 1 + scope.angles.length + allSources.length + (voted.length * VOTES_PER_CLAIM) + 1,
+    // Coverage actually lost. agentCalls above counts what was *planned*;
+    // these two say how much of it produced nothing, so the reader can judge
+    // the report evidence base instead of assuming the plan was executed.
+    degradedAgentCalls: degradedTotal(),
+    abstainedVotes,
   },
 }
 `

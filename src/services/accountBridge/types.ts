@@ -168,7 +168,18 @@ export interface AccountBridgeLoginStartParams {
 }
 
 export interface AccountBridgeLoginPollView {
-  state: 'pending' | 'succeeded' | 'failed' | 'cancelled' | 'expired'
+  /**
+   * The sidecar instance that owned this session stopped or was replaced.
+   * This is terminal: callers must start a new login instead of polling the
+   * replacement process with an identifier it never minted.
+   */
+  state:
+    | 'pending'
+    | 'succeeded'
+    | 'failed'
+    | 'cancelled'
+    | 'expired'
+    | 'session-lost'
   accountId: string | null
   errorCode: string | null
 }
@@ -505,7 +516,7 @@ export function parseAccountBridgeLoginPollView(
   return {
     state: enumField(
       input.state,
-      ['pending', 'succeeded', 'failed', 'cancelled', 'expired'],
+      ['pending', 'succeeded', 'failed', 'cancelled', 'expired', 'session-lost'],
       'loginPoll.state',
     ),
     accountId: nullableString(input.accountId, 'loginPoll.accountId'),

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/acosmi/OAuthAPI-LLM/internal/auth/autherrors"
 	"github.com/acosmi/OAuthAPI-LLM/internal/config"
 	"github.com/acosmi/OAuthAPI-LLM/internal/util"
 	"github.com/google/uuid"
@@ -240,7 +241,7 @@ func (c *DeviceFlowClient) PollForToken(ctx context.Context, deviceCode *DeviceC
 			return nil, fmt.Errorf("qwen: context cancelled: %w", ctx.Err())
 		case <-ticker.C:
 			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("qwen: device code expired")
+				return nil, autherrors.Classify(autherrors.ErrAuthorizationTimeout, fmt.Errorf("qwen: device code expired"))
 			}
 
 			token, slowDown, pollErr, shouldContinue := c.exchangeDeviceCode(ctx, deviceCode.DeviceCode, deviceCode.CodeVerifier)
@@ -281,7 +282,7 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode, c
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, false, fmt.Errorf("qwen: token request failed: %w", err), false
+		return nil, false, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("qwen: token request failed: %w", err)), false
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -291,13 +292,13 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode, c
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, false, fmt.Errorf("qwen: failed to read token response: %w", err), false
+		return nil, false, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("qwen: failed to read token response: %w", err)), false
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		var oauthErr qwenOAuthError
 		if json.Unmarshal(bodyBytes, &oauthErr) != nil || oauthErr.Error == "" {
-			return nil, false, fmt.Errorf("qwen: token poll failed with status %d: %s", resp.StatusCode, string(bodyBytes)), false
+			return nil, false, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("qwen: token poll failed with status %d: %s", resp.StatusCode, string(bodyBytes))), false
 		}
 		if resp.StatusCode == http.StatusBadRequest && oauthErr.Error == "authorization_pending" {
 			return nil, false, nil, true
@@ -307,9 +308,9 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode, c
 		}
 		switch oauthErr.Error {
 		case "expired_token":
-			return nil, false, fmt.Errorf("qwen: device code expired"), false
+			return nil, false, autherrors.Classify(autherrors.ErrAuthorizationTimeout, fmt.Errorf("qwen: device code expired")), false
 		case "access_denied":
-			return nil, false, fmt.Errorf("qwen: access denied by user"), false
+			return nil, false, autherrors.Classify(autherrors.ErrAuthorizationDenied, fmt.Errorf("qwen: access denied by user")), false
 		default:
 			return nil, false, fmt.Errorf("qwen: OAuth error: %s - %s", oauthErr.Error, oauthErr.ErrorDescription), false
 		}
@@ -324,10 +325,10 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode, c
 		ResourceURL  string  `json:"resource_url"`
 	}
 	if err = json.Unmarshal(bodyBytes, &tokenResp); err != nil {
-		return nil, false, fmt.Errorf("qwen: failed to parse token response: %w", err), false
+		return nil, false, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("qwen: failed to parse token response: %w", err)), false
 	}
 	if tokenResp.AccessToken == "" {
-		return nil, false, fmt.Errorf("qwen: empty access token in response"), false
+		return nil, false, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("qwen: empty access token in response")), false
 	}
 
 	var expiresAt int64

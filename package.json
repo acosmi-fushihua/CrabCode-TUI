@@ -45,7 +45,7 @@
   },
   "dependencies": {
     "@acosmi-ai/mcpb": "npm:@anthropic-ai/mcpb@2.1.2",
-    "@acosmi/sdk-ts": "2.15.0",
+    "@acosmi/sdk-ts": "2.16.0",
     "@alcalzone/ansi-tokenize": "^0.3.0",
     "@alcalzone/jsonl-db": "^4.0.2",
     "@aws-sdk/client-bedrock": "^3.1024.0",

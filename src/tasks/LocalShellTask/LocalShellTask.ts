@@ -1,5 +1,4 @@
 import { feature } from '../../utils/featurePolyfill.js';
-import { stat } from 'fs/promises';
 import { OUTPUT_FILE_TAG, STATUS_TAG, SUMMARY_TAG, TASK_ID_TAG, TASK_NOTIFICATION_TAG, TOOL_USE_ID_TAG } from '../../constants/xml.js';
 import { abortSpeculation } from '../../services/PromptSuggestion/speculation.js';
 import type { AppState } from '../../state/AppState.js';
@@ -15,7 +14,12 @@ import {
   retractPendingNotificationsForTask
 } from '../../utils/messageQueueManager.js';
 import type { ShellCommand } from '../../utils/ShellCommand.js';
-import { evictTaskOutput, getTaskOutputPath } from '../../utils/task/diskOutput.js';
+import {
+  evictTaskOutput,
+  getTaskOutputPath,
+  getTaskOutputSize,
+  requireTaskOutputFileIdentity
+} from '../../utils/task/diskOutput.js';
 import { registerTask, updateTaskState } from '../../utils/task/framework.js';
 import { escapeXml } from '../../utils/xml.js';
 import { backgroundAgentTask, isLocalAgentTask } from '../LocalAgentTask/LocalAgentTask.js';
@@ -55,14 +59,20 @@ function startStallWatchdog(taskId: string, description: string, kind: BashTaskK
   let cancelled = false;
   let admissionInFlight = false;
   const timer = setInterval(() => {
-    void stat(outputPath).then(s => {
-      if (s.size > lastSize) {
-        lastSize = s.size;
+    void getTaskOutputSize(taskId).then(size => {
+      if (size > lastSize) {
+        lastSize = size;
         lastGrowth = Date.now();
         return;
       }
       if (Date.now() - lastGrowth < STALL_THRESHOLD_MS) return;
-      void tailFile(outputPath, STALL_TAIL_BYTES).then(async ({
+      let identity;
+      try {
+        identity = requireTaskOutputFileIdentity(taskId);
+      } catch {
+        return;
+      }
+      void tailFile(outputPath, STALL_TAIL_BYTES, identity).then(async ({
         content
       }) => {
         if (cancelled || admissionInFlight) return;

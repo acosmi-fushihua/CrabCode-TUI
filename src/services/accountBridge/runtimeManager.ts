@@ -49,24 +49,6 @@ import {
   loadOrCreateAccountBridgeMasterKey,
 } from "./masterKey.js";
 
-export const ACCOUNT_BRIDGE_PUBLIC_METHODS = [
-  "worker.accountBridge/eligibility/read",
-  "worker.accountBridge/connector/list",
-  "worker.accountBridge/runtime/status",
-  "worker.accountBridge/runtime/ensure",
-  "worker.accountBridge/runtime/stop",
-  "worker.accountBridge/account/list",
-  "worker.accountBridge/login/start",
-  "worker.accountBridge/login/poll",
-  "worker.accountBridge/login/cancel",
-  "worker.accountBridge/account/remove",
-  "worker.accountBridge/model/list",
-  "worker.accountBridge/usage/read",
-] as const;
-
-export const ACCOUNT_BRIDGE_TURN_ACCESS_METHOD =
-  "worker.internal/accountBridge/turnAccess" as const;
-
 const COMPONENT = "OAuthAPI-LLM";
 const COMPONENT_MODULE = "github.com/acosmi/OAuthAPI-LLM";
 const GRANT_AUDIENCE = "crabcode-account-bridge";
@@ -158,7 +140,7 @@ export class AccountBridgeError extends Error {
 function isOptionalUsageAvailabilityError(error: unknown): boolean {
   if (!(error instanceof AccountBridgeError)) return false;
   if (error.code === "facade-unavailable") return true;
-  const match = /^facade-http-(\d{3})$/.exec(error.code);
+  const match = /^facade-http-(\d{3})(?:-|$)/.exec(error.code);
   if (!match) return false;
   const status = Number(match[1]);
   // The usage facade is an optional observation only when it is genuinely
@@ -271,12 +253,32 @@ export interface AccountBridgeArtifact {
   fixedPlugins: Array<{ id: "gemini-cli"; path: string; sha256: string }>;
 }
 
+export interface AccountBridgeSidecarLogLine {
+  stream: "stdout" | "stderr";
+  timestamp: string | null;
+  level: string | null;
+  origin: string | null;
+  message: string | null;
+  redactedByteLength: number | null;
+}
+
+export interface AccountBridgeSidecarForensics {
+  exitCode: number | null;
+  exitSignal: string | null;
+  spawnErrorCode: string | null;
+  bannerLine: string | null;
+  logLines: AccountBridgeSidecarLogLine[];
+  droppedLineCount: number;
+  readyLineRejected: boolean;
+}
+
 export interface AccountBridgeChild {
   readonly pid: number;
   readonly endpoint: Promise<string>;
   readonly exited: Promise<number | null>;
   terminate(): void;
   kill(): void;
+  forensics(): AccountBridgeSidecarForensics;
 }
 
 export interface AccountBridgeSpawnInput {
@@ -350,7 +352,6 @@ export interface AccountBridgeManagerDeps {
     inferenceKey: string;
     fixedPlugins: AccountBridgeArtifact["fixedPlugins"];
   }): Promise<{ configPath: string; runtimeDir: string }>;
-  removeConfigFile(configPath: string): Promise<void>;
   removeRuntimeFiles(runtimeDir: string): Promise<void>;
   spawnSidecar(input: AccountBridgeSpawnInput): Promise<AccountBridgeChild>;
   http(input: {
@@ -433,6 +434,12 @@ export interface AccountBridgeLocalDiagnosticBundle {
     }>;
   } | null;
   collectionErrorCode: "sidecar-snapshot-unavailable" | null;
+  sidecarProcess: AccountBridgeSidecarForensics | null;
+  sidecarProcessHistory: Array<{
+    capturedAt: string;
+    readyDurationMs: number | null;
+    forensics: AccountBridgeSidecarForensics | null;
+  }>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1225,6 +1232,8 @@ function buildAccountBridgeLocalDiagnosticBundle(input: {
   routes: AccountBridgeModelRouteView[] | null;
   usage: AccountBridgeUsageSnapshot[] | null;
   collectionError: boolean;
+  sidecarProcess: AccountBridgeSidecarForensics | null;
+  sidecarProcessHistory: readonly AccountBridgeSidecarForensicsRecord[];
 }): AccountBridgeLocalDiagnosticBundle {
   const referenceSalt = randomBytes(32);
   let sidecar: AccountBridgeLocalDiagnosticBundle["sidecar"] = null;
@@ -1331,6 +1340,12 @@ function buildAccountBridgeLocalDiagnosticBundle(input: {
     collectionErrorCode: input.collectionError
       ? "sidecar-snapshot-unavailable"
       : null,
+    sidecarProcess: input.sidecarProcess,
+    sidecarProcessHistory: input.sidecarProcessHistory.map(record => ({
+      capturedAt: record.capturedAt,
+      readyDurationMs: record.readyDurationMs,
+      forensics: record.forensics,
+    })),
   };
 }
 
@@ -1344,9 +1359,20 @@ export function accountBridgeAutomaticRestartDelay(
     : null;
 }
 
+export const SIDECAR_FORENSICS_HISTORY_CAPACITY = 5;
+
+interface AccountBridgeSidecarForensicsRecord {
+  capturedAt: string;
+  readyDurationMs: number | null;
+  forensics: AccountBridgeSidecarForensics | null;
+}
+
 export class AccountBridgeManager {
   private state: AccountBridgeRuntimeView["state"] = "stopped";
   private lastErrorCode: string | null = null;
+  private lastSidecarForensics: AccountBridgeSidecarForensics | null = null;
+  private sidecarForensicsHistory: AccountBridgeSidecarForensicsRecord[] = [];
+  private lastReadyAtMs: number | null = null;
   private artifact: AccountBridgeArtifact | null = null;
   private eligibility: VerifiedEligibility | null = null;
   private connectorDirectory: VerifiedConnectorPolicyDirectory | null = null;
@@ -1412,6 +1438,27 @@ export class AccountBridgeManager {
     return this.diagnosticWriteFlight;
   }
 
+  private recordSidecarForensicsHistory(
+    forensics: AccountBridgeSidecarForensics | null,
+  ): void {
+    const now = this.deps.now();
+    this.sidecarForensicsHistory.push({
+      capturedAt: new Date(now).toISOString(),
+      readyDurationMs:
+        this.lastReadyAtMs !== null
+          ? Math.max(0, now - this.lastReadyAtMs)
+          : null,
+      forensics,
+    });
+    this.lastReadyAtMs = null;
+    while (
+      this.sidecarForensicsHistory.length >
+      SIDECAR_FORENSICS_HISTORY_CAPACITY
+    ) {
+      this.sidecarForensicsHistory.shift();
+    }
+  }
+
   private async writeLocalDiagnostics(): Promise<void> {
     let connectors: AccountBridgeConnectorView[] | null = null;
     let accounts: AccountBridgeAccountView[] | null = null;
@@ -1444,6 +1491,8 @@ export class AccountBridgeManager {
       routes,
       usage,
       collectionError,
+      sidecarProcess: this.lastSidecarForensics,
+      sidecarProcessHistory: this.sidecarForensicsHistory,
     });
     await this.deps.writeDiagnosticBundle(bundle);
   }
@@ -1702,10 +1751,12 @@ export class AccountBridgeManager {
       (!Number.isSafeInteger(expiresIn) ||
         Number(expiresIn) <= 0 ||
         Number(expiresIn) > 3_600 ||
-        typeof raw.user_code !== "string" ||
-        raw.user_code.length === 0 ||
-        raw.user_code.length > 128 ||
-        /[\u0000-\u001f\u007f]/.test(raw.user_code))
+        (raw.user_code !== undefined &&
+          raw.user_code !== null &&
+          (typeof raw.user_code !== "string" ||
+            raw.user_code.length === 0 ||
+            raw.user_code.length > 128 ||
+            /[\u0000-\u001f\u007f]/.test(raw.user_code))))
     ) {
       throw new AccountBridgeError("login-start-response-invalid");
     }
@@ -1714,7 +1765,7 @@ export class AccountBridgeManager {
       authMode,
       authorizationUrl: isDevice ? null : authorizationURL.toString(),
       userCode:
-        isDevice ? raw.user_code : null,
+        isDevice && typeof raw.user_code === "string" ? raw.user_code : null,
       verificationUrl: isDevice ? authorizationURL.toString() : null,
       expiresAt: isDevice
         ? new Date(this.deps.now() + Number(expiresIn) * 1_000).toISOString()
@@ -1727,6 +1778,13 @@ export class AccountBridgeManager {
   }
 
   async loginPoll(sessionId: string): Promise<AccountBridgeLoginPollView> {
+    if (!this.loginSessions.has(sessionId)) {
+      return parseAccountBridgeLoginPollView({
+        state: "session-lost",
+        accountId: null,
+        errorCode: null,
+      });
+    }
     const raw = await this.facade(
       `/login/poll?state=${encodeURIComponent(sessionId)}`,
       "GET",
@@ -1775,6 +1833,9 @@ export class AccountBridgeManager {
   }
 
   async loginCancel(sessionId: string): Promise<AccountBridgeLoginCancelView> {
+    if (!this.loginSessions.has(sessionId)) {
+      return parseAccountBridgeLoginCancelView({ cancelled: true });
+    }
     const view = parseAccountBridgeLoginCancelView(
       await this.facade(`/login/cancel?state=${encodeURIComponent(sessionId)}`, "DELETE"),
     );
@@ -2152,6 +2213,7 @@ export class AccountBridgeManager {
 
   private async startWithCurrentControlPlane(): Promise<AccountBridgeRuntimeView> {
     this.state = "starting";
+    let spawnedChild: AccountBridgeChild | null = null;
     try {
       const eligibility = this.eligibility;
       if (
@@ -2236,6 +2298,7 @@ export class AccountBridgeManager {
             platform: this.deps.platform,
             expectedProtocolVersion: this.artifact.protocolVersion,
           });
+          spawnedChild = child;
           this.child = child;
           this.managementKey = managementKey;
           this.inferenceKey = inferenceKey;
@@ -2249,12 +2312,12 @@ export class AccountBridgeManager {
             method: "GET",
             bearer: null,
           });
-          // The sidecar has parsed its configuration. Remove the transient file
-          // containing per-run management/inference keys instead of retaining
-          // those bearer credentials for the process lifetime.
-          await this.deps.removeConfigFile(files.configPath);
+          // The sidecar installs its file watcher shortly after readiness.
+          // Keep the config inside the private runtime directory until exit;
+          // deleting it here can race watcher setup and crash-loop the child.
           this.state = "ready";
           this.lastErrorCode = null;
+          this.lastReadyAtMs = this.deps.now();
           this.scheduleBackgroundRefresh();
           void child.exited
             .then(code =>
@@ -2283,10 +2346,15 @@ export class AccountBridgeManager {
       }
       this.state =
         errorCode === "eligibility-denied" ||
-        errorCode === "master-key-secure-storage-unavailable"
+        errorCode === "master-key-secure-storage-unavailable" ||
+        errorCode === "artifact-missing"
           ? "blocked"
           : "failed";
       this.lastErrorCode = errorCode;
+      this.lastSidecarForensics = spawnedChild?.forensics() ?? null;
+      if (spawnedChild) {
+        this.recordSidecarForensicsHistory(spawnedChild.forensics());
+      }
       throw new AccountBridgeError(errorCode);
     }
   }
@@ -2296,6 +2364,9 @@ export class AccountBridgeManager {
     _code: number | null,
   ): Promise<void> {
     if (this.child !== child || this.stopping) return;
+    this.lastSidecarForensics = child.forensics();
+    this.recordSidecarForensicsHistory(child.forensics());
+    this.loginSessions.clear();
     this.child = null;
     this.endpoint = null;
     this.clearRuntimeSecrets();
@@ -2317,9 +2388,23 @@ export class AccountBridgeManager {
       void this.runLifecycleTransition(async () => {
         if (this.stopping || this.child !== null || this.state === "ready") return;
         const eligibility = await this.refreshEligibilityInternal(false);
-        if (!eligibility || this.currentAllowedConnectorIds().size === 0) return;
+        if (!eligibility) {
+          this.state = "failed";
+          this.lastErrorCode = "runtime-start-failed";
+          return;
+        }
+        if (this.currentAllowedConnectorIds().size === 0) {
+          this.state = "blocked";
+          this.lastErrorCode = "eligibility-denied";
+          return;
+        }
         await this.startWithCurrentControlPlane();
-      }).catch(() => {});
+      }).catch(() => {
+        if (this.state === "starting") {
+          this.state = "failed";
+          this.lastErrorCode = "runtime-start-failed";
+        }
+      });
     }, delay);
   }
 
@@ -2488,6 +2573,27 @@ async function regularDirectoryNoSymlink(path: string): Promise<void> {
   }
 }
 
+async function requirePackagedPath(check: () => Promise<void>): Promise<void> {
+  try {
+    await check();
+  } catch (error) {
+    if (error instanceof AccountBridgeError) throw error;
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      throw new AccountBridgeError("artifact-missing");
+    }
+    throw error;
+  }
+}
+
+async function packagedFileMustExist(path: string): Promise<void> {
+  await requirePackagedPath(() => regularFileNoSymlink(path));
+}
+
+async function packagedDirectoryMustExist(path: string): Promise<void> {
+  await requirePackagedPath(() => regularDirectoryNoSymlink(path));
+}
+
 function accountBridgeLicenseTarget(platform: string): string {
   const targets: Record<string, string> = {
     "arm64-darwin": "darwin/arm64",
@@ -2511,7 +2617,7 @@ async function packagedLicenseMaterialInventory(
   metadataDir: string,
 ): Promise<PackagedLicenseMaterial[]> {
   const root = join(metadataDir, LICENSE_MATERIALS_DIRECTORY);
-  await regularDirectoryNoSymlink(root);
+  await packagedDirectoryMustExist(root);
   const files: PackagedLicenseMaterial[] = [];
   let totalBytes = 0;
   const visit = async (directory: string, prefix: string): Promise<void> => {
@@ -2656,6 +2762,7 @@ export async function verifyPackagedArtifact(input: {
   expectedPlatform: string;
   expectedProtocolVersion: number;
   artifactPublicKeyBase64URL: string;
+  eligibilityPublicKeyBase64URL: string;
 }): Promise<AccountBridgeArtifact> {
   const binaryName = process.platform === "win32" ? "oauthapi-llm.exe" : "oauthapi-llm";
   if (basename(input.binaryPath) !== binaryName) {
@@ -2667,9 +2774,9 @@ export async function verifyPackagedArtifact(input: {
   ) {
     throw new AccountBridgeError("artifact-layout-invalid");
   }
-  await regularDirectoryNoSymlink(dirname(input.binaryPath));
-  await regularDirectoryNoSymlink(input.metadataDir);
-  await regularFileNoSymlink(input.binaryPath);
+  await packagedDirectoryMustExist(dirname(input.binaryPath));
+  await packagedDirectoryMustExist(input.metadataDir);
+  await packagedFileMustExist(input.binaryPath);
   const pluginFileName = input.expectedPlatform.endsWith("win32")
     ? "gemini-cli.dll"
     : input.expectedPlatform.endsWith("darwin")
@@ -2679,8 +2786,8 @@ export async function verifyPackagedArtifact(input: {
   const pluginPath = join(input.metadataDir, "plugins", pluginFileName);
   const pluginLicenseRelativePath = "plugins/gemini-cli-LICENSE";
   const pluginLicensePath = join(input.metadataDir, pluginLicenseRelativePath);
-  await regularFileNoSymlink(pluginPath);
-  await regularFileNoSymlink(pluginLicensePath);
+  await packagedFileMustExist(pluginPath);
+  await packagedFileMustExist(pluginLicensePath);
   for (const name of [
     "LICENSE",
     "NOTICE",
@@ -2692,7 +2799,7 @@ export async function verifyPackagedArtifact(input: {
     "provenance.json",
     "provenance.sig",
   ]) {
-    await regularFileNoSymlink(join(input.metadataDir, name));
+    await packagedFileMustExist(join(input.metadataDir, name));
   }
   const platformEvidenceName = input.expectedPlatform.endsWith("darwin")
     ? "codesign-evidence.json"
@@ -2700,10 +2807,10 @@ export async function verifyPackagedArtifact(input: {
       ? "binary.minisig"
       : null;
   if (platformEvidenceName !== null) {
-    await regularFileNoSymlink(join(input.metadataDir, platformEvidenceName));
+    await packagedFileMustExist(join(input.metadataDir, platformEvidenceName));
   }
   if (input.expectedPlatform.endsWith("linux")) {
-    await regularFileNoSymlink(
+    await packagedFileMustExist(
       join(input.metadataDir, "plugins", "gemini-cli.minisig"),
     );
   }
@@ -2988,6 +3095,10 @@ export async function verifyPackagedArtifact(input: {
       provenance.build.cgoEnabled !== false ||
       provenance.build.trimpath !== true ||
       provenance.build.buildvcs !== false ||
+      provenance.build.eligibilityTrustRootSha256 !==
+        createHash("sha256")
+          .update(Buffer.from(input.eligibilityPublicKeyBase64URL, "base64url"))
+          .digest("hex") ||
       !isRecord(sbom) ||
       sbom.bomFormat !== "CycloneDX" ||
       !isRecord(sbom.metadata) ||
@@ -3041,7 +3152,7 @@ export async function verifyPackagedArtifact(input: {
       // loadable and integrity-checkable without claiming Developer ID or
       // notarization that the component does not possess.
       const helperPath = join(dirname(input.binaryPath), "oauthapi-plugin-host");
-      await regularFileNoSymlink(helperPath);
+      await packagedFileMustExist(helperPath);
       const helperDigest = await sha256File(helperPath);
       const runtimeHelper: unknown = provenance.runtimeHelpers[0];
       if (
@@ -3522,18 +3633,207 @@ async function createProductionRuntimeFiles(input: {
   return { configPath, runtimeDir };
 }
 
-function childProcessAdapter(
+export const SIDECAR_FORENSIC_LINE_CAP = 32;
+export const SIDECAR_FORENSIC_LINE_MAX_BYTES = 512;
+
+const SIDECAR_BANNER_PATTERN = /^OAuthAPI-LLM Version: [ -~]{1,200}$/;
+const SIDECAR_LOG_LINE_PATTERN =
+  /^\[([^\]]{1,40})\] \[[^\]]{0,120}\] \[([^\]]{1,16})\] \[([^\]]{1,80})\] ([\s\S]*)$/;
+const SIDECAR_TIMESTAMP_PATTERN = /^[0-9 :.\-TZ+]{1,40}$/;
+const SIDECAR_LEVEL_PATTERN = /^[a-z]{1,10}$/;
+const SIDECAR_ORIGIN_PATTERN = /^[A-Za-z0-9_.+-]{1,64}:\d{1,7}$/;
+const SIDECAR_MESSAGE_ALLOWLIST_PREFIXES = [
+  "Account Bridge ",
+  "pluginhost: ",
+  "failed to ",
+] as const;
+const SIDECAR_STABLE_FAILURE_ANCHORS = [
+  [/^failed to resolve auth directory\b/, "failed to resolve auth directory"],
+  [/^failed to read auth file\b/, "failed to read auth file"],
+  [/^failed to parse auth file\b/, "failed to parse auth file"],
+  [/^failed to load config\b/, "failed to load config"],
+  [/^failed to reload config\b/, "failed to reload config"],
+  [/^failed to configure log output\b/, "failed to configure log output"],
+] as const;
+const SIDECAR_OPAQUE_RUN_PATTERN = /[A-Za-z0-9_-]{20,}/g;
+
+export function redactSidecarLogMessage(message: string): {
+  message: string | null;
+  redactedByteLength: number | null;
+} {
+  const byteLength = Buffer.byteLength(message, "utf8");
+  if (
+    !SIDECAR_MESSAGE_ALLOWLIST_PREFIXES.some(prefix =>
+      message.startsWith(prefix),
+    ) ||
+    !/^[ -!#-~]*$/.test(message)
+  ) {
+    return { message: null, redactedByteLength: byteLength };
+  }
+  if (message.startsWith("failed to ")) {
+    // `failed to …` is emitted across the watcher/config/auth stack and its
+    // free-form tail can contain a basename (including a short email address)
+    // without any slash for path redaction to notice. Retain only enumerated
+    // operation anchors. Unknown operations collapse to one stable category;
+    // origin + level + exit evidence still identify the failing branch.
+    const stable = SIDECAR_STABLE_FAILURE_ANCHORS.find(([pattern]) =>
+      pattern.test(message),
+    );
+    return {
+      message: stable?.[1] ?? "sidecar operation failed",
+      redactedByteLength: null,
+    };
+  }
+  if (message.startsWith("pluginhost: ")) {
+    // Plugin-host failures may embed the selected auth identifier in otherwise
+    // stable-looking text. Keep only the subsystem/branch classification.
+    return {
+      message: "pluginhost operation failed",
+      redactedByteLength: null,
+    };
+  }
+  if (message.startsWith("Account Bridge bootstrap rejected")) {
+    // Bootstrap rejection details are free-form and can include short account
+    // identifiers that do not resemble paths or opaque tokens.
+    return {
+      message: "Account Bridge bootstrap rejected",
+      redactedByteLength: null,
+    };
+  }
+  // Free-form log text has no quoting contract, so a whitespace-delimited path
+  // regex cannot know whether `My File/token.json` ends at `My` or at the end
+  // of the line. Once any path separator appears, retain only the stable
+  // allowlisted prefix before that token and redact the entire remaining tail.
+  // This is deliberately lossy: forensics may keep an error branch anchor, but
+  // must never retain the second half of a path containing spaces.
+  const firstPathSeparator = message.search(/[\\/]/);
+  const pathTokenStart =
+    firstPathSeparator === -1
+      ? -1
+      : message.lastIndexOf(" ", firstPathSeparator) + 1;
+  const withoutPath =
+    pathTokenStart === -1
+      ? message
+      : `${message.slice(0, pathTokenStart)}<path>`;
+  const redacted = withoutPath
+    .replace(SIDECAR_OPAQUE_RUN_PATTERN, run => `<redacted:${run.length}>`);
+  return redacted.length <= 256
+    ? { message: redacted, redactedByteLength: null }
+    : { message: null, redactedByteLength: byteLength };
+}
+
+export function parseSidecarLogLine(
+  line: string,
+  stream: "stdout" | "stderr",
+): AccountBridgeSidecarLogLine {
+  const byteLength = Buffer.byteLength(line, "utf8");
+  const withheld = (): AccountBridgeSidecarLogLine => ({
+    stream,
+    timestamp: null,
+    level: null,
+    origin: null,
+    message: null,
+    redactedByteLength: byteLength,
+  });
+  if (byteLength > SIDECAR_FORENSIC_LINE_MAX_BYTES) return withheld();
+  const match = SIDECAR_LOG_LINE_PATTERN.exec(line);
+  if (!match) return withheld();
+  const [, rawTimestamp = "", rawLevel = "", rawOrigin = "", rawMessage = ""] =
+    match;
+  const { message, redactedByteLength } = redactSidecarLogMessage(rawMessage);
+  return {
+    stream,
+    timestamp: SIDECAR_TIMESTAMP_PATTERN.test(rawTimestamp)
+      ? rawTimestamp
+      : null,
+    level: SIDECAR_LEVEL_PATTERN.test(rawLevel) ? rawLevel : null,
+    origin: SIDECAR_ORIGIN_PATTERN.test(rawOrigin) ? rawOrigin : null,
+    message,
+    redactedByteLength,
+  };
+}
+
+interface SidecarForensicRecorder {
+  recordLine(line: string, stream: "stdout" | "stderr"): void;
+  recordExit(code: number | null, signal: NodeJS.Signals | null): void;
+  recordSpawnError(error: unknown): void;
+  markReadyLineRejected(): void;
+  snapshot(): AccountBridgeSidecarForensics;
+}
+
+function createSidecarForensicRecorder(): SidecarForensicRecorder {
+  const state: AccountBridgeSidecarForensics = {
+    exitCode: null,
+    exitSignal: null,
+    spawnErrorCode: null,
+    bannerLine: null,
+    logLines: [],
+    droppedLineCount: 0,
+    readyLineRejected: false,
+  };
+  return {
+    recordLine: (line, stream) => {
+      if (
+        state.bannerLine === null &&
+        stream === "stdout" &&
+        SIDECAR_BANNER_PATTERN.test(line)
+      ) {
+        state.bannerLine = line;
+        return;
+      }
+      if (state.logLines.length >= SIDECAR_FORENSIC_LINE_CAP) {
+        state.droppedLineCount += 1;
+        return;
+      }
+      state.logLines.push(parseSidecarLogLine(line, stream));
+    },
+    recordExit: (code, signal) => {
+      state.exitCode = Number.isSafeInteger(code) ? code : null;
+      state.exitSignal =
+        typeof signal === "string" && /^SIG[A-Z0-9]{1,12}$/.test(signal)
+          ? signal
+          : null;
+    },
+    recordSpawnError: error => {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      state.spawnErrorCode =
+        typeof code === "string" && /^[A-Z][A-Z0-9_]{1,31}$/.test(code)
+          ? code
+          : null;
+    },
+    markReadyLineRejected: () => {
+      state.readyLineRejected = true;
+    },
+    snapshot: () => ({
+      ...state,
+      logLines: state.logLines.map(entry => ({ ...entry })),
+    }),
+  };
+}
+
+export function childProcessAdapter(
   child: ChildProcess,
   platform: NodeJS.Platform,
   expectedProtocolVersion: number,
 ): AccountBridgeChild {
+  const forensics = createSidecarForensicRecorder();
   const exited = new Promise<number | null>(resolveExit => {
-    child.once("exit", code => resolveExit(code));
-    child.once("error", () => resolveExit(null));
+    child.once("exit", (code, signal) => {
+      forensics.recordExit(code, signal);
+      resolveExit(code);
+    });
+    child.once("error", error => {
+      forensics.recordSpawnError(error);
+      resolveExit(null);
+    });
   });
-  // Never log child output: the sidecar boundary guarantees redaction, but a
-  // future upstream regression must still not cross the worker log channel.
-  child.stderr?.resume();
+  const stderr = child.stderr;
+  if (stderr) {
+    const stderrLines = createInterface({ input: stderr });
+    stderrLines.on("line", line => forensics.recordLine(line, "stderr"));
+    stderrLines.on("error", () => {});
+    stderr.on("error", () => {});
+  }
   const endpoint = new Promise<string>((resolveEndpoint, reject) => {
     const stdout = child.stdout;
     if (!stdout) {
@@ -3541,6 +3841,8 @@ function childProcessAdapter(
       return;
     }
     const lines = createInterface({ input: stdout });
+    lines.on("error", () => {});
+    stdout.on("error", () => {});
     let settled = false;
     let acceptedReadyLine: string | null = null;
     const timer = setTimeout(() => {
@@ -3571,17 +3873,23 @@ function childProcessAdapter(
           line,
           expectedProtocolVersion,
         );
-        if (!value) return;
+        if (!value) {
+          forensics.recordLine(line, "stdout");
+          return;
+        }
         if (acceptedReadyLine !== null) {
           // Duplicate (identical or drifted) readiness is impossible in the
           // single-listener process contract and indicates stream confusion.
+          forensics.markReadyLineRejected();
           child.kill();
           return;
         }
         acceptedReadyLine = line;
         if (!settled) done(value);
       } catch {
+        forensics.markReadyLineRejected();
         child.kill();
+        done(undefined, new AccountBridgeError("runtime-readiness-invalid"));
         return;
       }
     });
@@ -3597,6 +3905,7 @@ function childProcessAdapter(
     kill: () => {
       signalAccountBridgeProcessTree(child, platform, "SIGKILL");
     },
+    forensics: forensics.snapshot,
   };
 }
 
@@ -3740,6 +4049,49 @@ export function accountBridgeSpawnCommand(
   };
 }
 
+export const FACADE_ERROR_BODY_LIMIT_BYTES = 4096;
+const FACADE_ERROR_DETAIL_RE = /^[a-z0-9_:-]{1,64}$/;
+
+export async function readBoundedFacadeErrorDetail(
+  response: Response,
+): Promise<string | null> {
+  try {
+    const reader = response.body?.getReader();
+    if (!reader) return null;
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (total <= FACADE_ERROR_BODY_LIMIT_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+    void reader.cancel().catch(() => {});
+    if (total > FACADE_ERROR_BODY_LIMIT_BYTES) return null;
+    const parsed: unknown = JSON.parse(
+      new TextDecoder().decode(concatUint8Arrays(chunks)),
+    );
+    if (!isRecord(parsed) || typeof parsed.error !== "string") return null;
+    return FACADE_ERROR_DETAIL_RE.test(parsed.error) ? parsed.error : null;
+  } catch {
+    return null;
+  }
+}
+
+function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
+  const merged = new Uint8Array(
+    chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0),
+  );
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
+}
+
 async function defaultHTTP(input: {
   url: string;
   method: "GET" | "POST" | "DELETE";
@@ -3759,7 +4111,16 @@ async function defaultHTTP(input: {
       },
       ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
     });
-    if (!response.ok) throw new AccountBridgeError(`facade-http-${response.status}`);
+    if (!response.ok) {
+      const detail = (await readBoundedFacadeErrorDetail(response))
+        ?.replace(/[_:]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+      throw new AccountBridgeError(
+        detail
+          ? `facade-http-${response.status}-${detail}`
+          : `facade-http-${response.status}`,
+      );
+    }
     return await response.json();
   } catch (error) {
     if (error instanceof AccountBridgeError) throw error;
@@ -4061,12 +4422,12 @@ function productionDeps(): AccountBridgeManagerDeps {
         expectedPlatform: platformTag(),
         expectedProtocolVersion: injectedProtocolVersion(),
         artifactPublicKeyBase64URL: injectedArtifactTrustRoot(),
+        eligibilityPublicKeyBase64URL: injectedEligibilityTrustRoot(),
       });
     },
     loadOrCreateMasterKey: loadOrCreateAccountBridgeMasterKey,
     acquireRuntimeLock: acquireProductionLock,
     createRuntimeFiles: createProductionRuntimeFiles,
-    removeConfigFile: configPath => fs.rm(configPath),
     removeRuntimeFiles: runtimeDir => fs.rm(runtimeDir, { recursive: true, force: true }),
     spawnSidecar: spawnProductionSidecar,
     http: defaultHTTP,

@@ -36,6 +36,13 @@
 
 pub mod config;
 pub mod error;
+// W-SANDBOX-ENFORCED-DEADCODE PR-1：`crabcode sandbox-exec` 配置文件（v1）的
+// 解析与映射。三平台同构编译——解析/校验必须在每个平台都跑得起来，执行侧才按
+// 平台分（Unix = PR-2，Windows = PR-3）。
+pub mod exec_config;
+// W-SANDBOX-ENFORCED-DEADCODE PR-2：fs 模式表 → 内核路径规则的归一化与重叠
+// 判据。三平台同构编译且**刻意平台无关**——同一份语义写三遍只会有一份被测到。
+pub mod exec_rules;
 pub mod output;
 pub mod platform;
 pub mod worker;
@@ -99,6 +106,37 @@ pub fn select_runner(config: &SandboxConfig) -> Result<Box<dyn SandboxRunner>, S
 /// See [`platform::apply_sandbox_to_self`] for details.
 pub fn apply_sandbox_to_self(config: &SandboxConfig) -> Result<(), SandboxError> {
     platform::apply_sandbox_to_self(config)
+}
+
+/// 按 [`SandboxExecPlan`](crate::exec_config::SandboxExecPlan) 自沙箱当前进程。
+///
+/// 与 [`apply_sandbox_to_self`] 的区别就是本立项的全部理由：后者只吃
+/// [`SandboxConfig`]，而 `SandboxConfig` **表达不了 fs 四表**——事故里丢掉的
+/// 正是那批规则（SoT §1.5）。
+///
+/// 见 [`platform::apply_exec_plan_to_self`]。
+pub fn apply_exec_plan_to_self(
+    plan: &crate::exec_config::SandboxExecPlan,
+) -> Result<platform::ExecPlanReport, SandboxError> {
+    platform::apply_exec_plan_to_self(plan)
+}
+
+/// Windows：按 [`SandboxExecPlan`](crate::exec_config::SandboxExecPlan) 起一个
+/// 受沙箱约束的**子进程**并等它退出。
+///
+/// Windows 没有 `exec`，也无法在进程启动后收紧自己的令牌，所以这条链不是
+/// [`apply_exec_plan_to_self`] 的同形态，而是它的对偶：helper 活着当中继。
+///
+/// 见 [`platform::run_exec_plan_as_child`]。
+///
+/// # Errors
+///
+/// 隔离链任一环失败即错误；调用方必须走 125 协议，**绝不**静默裸跑。
+#[cfg(target_os = "windows")]
+pub fn run_exec_plan_as_child(
+    plan: &crate::exec_config::SandboxExecPlan,
+) -> Result<platform::ExecPlanChildOutcome, SandboxError> {
+    platform::run_exec_plan_as_child(plan)
 }
 
 /// Canary: verify sandbox constraints are actually active on the current process.

@@ -189,8 +189,6 @@ export function createPermissionRequestMessage(
       }
       case 'permissionPromptTool':
         return `Tool '${decisionReason.permissionPromptToolName}' requires approval for this ${toolName} command`
-      case 'sandboxOverride':
-        return 'Run outside of the sandbox'
       case 'workingDir':
         return decisionReason.reason
       case 'safetyCheck':
@@ -1121,10 +1119,12 @@ export async function checkRuleBasedPermissions(
   // 1b. Entire tool has an ask rule
   const askRule = getAskRuleForTool(appState.toolPermissionContext, tool)
   if (askRule) {
+    // `isSandboxAutoAllowActive()` = enabled + backend wired + fidelity full
+    // (W-SANDBOX-ENFORCED-DEADCODE PR-5). Narrowing it can only produce MORE
+    // asks, never more allows — the bypass-immune floor keeps its shape.
     const canSandboxAutoAllow =
       tool.name === BASH_TOOL_NAME &&
-      SandboxManager.isSandboxingEnabled() &&
-      SandboxManager.isAutoAllowBashIfSandboxedEnabled() &&
+      SandboxManager.isSandboxAutoAllowActive() &&
       shouldUseSandbox(input)
 
     if (!canSandboxAutoAllow) {
@@ -1294,10 +1294,12 @@ async function hasPermissionsToUseToolInner(
     // When autoAllowBashIfSandboxed is on, sandboxed commands skip the ask rule and
     // auto-allow via Bash's checkPermissions. Commands that won't be sandboxed (excluded
     // commands, dangerouslyDisableSandbox) still need to respect the ask rule.
+    // `isSandboxAutoAllowActive()` additionally requires the backend to be wired
+    // AND the isolation to be fully enforceable (PR-5): a waiver whose whole
+    // justification is "the sandbox has it covered" must not outlive that fact.
     const canSandboxAutoAllow =
       tool.name === BASH_TOOL_NAME &&
-      SandboxManager.isSandboxingEnabled() &&
-      SandboxManager.isAutoAllowBashIfSandboxedEnabled() &&
+      SandboxManager.isSandboxAutoAllowActive() &&
       shouldUseSandbox(input)
 
     if (!canSandboxAutoAllow) {

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "component": "OAuthAPI-LLM",
-  "componentVersion": "7.2.71-crabcode.5",
+  "componentVersion": "7.2.71-crabcode.9",
   "protocolVersion": 1,
   "module": "github.com/acosmi/OAuthAPI-LLM",
   "upstream": {

@@ -119,7 +119,8 @@ export function registerTask(task: TaskState, setAppState: SetAppState): void {
 
 /**
  * Eagerly evict a terminal task from AppState.
- * The task must be in a terminal state (completed/failed/killed) with notified=true.
+ * The task must be in a terminal state (completed/incomplete/failed/killed)
+ * with notified=true.
  * This allows memory to be freed without waiting for the next query loop iteration.
  * The lazy GC in generateTaskAttachments() remains as a safety net.
  */
@@ -173,6 +174,7 @@ export async function generateTaskAttachments(state: AppState): Promise<{
     if ((taskState as { notified?: boolean }).notified) {
       switch (taskState.status) {
         case 'completed':
+        case 'incomplete':
         case 'failed':
         case 'killed':
           // Evict terminal tasks — they've been consumed and can be GC'd
@@ -304,6 +306,8 @@ function getStatusText(status: TaskStatus): string {
   switch (status) {
     case 'completed':
       return 'completed successfully'
+    case 'incomplete':
+      return 'returned an incomplete result'
     case 'failed':
       return 'failed'
     case 'killed':

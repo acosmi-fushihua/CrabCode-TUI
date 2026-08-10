@@ -1,7 +1,7 @@
 import type { ContentBlockParam } from './types/api-types.js'
 import { feature } from './utils/featurePolyfill.js'
 
-import { randomUUID } from 'crypto'
+import { randomUUID, type UUID } from 'crypto'
 import last from 'lodash-es/last.js'
 import {
   getSessionId,
@@ -93,6 +93,7 @@ import { setCwd } from './utils/Shell.js'
 import {
   flushSessionStorage,
   recordTranscript,
+  removeTranscriptMessage,
 } from './utils/sessionStorage.js'
 import { buildEffectiveSystemPrompt } from './utils/systemPrompt.js'
 import { asSystemPrompt } from './utils/systemPromptType.js'
@@ -1091,9 +1092,26 @@ export class QueryEngine {
       }
 
       switch (message.type) {
-        case 'tombstone':
-          // Tombstone messages are control signals for removing messages, skip them
+        case 'tombstone': {
+          // The direct TUI receives the original tombstone through
+          // onQueryEvent above. Also retract the target from the in-memory
+          // query state and persisted transcript before a retry appends its
+          // replacement.
+          const targetUuid = message.message.uuid
+          if (targetUuid === undefined) break
+          const mutableIndex = this.mutableMessages.findLastIndex(
+            item => item.uuid === targetUuid,
+          )
+          if (mutableIndex !== -1) this.mutableMessages.splice(mutableIndex, 1)
+          const bufferIndex = messages.findLastIndex(
+            item => item.uuid === targetUuid,
+          )
+          if (bufferIndex !== -1) messages.splice(bufferIndex, 1)
+          if (persistSession) {
+            await removeTranscriptMessage(targetUuid as UUID)
+          }
           break
+        }
         case 'assistant':
           // Capture stop_reason if already set (synthetic messages). For
           // streamed responses, this is null at content_block_stop time;

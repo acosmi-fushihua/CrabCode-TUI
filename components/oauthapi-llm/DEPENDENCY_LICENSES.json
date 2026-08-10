@@ -21,18 +21,18 @@
   },
   "entrypoint": "./cmd/oauthapi-llm",
   "targetGraphSha256": {
-    "linux/amd64": "d592f3e9586f353f2b8600e41d1fe917835ae61d504c33ba61832fe9a1e26def",
-    "linux/arm64": "d592f3e9586f353f2b8600e41d1fe917835ae61d504c33ba61832fe9a1e26def",
-    "darwin/amd64": "5a4b2496e28b464a6437af9433a18293aac89a854c46a6d4ad83b583b6e9f38d",
-    "darwin/arm64": "5a4b2496e28b464a6437af9433a18293aac89a854c46a6d4ad83b583b6e9f38d",
-    "windows/amd64": "bdd25e7e79858cedfdb6e74b0fb3e6e4500a3b0830e6b9a4a3beae3753f78d4e"
+    "linux/amd64": "ffa9b211abf9b9f14e31d7f7c4f3aacd1fdae5d6ce7254f989d9aeb56e6942ec",
+    "linux/arm64": "ffa9b211abf9b9f14e31d7f7c4f3aacd1fdae5d6ce7254f989d9aeb56e6942ec",
+    "darwin/amd64": "0cecb771e126d4ba62b2ec33a1ecd58565a2a9e619cd3c76384289229c99760c",
+    "darwin/arm64": "0cecb771e126d4ba62b2ec33a1ecd58565a2a9e619cd3c76384289229c99760c",
+    "windows/amd64": "d501efef180c3c5793481269efaa095eb06159bc7597be5e8f7db18adb7088c7"
   },
   "targetReportSha256": {
-    "linux/amd64": "5c136fa48fc4ee1e4b3da2d9be2ecf1d4899b95c2000df2c24e0574d35b17c0d",
-    "linux/arm64": "5c136fa48fc4ee1e4b3da2d9be2ecf1d4899b95c2000df2c24e0574d35b17c0d",
-    "darwin/amd64": "9324f323de7f54cd7450cbe73313b7c2a132e46d657d92f668b79631ff41c438",
-    "darwin/arm64": "9324f323de7f54cd7450cbe73313b7c2a132e46d657d92f668b79631ff41c438",
-    "windows/amd64": "7d031b3750e18c4a0e032e6aca9a4bdc91aa392521dbbd38e50da7896bf9c419"
+    "linux/amd64": "5246200a515c848de658184832837af107d181826391703ea5e296eb31a6a390",
+    "linux/arm64": "5246200a515c848de658184832837af107d181826391703ea5e296eb31a6a390",
+    "darwin/amd64": "499250858638618d501af544528dffb54fb32a06282fbdb4dcc5804ce728ce25",
+    "darwin/arm64": "499250858638618d501af544528dffb54fb32a06282fbdb4dcc5804ce728ce25",
+    "windows/amd64": "741c863dd98a0fcb7c47adf9615a64d78c7ee76bbffe4f189cdf152d4a3c2356"
   },
   "modules": [
     {
@@ -233,14 +233,14 @@
     },
     {
       "path": "github.com/go-git/go-billy/v6",
-      "version": "v6.0.0-alpha.1",
+      "version": "v6.0.0-alpha.2",
       "licenses": [
         "Apache-2.0"
       ]
     },
     {
       "path": "github.com/go-git/go-git/v6",
-      "version": "v6.0.0-alpha.4",
+      "version": "v6.0.0-alpha.5",
       "licenses": [
         "Apache-2.0"
       ]
@@ -563,14 +563,14 @@
     },
     {
       "path": "golang.org/x/crypto",
-      "version": "v0.52.0",
+      "version": "v0.54.0",
       "licenses": [
         "BSD-3-Clause"
       ]
     },
     {
       "path": "golang.org/x/net",
-      "version": "v0.55.0",
+      "version": "v0.57.0",
       "licenses": [
         "BSD-3-Clause"
       ]
@@ -584,21 +584,21 @@
     },
     {
       "path": "golang.org/x/sync",
-      "version": "v0.20.0",
+      "version": "v0.22.0",
       "licenses": [
         "BSD-3-Clause"
       ]
     },
     {
       "path": "golang.org/x/sys",
-      "version": "v0.45.0",
+      "version": "v0.47.0",
       "licenses": [
         "BSD-3-Clause"
       ]
     },
     {
       "path": "golang.org/x/text",
-      "version": "v0.37.0",
+      "version": "v0.40.0",
       "licenses": [
         "BSD-3-Clause"
       ]

@@ -263,6 +263,10 @@ func (s *Server) enrichAccountBridgeUsage(ctx context.Context, usage []facadeUsa
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
+			// F4: a panic in one quota probe must cost that probe, not the
+			// sidecar. Registered after Done so it runs first and stops the
+			// unwind before it crosses the goroutine boundary.
+			defer managementHandlers.RecoverAccountBridgeGoroutine("quota fan-out worker")
 			for target := range targetChannel {
 				if quotaContext.Err() != nil {
 					return
@@ -614,7 +618,15 @@ func (s *Server) accountBridgeLoginPoll(c *gin.Context) {
 			}
 		case status != "":
 			response["state"] = "failed"
-			response["errorCode"] = "login_failed"
+			// V2: bounded enum transparency — the writer's classified code
+			// when present, the historical residual otherwise. The enum is
+			// pinned by the cross-language fixture; this branch must never
+			// invent a value.
+			if code := managementHandlers.GetOAuthSessionErrorCode(state); code != "" {
+				response["errorCode"] = code
+			} else {
+				response["errorCode"] = "login_failed"
+			}
 		default:
 			response["state"] = "pending"
 		}

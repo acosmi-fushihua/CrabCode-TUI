@@ -370,6 +370,19 @@ describe('direct TUI model-management actions', () => {
         inferenceKey: 'must-not-pass',
       }),
     ).toThrow()
+    expect(
+      directTuiModelManagementResultSchema.parse({
+        kind: 'model.account.login_poll',
+        state: 'session-lost',
+        accountId: null,
+        errorCode: null,
+      }),
+    ).toEqual({
+      kind: 'model.account.login_poll',
+      state: 'session-lost',
+      accountId: null,
+      errorCode: null,
+    })
   })
 
   test('custom list and mutations never project API keys or credential handles', async () => {

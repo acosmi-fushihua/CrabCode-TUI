@@ -37,8 +37,13 @@ var (
 )
 
 type oauthSession struct {
-	Provider      string
-	Status        string
+	Provider string
+	Status   string
+	// ErrorCode is the bounded machine code paired with Status (V2, 2026-08-08
+	// 账户接入审计 §7 PR-α-3). Only members of the enum below may be stored;
+	// the /login/poll facade falls back to OAuthSessionErrLoginFailed when the
+	// writer did not classify. Human text stays in Status, never on the wire.
+	ErrorCode     string
 	Source        string
 	Metadata      map[string]any
 	ResultAuthIDs []string
@@ -47,6 +52,55 @@ type oauthSession struct {
 	CreatedAt     time.Time
 	ExpiresAt     time.Time
 }
+
+// Bounded /login/poll errorCode enum. The component-local direct-TUI contract
+// and TestOAuthSessionErrorCodeEnumMatchesFixture pin this set; extending it is
+// a contract change, not a convenience.
+const (
+	OAuthSessionErrAuthorizationDenied  = "authorization_denied"
+	OAuthSessionErrLoginTimeout         = "login_timeout"
+	OAuthSessionErrUpstreamUnavailable  = "upstream_unavailable"
+	OAuthSessionErrTokenExchangeFailed  = "token_exchange_failed"
+	OAuthSessionErrProvisioningFailed   = "provisioning_failed"
+	OAuthSessionErrCredentialSaveFailed = "credential_save_failed"
+	OAuthSessionErrStateMismatch        = "state_mismatch"
+	OAuthSessionErrLoginFailed          = "login_failed"
+)
+
+// normalizeOAuthSessionErrorCode keeps the stored code inside the enum by
+// construction: an unknown value degrades to "" (→ residual login_failed at
+// the facade), never to a new ad-hoc wire value.
+func normalizeOAuthSessionErrorCode(code string) string {
+	switch code {
+	case OAuthSessionErrAuthorizationDenied,
+		OAuthSessionErrLoginTimeout,
+		OAuthSessionErrUpstreamUnavailable,
+		OAuthSessionErrTokenExchangeFailed,
+		OAuthSessionErrProvisioningFailed,
+		OAuthSessionErrCredentialSaveFailed,
+		OAuthSessionErrStateMismatch,
+		OAuthSessionErrLoginFailed:
+		return code
+	default:
+		return ""
+	}
+}
+
+// oauthSessionCancelOutcome distinguishes what Cancel found (F5: a terminal
+// or unknown session must read as "already terminal", not as a failure the
+// direct TUI caller retries forever).
+type oauthSessionCancelOutcome int
+
+const (
+	// oauthCancelPending — a live pending session was cancelled now.
+	oauthCancelPending oauthSessionCancelOutcome = iota
+	// oauthCancelAlreadyTerminal — unknown, expired, completed, or errored:
+	// nothing is left to cancel, cleanup can proceed.
+	oauthCancelAlreadyTerminal
+	// oauthCancelSaveInFlight — a save claim owns the session; the only state
+	// that genuinely cannot be cancelled (poll resolves it shortly).
+	oauthCancelSaveInFlight
+)
 
 type oauthSessionStore struct {
 	mu           sync.RWMutex
@@ -129,6 +183,10 @@ func (s *oauthSessionStore) RegisterPlugin(state, provider string, metadata map[
 }
 
 func (s *oauthSessionStore) SetError(state, message string) {
+	s.SetErrorCoded(state, "", message)
+}
+
+func (s *oauthSessionStore) SetErrorCoded(state, code, message string) {
 	state = strings.TrimSpace(state)
 	message = strings.TrimSpace(message)
 	if state == "" {
@@ -152,6 +210,7 @@ func (s *oauthSessionStore) SetError(state, message string) {
 	}
 	session.Operation = oauthSessionOperationNone
 	session.Status = message
+	session.ErrorCode = normalizeOAuthSessionErrorCode(code)
 	session.ExpiresAt = now.Add(s.ttl)
 	s.sessions[state] = session
 }
@@ -377,16 +436,24 @@ func (s *oauthSessionStore) FailClaimedSave(state, provider, message string) boo
 	}
 	session.Operation = oauthSessionOperationNone
 	session.Status = message
+	// The claimed-save failure publisher is by construction the credential
+	// persistence path — the code is baked here so all eight call sites
+	// classify without threading a parameter through.
+	session.ErrorCode = OAuthSessionErrCredentialSaveFailed
 	session.ExpiresAt = now.Add(s.ttl)
 	s.sessions[state] = session
 	return true
 }
 
-// Cancel removes a pending OAuth session so background waiters exit without saving credentials.
-// Returns true when a pending session was cancelled.
-func (s *oauthSessionStore) Cancel(state string) bool {
+// FailPanickedWaiter is the panic-only terminal publisher for a built-in OAuth
+// waiter. Unlike SetErrorCoded it may release an in-flight save claim: the
+// waiter that owned that claim has unwound and no remaining goroutine can
+// complete it. Provider matching and the existing terminal checks prevent a
+// stale or unrelated waiter from overwriting a successful/newer outcome.
+func (s *oauthSessionStore) FailPanickedWaiter(state, provider string) bool {
 	state = strings.TrimSpace(state)
-	if state == "" {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if state == "" || provider == "" {
 		return false
 	}
 	now := time.Now()
@@ -396,11 +463,43 @@ func (s *oauthSessionStore) Cancel(state string) bool {
 
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
-	if !ok || session.Completed || session.Status != "" || session.Operation == oauthSessionOperationSaving {
+	if !ok || session.Completed || session.Status != "" || !strings.EqualFold(session.Provider, provider) {
 		return false
 	}
-	delete(s.sessions, state)
+	session.Operation = oauthSessionOperationNone
+	session.Status = "Authentication failed"
+	session.ErrorCode = OAuthSessionErrLoginFailed
+	session.ExpiresAt = now.Add(s.ttl)
+	s.sessions[state] = session
 	return true
+}
+
+// Cancel removes a pending OAuth session so background waiters exit without
+// saving credentials. A completed, errored, expired, or unknown session
+// reports oauthCancelAlreadyTerminal — nothing is left to cancel and the
+// caller may clean up (F5). Only a save claim in flight refuses cancellation.
+// Terminal sessions are deliberately NOT deleted here: a completed session
+// must survive for the succeeded-poll's account association.
+func (s *oauthSessionStore) Cancel(state string) oauthSessionCancelOutcome {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return oauthCancelAlreadyTerminal
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.purgeExpiredLocked(now)
+	session, ok := s.sessions[state]
+	if !ok || session.Completed || session.Status != "" {
+		return oauthCancelAlreadyTerminal
+	}
+	if session.Operation == oauthSessionOperationSaving {
+		return oauthCancelSaveInFlight
+	}
+	delete(s.sessions, state)
+	return oauthCancelPending
 }
 
 func cloneOAuthSessionMetadata(in map[string]any) map[string]any {
@@ -453,6 +552,24 @@ func RegisterPluginOAuthSession(state, provider string, metadata map[string]any)
 }
 
 func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state, message) }
+
+// SetOAuthSessionErrorCoded records a terminal error together with its bounded
+// machine code (V2 enum above). Prefer this over SetOAuthSessionError at every
+// account-bridge connector call site; the uncoded form degrades to the
+// residual "login_failed" at the poll facade.
+func SetOAuthSessionErrorCoded(state, code, message string) {
+	oauthSessions.SetErrorCoded(state, code, message)
+}
+
+// GetOAuthSessionErrorCode exposes the bounded code paired with a failed
+// session's Status. Empty when the writer did not classify.
+func GetOAuthSessionErrorCode(state string) string {
+	session, ok := oauthSessions.Get(state)
+	if !ok {
+		return ""
+	}
+	return session.ErrorCode
+}
 
 func CompleteOAuthSession(state string) { oauthSessions.Complete(state) }
 
@@ -538,9 +655,13 @@ func promotePluginOAuthSessionPollToSave(state, provider string) bool {
 }
 
 // CancelOAuthSession cancels a pending OAuth session by state.
-// Background callback and device-code waiters observe IsOAuthSessionPending as false and exit without saving credentials.
+// Background callback and device-code waiters observe IsOAuthSessionPending as
+// false and exit without saving credentials. True means "nothing pending
+// remains" — either a live session was cancelled now or the session was
+// already terminal/unknown (F5: idempotent confirmation the host cleans up
+// on). False only for a save claim in flight.
 func CancelOAuthSession(state string) bool {
-	return oauthSessions.Cancel(state)
+	return oauthSessions.Cancel(state) != oauthCancelSaveInFlight
 }
 
 func oauthSessionErrorWithCause(message string, cause error) string {

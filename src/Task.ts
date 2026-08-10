@@ -15,6 +15,7 @@ export type TaskStatus =
   | 'pending'
   | 'running'
   | 'completed'
+  | 'incomplete'
   | 'failed'
   | 'killed'
 
@@ -24,7 +25,12 @@ export type TaskStatus =
  * finished tasks from AppState, and orphan-cleanup paths.
  */
 export function isTerminalTaskStatus(status: TaskStatus): boolean {
-  return status === 'completed' || status === 'failed' || status === 'killed'
+  return (
+    status === 'completed' ||
+    status === 'incomplete' ||
+    status === 'failed' ||
+    status === 'killed'
+  )
 }
 
 export type TaskHandle = {

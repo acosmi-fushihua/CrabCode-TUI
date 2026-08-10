@@ -7,6 +7,8 @@
 mod memory_runtime;
 mod native_generation;
 mod native_tui_bootstrap;
+mod sandbox_exec;
+mod sandbox_probe;
 
 #[cfg(any(windows, test))]
 use std::ffi::{OsStr, OsString};
@@ -52,6 +54,15 @@ fn run() -> std::result::Result<i32, PureLaunchError> {
     {
         return Ok(exit_code);
     }
+
+    // Internal sandbox helpers run in the selected immutable generation, but
+    // before acquiring a generation lease or applying any terminal/public-TUI
+    // policy. The probe owns stdout (one JSON line); sandbox-exec owns all
+    // three stdio streams and becomes the requested command on Unix.
+    if try_dispatch_sandbox_probe_before_public_parse()? {
+        return Ok(0);
+    }
+    try_dispatch_sandbox_exec_before_public_parse();
 
     // A directly running immutable generation owns a validation-bound lease
     // before any private or public route can execute. Unlike the generic
@@ -136,6 +147,49 @@ fn run() -> std::result::Result<i32, PureLaunchError> {
         .unwrap_or(0);
     drop(generation_lease);
     Ok(exit_code)
+}
+
+/// Dispatch the exact internal probe shape before any launcher side effect.
+///
+/// A malformed `sandbox-probe` route is rejected here instead of falling
+/// through as a public TUI prompt. `--json` is accepted as the version-skew
+/// guard used by the TypeScript caller; the payload is JSON in both forms.
+fn try_dispatch_sandbox_probe_before_public_parse() -> std::result::Result<bool, PureLaunchError> {
+    let mut args = std::env::args();
+    let Some(_program) = args.next() else {
+        return Ok(false);
+    };
+    if args.next().as_deref() != Some("sandbox-probe") {
+        return Ok(false);
+    }
+    match args.next().as_deref() {
+        None => {}
+        Some("--json") if args.next().is_none() => {}
+        _ => {
+            return Err(PureLaunchError::Unsupported(
+                "sandbox-probe is an internal route and only accepts `--json`".into(),
+            ));
+        }
+    }
+    sandbox_probe::run_sandbox_probe().map_err(PureLaunchError::Failed)?;
+    Ok(true)
+}
+
+/// Dispatch the internal per-command sandbox helper.
+///
+/// Once the first token matches, the helper owns the invocation. Its parser
+/// intentionally accepts only `--config-stdin -- PROGRAM [ARGS...]`; malformed
+/// forms fail through the stable exit-125 protocol and can never become a TUI
+/// prompt.
+fn try_dispatch_sandbox_exec_before_public_parse() {
+    let mut args = std::env::args();
+    let Some(_program) = args.next() else {
+        return;
+    };
+    if args.next().as_deref() != Some("sandbox-exec") {
+        return;
+    }
+    sandbox_exec::dispatch(args.collect());
 }
 
 #[cfg(any(windows, test))]

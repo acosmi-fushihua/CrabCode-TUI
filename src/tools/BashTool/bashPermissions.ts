@@ -1823,13 +1823,12 @@ export async function bashToolHasPermission(
     }
   }
 
-  // Check sandbox auto-allow (which respects explicit deny/ask rules)
-  // Only call this if sandboxing and auto-allow are both enabled
-  if (
-    SandboxManager.isSandboxingEnabled() &&
-    SandboxManager.isAutoAllowBashIfSandboxedEnabled() &&
-    shouldUseSandbox(input)
-  ) {
+  // Check sandbox auto-allow (which respects explicit deny/ask rules).
+  // `isSandboxAutoAllowActive()` is the single session-level gate (enabled +
+  // backend wired + fidelity full — W-SANDBOX-ENFORCED-DEADCODE PR-5); the
+  // per-command half stays here because excludedCommands /
+  // dangerouslyDisableSandbox only make sense against a concrete input.
+  if (SandboxManager.isSandboxAutoAllowActive() && shouldUseSandbox(input)) {
     const sandboxAutoAllowResult = checkSandboxAutoAllow(
       input,
       appState.toolPermissionContext,

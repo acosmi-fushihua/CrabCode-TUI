@@ -3,9 +3,8 @@
  *
  * The retired `@acosmi-ai/sandbox-runtime`
  * package 整体退场；types 转入 `./types.ts` 内联，BaseSandboxManager 调用面
- * 全部退场（commit 2 已切 settings 派生 + shape adapter）。Rust 真后端经
- * ExecBridge sandboxMode='enforced' 链路调度 (Shell.ts:349-362 useEnforcedRouting →
- * ExecBridge.spawnManaged → acosmi-supervisor::ipc → AsyncSandboxRunner)。
+ * 全部退场。TUI 在 `Shell.ts` 内直接派生一次性配置，并以前缀 argv 调用同目录
+ * `crabcode sandbox-exec` helper；没有长驻通信层或中转服务。
  */
 
 import type {
@@ -17,13 +16,36 @@ import type {
   SandboxAskCallback,
   SandboxDependencyCheck,
   SandboxRuntimeConfig,
-  SandboxViolationEvent,
-  SandboxViolationStore,
 } from './types.js'
 import {
   SandboxRuntimeUnavailableError,
   type SandboxRuntimeKind,
 } from './errors.js'
+import {
+  isEnforcedBackendProbeResolved,
+  probeEnforcedBackend,
+  probeReasonTelemetrySlug,
+  resetEnforcedBackendProbeCache,
+  type EnforcedBackendProbeResult,
+  type SandboxBackendId,
+} from './enforcedBackendProbe.js'
+import {
+  computeSandboxFidelity,
+  type SandboxFidelity,
+} from './fidelity.js'
+// 循环 import（本模块 ← sandboxNetworkProxy）**只在调用期成立**：那边在模块顶层
+// 一个 binding 都不取（只在函数体里调 `convertToSandboxRuntimeConfig`），这边也
+// 只在 `getSandboxFidelity()` 里调它 —— ESM 的 live binding 对这种形态是安全的。
+import { currentSandboxFilteringProxyPort } from './sandboxNetworkProxy.js'
+import {
+  collectSandboxDenials,
+  filterIgnoredDenials,
+  formatSandboxViolationAnnotation,
+} from './violationPatterns.js'
+import {
+  type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+  logEvent,
+} from 'src/services/analytics/index.js'
 import { rmSync, statSync } from 'fs'
 import { readFile } from 'fs/promises'
 import { memoize } from 'lodash-es'
@@ -32,11 +54,8 @@ import {
   getAdditionalDirectoriesForCrabcodeMd,
   getOriginalCwd,
 } from '../../bootstrap/state.js'
-// A20 verification gate — sandbox config is rebuilt PER worker turn (BashTool
-// runs inside the agent loop). Read the ALS-aware `getCwd()` so the deny-write
-// / worktree-detect paths bind to THIS turn's cwd, not the racing global
-// `STATE.cwd` clobbered by overlapping cross-thread turns. In the TUI (no
-// override installed) `getCwd()` resolves to the same global — byte-identical.
+// Sandbox config is rebuilt for every BashTool execution. Read the current TUI
+// cwd so deny-write and worktree-detection paths bind to that command's state.
 import { getCwd } from '../cwd.js'
 import { logForDebugging } from '../debug.js'
 import { expandPath } from '../path.js'
@@ -63,24 +82,8 @@ import { FILE_EDIT_TOOL_NAME } from 'src/tools/FileEditTool/constants.js'
 import { FILE_READ_TOOL_NAME } from 'src/tools/FileReadTool/prompt.js'
 import { WEB_FETCH_TOOL_NAME } from 'src/tools/WebFetchTool/prompt.js'
 import { errorMessage } from '../errors.js'
-import { getCrabCodeTempDir } from '../permissions/filesystem.js'
 import type { PermissionRuleValue } from '../permissions/PermissionRule.js'
 import { ripgrepCommand } from '../ripgrep.js'
-
-/**
- * Stub violation store used by `getSandboxViolationStore()` in path B.
- *
- * Caller surface: `SandboxPromptFooterHint.tsx:19` + `SandboxViolationExpandedView.tsx:36`.
- * - `subscribe(listener)` → returns no-op unsubscribe
- * - `getTotalCount()` → 0
- *
- * Phase 5 acosmi-protocol 接通后由 Rust 端经 IPC 推 violation 事件，本 store
- * 被替换为真实现。R-2 退化已在 audit doc + CHANGELOG 标注。
- */
-const STUB_VIOLATION_STORE: SandboxViolationStore = {
-  subscribe: () => () => {},
-  getTotalCount: () => 0,
-}
 
 // Local copies to avoid circular dependency
 // (permissions.ts imports SandboxManager, bashPermissions.ts imports permissions.ts)
@@ -243,10 +246,10 @@ export function convertToSandboxRuntimeConfig(
     }
   }
 
-  // Extract filesystem paths from Edit and Read rules
-  // Always include current directory and CrabCode temp directory as writable
-  // The temp directory is needed for Shell.ts cwd tracking files
-  const allowWrite: string[] = ['.', getCrabCodeTempDir()]
+  // Extract filesystem paths from Edit and Read rules. Per-command temp access
+  // is added only by sandboxExecConfig; granting the shared CrabCode temp root
+  // would let one sandbox replace another task's host-owned artifacts.
+  const allowWrite: string[] = ['.']
   const denyWrite: string[] = []
   const denyRead: string[] = []
   const allowRead: string[] = []
@@ -489,11 +492,9 @@ async function detectWorktreeMainRepoPath(cwd: string): Promise<string | null> {
  * Check if dependencies are available (memoized)
  * Returns { errors, warnings } - errors mean sandbox cannot run
  *
- * R-Sandbox Phase 4 wave 2 path B：BaseSandboxManager 退场，依赖探测下沉到
- * Rust acosmi-sandbox 启动期 (`acosmi-sandbox::lib::select_runner` 走
- * MacosAsyncRunner / LinuxAsyncRunner / WindowsRunner，缺 vendor 时 supervisor
- * 返 SandboxRuntimeUnavailable，TS 经 ExecBridge 收回 + warn UI)。TS 端不再
- * 探测 bwrap / landlock-userspace / ripgrep；release packaging supplies them.
+ * BaseSandboxManager 退场后，能力探测由 `crabcode sandbox-probe --json` 直接
+ * 完成；每条命令再由 `sandbox-exec` helper 施加平台规则。TS 端不重复探测
+ * bwrap / landlock-userspace / ripgrep；release packaging supplies them.
  */
 const checkDependencies = memoize((): SandboxDependencyCheck => {
   return { errors: [], warnings: [] }
@@ -574,8 +575,70 @@ function isPlatformInEnabledList(): boolean {
 }
 
 /**
+ * W-SANDBOX-ENFORCED-DEADCODE PR-0：沙箱执行后端是否真的接线可用。
+ *
+ * 这是「诚实降级层」的判据。事故形态：`sandbox.enabled=true` 时 enforced 执行
+ * 后端从未接线，Bash 首跑必抛 `SandboxRuntimeUnavailableError`，而系统提示词
+ * 教模型立刻 `dangerouslyDisableSandbox:true` 绕过 —— 用户以为有沙箱，实际
+ * 恒裸跑。有了这道门，后端不可用时整条链自动归 false（提示词沙箱节消失、
+ * auto-allow 宽免收回、status/logo/审批标题/遥测同步转真话）。
+ *
+ * 进程级 memoize 在 `enforcedBackendProbe.ts`；`reset()` 联动清。
+ */
+function isEnforcedBackendWired(): boolean {
+  return probeWithTelemetry().wired
+}
+
+/** 后端不可用的具体原因；可用时为 undefined。 */
+function getEnforcedBackendUnavailableReason(): string | undefined {
+  const probe = probeWithTelemetry()
+  if (probe.wired) return undefined
+  return probe.reason ?? 'unspecified'
+}
+
+/**
+ * 读探测结论，并在**真的探测了一次**时发一条 `tengu_sandbox_backend_probe`
+ * （SoT §3 关联方 #23）。
+ *
+ * 为什么发在这一层而不是探测模块里：`enforcedBackendProbe.ts` 保持只依赖 Node
+ * 内置模块，以便在 TUI 运行时初始化前执行。在那里调用 `logEvent` 会把整个
+ * analytics 依赖图拉入早期探测路径，因此遥测留在已经初始化的适配层。
+ *
+ * 「真的探测了一次」= 调用前 memoize 还没落定。所以 `reset()` 之后的重新探测
+ * 会**再发一条**（那确实是一次新的探测），而同一会话里的几百次读结论只发一条。
+ */
+function probeWithTelemetry(): EnforcedBackendProbeResult {
+  const alreadyResolved = isEnforcedBackendProbeResolved()
+  const probe = probeEnforcedBackend()
+  if (!alreadyResolved) {
+    logEvent('tengu_sandbox_backend_probe', {
+      wired: probe.wired,
+      // 脱敏见 `probeReasonTelemetrySlug` —— 原始 reason 可能带绝对路径。
+      reason: probeReasonTelemetrySlug(
+        probe.reason,
+      ) as unknown as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      backend: (probe.backend ??
+        'none') as unknown as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    })
+  }
+  return probe
+}
+
+/**
+ * 本会话实际生效的后端标识；没有生效的沙箱时返 undefined。
+ *
+ * 判据是 `isSandboxingEnabled()`（含第 4 道门）而不是只看探测：后端接线良好但
+ * 用户没开沙箱时，这一轮命令并没有被任何东西隔离，报一个后端名就是谎话。
+ */
+function getSandboxBackend(): SandboxBackendId | undefined {
+  if (!isSandboxingEnabled()) return undefined
+  return probeWithTelemetry().backend ?? undefined
+}
+
+/**
  * Check if sandboxing is enabled
- * This checks the user's enabled setting, platform support, and enabledPlatforms restriction
+ * This checks the user's enabled setting, platform support, enabledPlatforms
+ * restriction, and whether the sandbox execution backend is actually wired.
  */
 function isSandboxingEnabled(): boolean {
   if (!isSupportedPlatform()) {
@@ -591,7 +654,108 @@ function isSandboxingEnabled(): boolean {
     return false
   }
 
-  return getSandboxEnabledSetting()
+  if (!getSandboxEnabledSetting()) {
+    return false
+  }
+
+  // 第 4 道门（PR-0）：设置说要沙箱 ≠ 这个构建跑得出沙箱。后端没接线时整条
+  // 链归 false 并由 getSandboxUnavailableReason() 如实披露，而不是让用户以为
+  // 隔离生效。放在最后是因为它是唯一需要 spawn 子进程的判据 —— 前三道门任一
+  // 不过就不必付探测成本。
+  return isEnforcedBackendWired()
+}
+
+/**
+ * 本会话当前配置的隔离保真度（W-SANDBOX-ENFORCED-DEADCODE PR-5）。
+ *
+ * 判据实现在 `./fidelity.ts`，与 `sandboxExecConfig.ts` 给每条命令算的那份
+ * **是同一个纯函数**。两者输入也等价：deny 四表与域名两表全部来自
+ * settings + `getCwd()`/`getOriginalCwd()`，per-command 的
+ * `options.cwd`/`cwdFile` 只会往 `allowWrite` 里再加两三个条目，动不了任何
+ * 判据位。所以「会话级 fidelity」不是一个更粗的近似，而是与 per-command
+ * 结论逐字节相等的同一件事（`sandbox-fidelity.test.ts` 有断言钉着这条等价）。
+ *
+ * PR-8 Slice 4 新加的 `httpProxyPort` 也守着同一条等价：两侧读的是**同一个
+ * 进程级单例**、用**同一组规则**做键（per-command 那边由
+ * `buildSandboxExecConfig` 把 `ensureSandboxFilteringProxy` 的返回值当 override
+ * 传下去，规则来自同一对 `convertToSandboxRuntimeConfig` +
+ * `shouldAllowManagedSandboxDomainsOnly`）。唯一会分叉的时刻是「代理已经跑起来、
+ * 但有人绕开 `buildSandboxExecConfig` 直接调 `deriveSandboxExecConfig`」——那条路
+ * 只有测试在走，且分叉方向是 per-command 更保守（端口 0 ⇒ partial）。
+ *
+ * 这一点是 auto-allow 能在**权限层**（命令还没派生配置文件的时刻）问出
+ * 「这台机器兑现得了吗」的前提；否则就只能在授权时刻猜。
+ *
+ * **副作用来自共享派生，不是本函数新引入的**：`convertToSandboxRuntimeConfig`
+ * 会重算 `bareGitRepoScrubPaths`（#29316 的 post-command 清扫台账）。既有的
+ * `getFsReadConfig` / `getFsWriteConfig` / `getNetworkRestrictionConfig`
+ * （提示词每次构建都调）与 `refreshConfig()` 早就在任意时刻这么做了，而真正
+ * 生效的那份台账是 `Shell.ts` 在 spawn 前一刻派生的那次。故这里多一次调用既不
+ * 改变清扫语义，也不新增危险面。开销同理：`isSandboxAutoAllowActive()` 先过
+ * `isSandboxingEnabled()`，沙箱没开（默认）时根本不会走到这里。
+ */
+function getSandboxFidelity(): SandboxFidelity {
+  const runtime = convertToSandboxRuntimeConfig(getInitialSettings())
+  // 域名三件套 + 代理传输安全语义先落成一个对象：它既是保真度的输入，又是
+  // 「代理是不是为**这套**规则跑着」的查询键。分成两处各读一遍就是第二个漂移
+  // 面 —— 那时代理按 A 组规则背书、报告按 B 组规则声明，而没有测试看得见这个差。
+  const rules = {
+    allowedDomains: runtime.network?.allowedDomains ?? [],
+    deniedDomains: runtime.network?.deniedDomains ?? [],
+    allowManagedDomainsOnly: shouldAllowManagedSandboxDomainsOnly(),
+    policy: 'restricted' as const,
+    allowLocalBinding: runtime.network?.allowLocalBinding ?? false,
+  }
+  return computeSandboxFidelity({
+    platform: getPlatform(),
+    filesystem: {
+      allowRead: runtime.filesystem?.allowRead ?? [],
+      allowWrite: runtime.filesystem?.allowWrite ?? [],
+      denyRead: runtime.filesystem?.denyRead ?? [],
+      denyWrite: runtime.filesystem?.denyWrite ?? [],
+    },
+    network: {
+      ...rules,
+      // 查而不起（同步路径上没得 await）：代理由 `buildSandboxExecConfig` 在派生
+      // 每条命令的配置时起。所以「本会话还没跑过沙箱命令」时这里是 0 ⇒ partial
+      // ⇒ 第一条命令仍走审批，之后代理起来了才恢复宽免。方向宁严。
+      httpProxyPort: currentSandboxFilteringProxyPort(rules),
+    },
+  })
+}
+
+/**
+ * 沙箱 auto-allow 免审批宽免此刻是否成立 —— **唯一判据点**
+ * （W-SANDBOX-ENFORCED-DEADCODE PR-5，SoT §2.4 + §3 关联方 #20）。
+ *
+ * 事故前这个条件被逐字抄在 6 处（3 个授权点 + 3 个「规则不可达」提示面），
+ * 每处都是 `isSandboxingEnabled() && isAutoAllowBashIfSandboxedEnabled()`。
+ * 收进一个函数不是洁癖：**宽免的含义正在变**，而分散的合取式没有任何机制
+ * 保证 6 处一起变。
+ *
+ * 三个乘数，各自回答一个不同的问题：
+ *   1. `isSandboxingEnabled()` —— 这一轮到底隔不隔离（含 PR-0 第 4 道门
+ *      `isEnforcedBackendWired()`，所以「后端没接线」已经被它拦掉了）
+ *   2. `isAutoAllowBashIfSandboxedEnabled()` —— 用户要不要这个便利
+ *   3. `getSandboxFidelity().level === 'full'` —— **沙箱真拦得住吗**
+ *
+ * 第 3 条是本 PR 新加的，也是唯一一条改变产品行为的：免审批的交换条件是
+ * 「反正有沙箱兜着」，那么当沙箱兑现不了自己承诺的规则时，这个交换条件就
+ * 不成立。**Linux 与 Windows 上它实际恒为 false**（Linux：`.` 恒在 allowWrite
+ * 而 settings.json / `.crabcode/skills` 恒在 denyWrite，deny-within-allow 恒
+ * 命中；Windows：整个路径层与网络层都不施加）。那不是回归，是把一件本来就
+ * 不成立的事从「悄悄当成立」改成「明说不成立」—— 用户会多按审批按钮，而不是
+ * 多一个没人拦的命令。macOS 上 fidelity 为 full 时照常发放。
+ *
+ * **调用方仍需自行判断这条命令会不会被沙箱**（`shouldUseSandbox(input)`）：
+ * 那是 per-command 的（excludedCommands / dangerouslyDisableSandbox），本函数
+ * 是会话级的，硬塞进来会把一个纯粹的会话级判据变成需要输入的函数，反而挡住
+ * 「规则不可达」那三个没有命令可谈的展示面。
+ */
+function isSandboxAutoAllowActive(): boolean {
+  if (!isSandboxingEnabled()) return false
+  if (!isAutoAllowBashIfSandboxedEnabled()) return false
+  return getSandboxFidelity().level === 'full'
 }
 
 /**
@@ -634,6 +798,19 @@ function getSandboxUnavailableReason(): string | undefined {
         ? 'run /sandbox or /doctor for details'
         : 'install missing tools (e.g. apt install bubblewrap socat) or run /sandbox for details'
     return `sandbox.enabled is set but dependencies are missing: ${deps.errors.join(', ')} · ${hint}`
+  }
+
+  // W-SANDBOX-ENFORCED-DEADCODE PR-0：第 4 道门的披露面。这是本立项之前
+  // **完全没有声音**的那一条 —— 后端从未接线，用户却一路看到「沙箱已启用」。
+  // 三要素：具体原因 / 当前实际效果 / 出路。
+  const backendReason = getEnforcedBackendUnavailableReason()
+  if (backendReason !== undefined) {
+    return (
+      `sandbox.enabled is set but the sandbox execution backend is not wired: ${backendReason} · ` +
+      `effect: sandboxing is DEGRADED TO OFF — commands run without filesystem or network isolation · ` +
+      `way out: update to a CrabCode build that ships the sandbox helper, or set sandbox.enabled=false ` +
+      `to stop requesting an isolation this build cannot deliver (run /sandbox for details)`
+    )
   }
 
   return undefined
@@ -747,23 +924,17 @@ function getExcludedCommands(): string[] {
 }
 
 /**
- * Wrap command with sandbox — fail-loud guard for enforced routing edge cases.
+ * Wrap command with sandbox — **构造性不可达 tripwire**（PR-0 之后）。
  *
- * R-Sandbox Phase 4 wave 3 (P4-T6 final cleanup, 2026-05-06)：保留语义重写消息
- * 文案。本函数无真后端可调（wave 2 已删 BaseSandboxManager / stub package）；
- * 沙箱真隔离走 `Shell.ts` enforced routing → ExecBridge IPC → Rust AsyncSandboxRunner
- * (`Shell.ts:349-362 useEnforcedRouting` 命中即早返)。
+ * 旧的命令字符串包装路径已退役；真实后端由 `Shell.ts` 直接加 helper argv
+ * 前缀。后端不可用时 `isEnforcedBackendWired()` 会让 `shouldUseSandbox` 归
+ * false，因此本函数没有生产调用者 —— 命中说明有路径绕过了直连入口，是 bug。
  *
- * 触发场景（`shouldUseSandbox=true` AND `useEnforcedRouting=false`，详
- * `computeUseEnforcedRouting` 5 条件）：
- * 1. `isExecBridgeFallback=true` — 循环防御 sentinel（spawnManaged catch 兜底回路）
- * 2. `shellType==='powershell'` — PowerShell sandbox macOS/Linux 暂未接通（R5 独立门）
- * 3. `!isIpcAvailable` — Rust supervisor 离线（异常环境）
+ * 保留 throw 而不是静默降级：静默走 host 直跑 = 用户以为有隔离、实际没有，
+ * 正是本立项要消灭的形态。
  *
- * 三场景下 user 期望真隔离但 enforced 路径不可达 → 抛 `SandboxRuntimeUnavailableError`
- * 给清晰诊断；不静默降级走 host 直跑（安全 footgun）。
- *
- * 详 `src/utils/sandbox/errors.ts` + 主真源 doc wave 3 实施计划。
+ * 详 `src/utils/sandbox/errors.ts` +
+ * `the sandbox direct-execution contract`。
  */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 async function wrapWithSandbox(
@@ -776,18 +947,62 @@ async function wrapWithSandbox(
 }
 
 /**
- * Detect runtime kind so telemetry / UI banner / health check can report the
- * effective sandbox backend.
+ * 本会话里到底是谁在隔离命令 —— 遥测 (`sandbox_runtime_kind`) 与健康检查的真源。
  *
- * Phase 3 闭环后默认返 `'rust'`：enforced 路径三平台均经 ExecBridge IPC →
- * Rust `AsyncSandboxRunner`；本函数仅在 stub `@acosmi-ai/sandbox-runtime`
- * package 还在 `node_modules/` 时被调用（P4-T7 退场后整体下线）。`'stub'`
- * 分支保留给 stub package 加载失败的兜底，作为 telemetry 信号。
+ * 旧实现无条件返回 `rust`，无法区分 helper 真正可用与用户仅打开了设置。
+ * 当前值以本地 probe 为准，让「用户开了沙箱但后端不可用」成为显式状态。
+ *
+ * 三档判定顺序即语义（见 `SandboxRuntimeKind`）：先分「这一轮到底隔不隔离」，
+ * 隔离才谈后端名；不隔离时再分「后端坏了」与「用户就没开」——两者的处置完全
+ * 不同，混成一个值等于把这次立项要暴露的那件事又藏回去。
  */
 function getSandboxRuntimeKind(): SandboxRuntimeKind {
-  // R-Sandbox Phase 4 wave 2 path B：BaseSandboxManager 退场后永远返 'rust'。
-  // 5 UI banner condition `kind === 'stub'` 永不命中，commit 3 一并删 banner。
-  return 'rust'
+  const backend = getSandboxBackend()
+  if (backend !== undefined) return backend
+  // 短路顺序有意：设置没开时**不付探测成本**（probe 要 spawn 一个子进程）。
+  if (getSandboxEnabledSetting() && !isEnforcedBackendWired()) return 'degraded'
+  return 'off'
+}
+
+/**
+ * 把命令输出里的隔离拒绝行注解成模型读得懂的信息。
+ *
+ * ## `context.sandboxed` 必须由调用方给，且默认 false
+ *
+ * 判据表里的 `Permission denied` / `Operation not permitted` 在没有沙箱的机器上
+ * 同样天天出现。把它们标成「沙箱拦截」的前提**只有一个**：这条命令确实经
+ * `crabcode sandbox-exec` 跑过。这个事实只有调用方知道（它算过
+ * `shouldUseSandbox(input)`），本函数不去猜 —— 不传就当没跑在沙箱里，
+ * 原样返回、不计数。凭空造证据比不注解糟得多。
+ *
+ * ## 两件事都做
+ *
+ * 1. 注解文本（返回值）：给模型看的定性 + 点名 + 出路
+ * 2. `sandbox.ignoreViolations` 过滤：用户明确忽略的拒绝不做注解
+ */
+function annotateStderrWithSandboxFailures(
+  command: string,
+  stderr: string,
+  context?: { readonly sandboxed?: boolean },
+): string {
+  if (context?.sandboxed !== true) return stderr
+  if (stderr.length === 0) return stderr
+
+  const denials = filterIgnoredDenials(
+    collectSandboxDenials(stderr),
+    getInitialSettings().sandbox?.ignoreViolations,
+  )
+  if (denials.length === 0) return stderr
+
+  const annotation = formatSandboxViolationAnnotation({
+    denials,
+    backend: getSandboxBackend() ?? null,
+    allowUnsandboxedCommands: areUnsandboxedCommandsAllowed(),
+    command,
+  })
+  // 前置而不是追加：下游有多处按长度截断输出，注解排在后面就会在「输出很长的
+  // 失败命令」——正是最需要解释的那一类——上被切掉。原文一个字节不动。
+  return `${annotation}\n${stderr}`
 }
 
 /**
@@ -832,17 +1047,19 @@ async function initialize(
         worktreeMainRepoPath = await detectWorktreeMainRepoPath(getCwd())
       }
 
-      // R-Sandbox Phase 4 wave 2 path B：BaseSandboxManager 退场。Rust 端 acosmi-sandbox
-      // 由 ExecBridge sandboxMode='enforced' 每次 spawnManaged 时从 settings 派生
-      // SandboxRuntimeConfig (`acosmi-supervisor::ipc::handle_spawn_managed_sandboxed`
-      // → `select_async_runner`)，TS 端不再主动 initialize 后端。wrappedCallback 与
-      // settingsChangeDetector subscription 暂保留作占位，wave 3 P4-T6 默认开
-      // enforced 后整体下线。
+      // 这里不 initialize 任何后端，因为**没有需要被 initialize 的长驻后端**。
+      //
+      // Rust 不读取 settings：隔离配置由 TS 单源，经
+      // `sandboxExecConfig.ts::buildSandboxExecConfig` 从 settings
+      // 全保真派生、落 0600 临时文件，helper（`crabcode sandbox-exec`）只做严格
+      // 反序列化与平台映射，读不出任何 TS 没写进去的东西。
+      //
+      // 配置因此是**每条命令现派生**的：不存在需要被 push 的会话级后端状态，
+      // 这才是 refreshConfig / 下面这个 subscription 可以是 no-op 的真实理由。
       void wrappedCallback
 
-      // Subscribe to settings changes — kept as no-op：Rust runtime 每次 spawnManaged
-      // 重读 settings；TS 端不需主动通知。保留 subscription 让 reset() 清理路径
-      // 不破，且未来 Phase 5 acosmi-protocol 接通时可恢复实义。
+      // Subscribe to settings changes — kept as no-op：配置每条命令现派生（见上），
+      // 没有要通知的对象。保留 subscription 只为让 reset() 的清理路径不破。
       settingsSubscriptionCleanup = settingsChangeDetector.subscribe(() => {
         // no-op
       })
@@ -862,20 +1079,20 @@ async function initialize(
  * Refresh sandbox config from current settings immediately
  * Call this after updating permissions to avoid race conditions
  *
- * R-Sandbox Phase 4 wave 2 path B：BaseSandboxManager.updateConfig 退场。Rust 端
- * 每次 spawnManaged 都重读 settings 派生 config，无需 TS 主动 push。本函数保
- * no-op 兼容现 caller surface（add-dir / setSandboxSettings 等调用点）。
+ * no-op —— 且这次是有理由的 no-op（PR-6 更正措辞）。隔离配置由
+ * `buildSandboxExecConfig()` 在**每一条**沙箱命令 spawn 前从当前 settings 现场
+ * 派生并落成一次性 0600 文件，没有任何一份被缓存的 config 需要被刷新。本函数
+ * 保留只为兼容现 caller surface（add-dir / setSandboxSettings 等调用点）。
  */
 function refreshConfig(): void {
-  // no-op (path B)
+  // no-op — 见上：没有缓存态可刷
 }
 
 /**
  * Reset sandbox state and clear memoized values
  *
- * R-Sandbox Phase 4 wave 2 path B：BaseSandboxManager.reset 退场，TS 端仅清自身
- * 缓存与订阅。Rust 端无 session-scoped state（每次 spawnManaged 重读 settings），
- * 不需 cross-language reset。
+ * TS 端仅清自身缓存与订阅。没有 cross-language reset 可做：helper 是 per-command
+ * 进程，命令结束即消失，不持有任何 session-scoped 状态。
  */
 async function reset(): Promise<void> {
   // Clean up settings subscription
@@ -887,6 +1104,9 @@ async function reset(): Promise<void> {
   // Clear memoized caches
   checkDependencies.cache.clear?.()
   isSupportedPlatform.cache.clear?.()
+  // PR-0：后端探测缓存与上面三个同生命周期 —— 漏清会让 reset() 后的第 4 道门
+  // 继续复用旧结论（例如换了 helper 二进制却仍报不可用）。
+  resetEnforcedBackendProbeCache()
   initializationPromise = undefined
 }
 
@@ -953,8 +1173,16 @@ export interface ISandboxManager {
   getSandboxUnavailableReason(): string | undefined
   isSandboxingEnabled(): boolean
   isSandboxEnabledInSettings(): boolean
+  isEnforcedBackendWired(): boolean
+  getEnforcedBackendUnavailableReason(): string | undefined
+  /** 本会话实际生效的后端标识；没有生效的沙箱时 undefined。 */
+  getSandboxBackend(): SandboxBackendId | undefined
   checkDependencies(): SandboxDependencyCheck
   isAutoAllowBashIfSandboxedEnabled(): boolean
+  /** 本会话配置的隔离保真度（哪些规则兑现不了）。 */
+  getSandboxFidelity(): SandboxFidelity
+  /** 沙箱 auto-allow 免审批宽免此刻是否成立 —— 唯一判据点。 */
+  isSandboxAutoAllowActive(): boolean
   areUnsandboxedCommandsAllowed(): boolean
   isSandboxRequired(): boolean
   areSandboxSettingsLockedByPolicy(): boolean
@@ -983,9 +1211,11 @@ export interface ISandboxManager {
     abortSignal?: AbortSignal,
   ): Promise<string>
   cleanupAfterCommand(): void
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  getSandboxViolationStore(): SandboxViolationStore
-  annotateStderrWithSandboxFailures(command: string, stderr: string): string
+  annotateStderrWithSandboxFailures(
+    command: string,
+    stderr: string,
+    context?: { readonly sandboxed?: boolean },
+  ): string
   getLinuxGlobPatternWarnings(): string[]
   refreshConfig(): void
   reset(): Promise<void>
@@ -1000,9 +1230,14 @@ export const SandboxManager: ISandboxManager = {
   initialize,
   isSandboxingEnabled,
   isSandboxEnabledInSettings: getSandboxEnabledSetting,
+  isEnforcedBackendWired,
+  getEnforcedBackendUnavailableReason,
+  getSandboxBackend,
   isPlatformInEnabledList,
   getSandboxUnavailableReason,
   isAutoAllowBashIfSandboxedEnabled,
+  getSandboxFidelity,
+  isSandboxAutoAllowActive,
   areUnsandboxedCommandsAllowed,
   isSandboxRequired,
   areSandboxSettingsLockedByPolicy,
@@ -1018,10 +1253,9 @@ export const SandboxManager: ISandboxManager = {
   // 4 个 runtime-allocated 字段 (proxy ports / socket paths) 永远 undefined —
   // Rust 端分配，TS 不可见；execHttpHook.ts 退化为不经 sandbox proxy 路由
   // (enforced 模式下子进程仍 Rust 真隔离，安全实质不破)。
-  // getSandboxViolationStore 永远返 STUB_VIOLATION_STORE：UI violation count
-  // 永远 0，subscribe noop（Phase 5 acosmi-protocol 接通后恢复）。
-  // annotateStderrWithSandboxFailures 保留接口 + TS noop 返回原 stderr
-  // (Phase 5 增强 regex)。cleanupAfterCommand 仅保留 scrubBareGitRepoFiles。
+  // Text annotations are derived locally from command stderr. No presentation
+  // store or cross-process feedback channel is part of the direct TUI closure.
+  // cleanupAfterCommand only keeps scrubBareGitRepoFiles.
   getFsReadConfig: () =>
     deriveFsReadConfig(convertToSandboxRuntimeConfig(getInitialSettings())),
   getFsWriteConfig: () =>
@@ -1044,14 +1278,7 @@ export const SandboxManager: ISandboxManager = {
   getLinuxHttpSocketPath: () => undefined,
   getLinuxSocksSocketPath: () => undefined,
   waitForNetworkInitialization: () => Promise.resolve(true),
-  getSandboxViolationStore: () => STUB_VIOLATION_STORE,
-  annotateStderrWithSandboxFailures: (
-    _command: string,
-    stderr: string,
-  ): string => {
-    // path B noop：Phase 5 真接通时增强 regex /Operation not permitted/ → sandbox hint
-    return stderr
-  },
+  annotateStderrWithSandboxFailures,
   cleanupAfterCommand: (): void => {
     scrubBareGitRepoFiles()
   },
@@ -1069,8 +1296,6 @@ export type {
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
   NetworkHostPattern,
-  SandboxViolationEvent,
-  SandboxViolationStore,
   SandboxRuntimeConfig,
   IgnoreViolationsConfig,
 }

@@ -49,6 +49,7 @@ import {
 import {
   getMergedBetas,
 } from '../../utils/betas.js'
+import { createCombinedAbortSignal } from '../../utils/combinedAbortSignal.js'
 import { resolveAppliedEffort } from '../../utils/effort.js'
 import { isEnvDefinedFalsy, isEnvTruthy } from '../../utils/envUtils.js'
 import { errorMessage } from '../../utils/errors.js'
@@ -218,6 +219,7 @@ import {
   chatStreamAdapter,
   systemToString,
   type ChatRequest,
+  type ChatStreamAdapter,
 } from '../acosmi/client.js'
 // Y 路径 step 9 (2026-05-01): IPC 中转层下线, 所有 model call 走 SDK 直调.
 // M1+M2 (2026-05-01): chat 401/403 → handleAuthExpiredInQuery 同步触发 cache cleanup,
@@ -583,6 +585,63 @@ export async function* executeNonStreamingRequest(
   }
 
   const fallbackTimeoutMs = getNonstreamingFallbackTimeoutMs()
+
+  // 2026-08-06: 在此之前, fallbackTimeoutMs 只被写进埋点字段 timeout_ms, 从未传给 SDK ——
+  // 于是真正生效的是 SDK 内层 doJSONFullRaw 的 30s 默认值。回退路径的预算比它要救的流式
+  // 路径**更短**, 是反向降级: 把"可恢复的抖动"确定性翻译成"整轮失败"。
+  //
+  // 预算是**整条回退链路**共享一条 deadline, 不是每次尝试各给一份。
+  // 依据是 getNonstreamingFallbackTimeoutMs 自己的文档: 它存在的理由是"stay under CCR's
+  // container idle-kill (~5min)"。按尝试计的话 4 次 × 120s(remote) = 8min, 正好冲破它要
+  // 守的那条线; 按尝试计 4 × 300s = 20min 还会撞 §17 的轮次墙钟 (默认 1800s)。
+  //
+  // 同时把 signal 真正下传: 此前 chatComplete 拿不到任何 signal, 用户按 ESC 取消不了
+  // 非流式回退 (要等它自己超时)。
+  const fallbackBudget = createCombinedAbortSignal(retryOptions.signal, {
+    timeoutMs: fallbackTimeoutMs,
+  })
+  try {
+    return yield* runNonStreamingRetryLoop(
+      clientOptions,
+      retryOptions,
+      paramsFromContext,
+      onAttempt,
+      captureRequest,
+      fallbackTimeoutMs,
+      fallbackBudget.signal,
+      originatingRequestId,
+    )
+  } finally {
+    fallbackBudget.cleanup()
+  }
+}
+
+/**
+ * executeNonStreamingRequest 的重试主体。拆出来只为让上面那层的 try/finally
+ * 明确地包住整条链路 —— 预算的 cleanup 必须在生成器被关闭时也执行到。
+ */
+async function* runNonStreamingRetryLoop(
+  clientOptions: {
+    model: string
+    fetchOverride?: Options['fetchOverride']
+    source: string
+  },
+  retryOptions: {
+    model: string
+    fallbackModel?: string
+    thinkingConfig: ThinkingConfig
+    fastMode?: boolean
+    signal: AbortSignal
+    initialConsecutive529Errors?: number
+    querySource?: QuerySource
+  },
+  paramsFromContext: (context: RetryContext) => BetaMessageStreamParams,
+  onAttempt: (attempt: number, start: number, maxOutputTokens: number) => void,
+  captureRequest: (params: BetaMessageStreamParams) => void,
+  fallbackTimeoutMs: number,
+  budgetSignal: AbortSignal,
+  originatingRequestId?: string | null,
+): AsyncGenerator<SystemAPIErrorMessage, BetaMessage> {
   const generator = withRetry(
     () => Promise.resolve(null as unknown as Acosmi),
     async (_acosmi, attempt, context) => {
@@ -604,11 +663,19 @@ export async function* executeNonStreamingRequest(
         const resp = await chatComplete(
           normalizeModelStringForAPI(adjustedParams.model),
           buildAcosmiChatRequestFromParams(adjustedParams),
+          budgetSignal,
         )
         return resp as unknown as BetaMessage
       } catch (err) {
         // User aborts are not errors — re-throw immediately without logging
         if (err instanceof APIUserAbortError) throw err
+
+        // 用户中断经 budgetSignal 传到 SDK 后, 回来的是 AbortError→NetworkError,
+        // 形态与"网络抖动"无法区分。这里按中断源头判定并翻译回 APIUserAbortError:
+        // 否则 ESC 会被记成一次 tengu_nonstreaming_fallback_error, 且要多跑一轮退避
+        // 才在 withRetry 的 sleep 处才认出是中断。budgetSignal 自己超时不走这条
+        // (它不是用户中断, 该照常按网络错误分类)。
+        if (retryOptions.signal.aborted) throw new APIUserAbortError()
 
         // M1+M2 K6 (2026-05-01) + 根因修 2026-05-05: 仅真 auth-expired 才清 cache.
         // 与流式路径 line 2167-2170 对齐: 401 一律算 auth-expired (网关约定);
@@ -652,6 +719,16 @@ export async function* executeNonStreamingRequest(
       thinkingConfig: retryOptions.thinkingConfig,
       ...(isFastModeEnabled() && { fastMode: retryOptions.fastMode }),
       signal: retryOptions.signal,
+      // The request and every retry backoff share the same wall-clock
+      // deadline. Keep the caller signal separate so an elapsed budget is
+      // reported as a timeout rather than as an ESC/user cancellation.
+      retrySignal: budgetSignal,
+      retryAbortError: () =>
+        retryOptions.signal.aborted
+          ? new APIUserAbortError()
+          : new APIConnectionTimeoutError({
+              message: `Non-streaming fallback exceeded its ${fallbackTimeoutMs}ms budget`,
+            }),
       initialConsecutive529Errors: retryOptions.initialConsecutive529Errors,
       querySource: retryOptions.querySource,
     },
@@ -1858,6 +1935,27 @@ async function* queryModel(
       }, STREAM_IDLE_TIMEOUT_MS)
     }
     resetStreamIdleTimer()
+
+    // 把看门狗接到 SDK 的上游活性信号上 (2026-08-06)。
+    //
+    // 看门狗原本只在 yield 出事件时才复位, 但 SSE 上有两类**有字节、无事件**的情形
+    // 对它完全失明: ① 网关在等上游首字节期间发的 ": keep-alive" 注释行被 SDK 的
+    // isSSECommentLine 吞掉; ② OpenAI 格式下 converter 对某些 data 行返回零事件。
+    // 两种情形连接都健康, 看门狗却照常开火 —— 网关补了心跳而中间层吞掉, 等于没补。
+    //
+    // 只有 gateway 流式适配器带这个钩子; local:/custom: 适配器没有, 行为不变。
+    //
+    // 先落到局部变量再判: `stream` 是闭包变量, releaseStreamResources 会把它置
+    // undefined, 而 `'x' in undefined` 是抛 TypeError 不是返回 false。当前控制流
+    // 里从 resetStreamIdleTimer() 到这里没有 await, 置空不可能插进来 (TS 也据此
+    // narrow 成非 undefined), 但这条依赖的是"中间没人加 await"这种会被后来者
+    // 无声破坏的前提 —— 主查询路径上不值得赌, 写成结构上不可能抛的形态。
+    const activityHookTarget = stream as
+      | Partial<ChatStreamAdapter>
+      | undefined
+    if (activityHookTarget && 'onUpstreamActivity' in activityHookTarget) {
+      activityHookTarget.onUpstreamActivity = resetStreamIdleTimer
+    }
 
     startSessionActivity('api_call')
     try {

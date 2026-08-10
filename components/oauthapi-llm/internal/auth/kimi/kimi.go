@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/acosmi/OAuthAPI-LLM/internal/auth/autherrors"
 	"github.com/acosmi/OAuthAPI-LLM/internal/config"
 	"github.com/acosmi/OAuthAPI-LLM/internal/util"
 	"github.com/google/uuid"
@@ -246,7 +247,7 @@ func (c *DeviceFlowClient) PollForToken(ctx context.Context, deviceCode *DeviceC
 			return nil, fmt.Errorf("kimi: context cancelled: %w", ctx.Err())
 		case <-ticker.C:
 			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("kimi: device code expired")
+				return nil, autherrors.Classify(autherrors.ErrAuthorizationTimeout, fmt.Errorf("kimi: device code expired"))
 			}
 
 			token, pollErr, shouldContinue := c.exchangeDeviceCode(ctx, deviceCode.DeviceCode)
@@ -281,7 +282,7 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode st
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("kimi: token request failed: %w", err), false
+		return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("kimi: token request failed: %w", err)), false
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -291,7 +292,7 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode st
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("kimi: failed to read token response: %w", err), false
+		return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("kimi: failed to read token response: %w", err)), false
 	}
 
 	// Parse response - Kimi returns 200 for both success and pending states
@@ -306,7 +307,7 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode st
 	}
 
 	if err = json.Unmarshal(bodyBytes, &oauthResp); err != nil {
-		return nil, fmt.Errorf("kimi: failed to parse token response: %w", err), false
+		return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("kimi: failed to parse token response: %w", err)), false
 	}
 
 	if oauthResp.Error != "" {
@@ -316,16 +317,16 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode st
 		case "slow_down":
 			return nil, nil, true // Continue polling (with increased interval handled by caller)
 		case "expired_token":
-			return nil, fmt.Errorf("kimi: device code expired"), false
+			return nil, autherrors.Classify(autherrors.ErrAuthorizationTimeout, fmt.Errorf("kimi: device code expired")), false
 		case "access_denied":
-			return nil, fmt.Errorf("kimi: access denied by user"), false
+			return nil, autherrors.Classify(autherrors.ErrAuthorizationDenied, fmt.Errorf("kimi: access denied by user")), false
 		default:
 			return nil, fmt.Errorf("kimi: OAuth error: %s - %s", oauthResp.Error, oauthResp.ErrorDescription), false
 		}
 	}
 
 	if oauthResp.AccessToken == "" {
-		return nil, fmt.Errorf("kimi: empty access token in response"), false
+		return nil, autherrors.Classify(autherrors.ErrUpstreamUnavailable, fmt.Errorf("kimi: empty access token in response")), false
 	}
 
 	var expiresAt int64

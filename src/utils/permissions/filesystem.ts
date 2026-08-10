@@ -1685,21 +1685,6 @@ export function checkReadableInternalPath(
     }
   }
 
-  // Project temp directory (/tmp/crabcode/{sanitized-cwd}/)
-  // Intentionally allows reading files from all sessions in this project, not just the current session.
-  // This enables cross-session file access within the same project's temp space.
-  const projectTempDir = getProjectTempDir()
-  if (normalizedPath.startsWith(projectTempDir)) {
-    return {
-      behavior: 'allow',
-      updatedInput: input,
-      decisionReason: {
-        type: 'other',
-        reason: 'Project temp directory files are allowed for reading',
-      },
-    }
-  }
-
   // Agent memory directory (for self-improving agents)
   if (isAgentMemoryPath(normalizedPath)) {
     return {

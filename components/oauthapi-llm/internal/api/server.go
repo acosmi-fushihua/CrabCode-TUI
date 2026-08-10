@@ -1718,6 +1718,14 @@ func (s *Server) Start() error {
 	httpListener := newMuxListener(listener.Addr(), 1024)
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
+	// F1 (2026-08-08 账户接入审计 §7 PR-α-1): publish the OS-assigned port to
+	// the management handler so browser-flow callback URLs can be composed in
+	// account-bridge mode. cfg.Port stays pinned to 0 — the
+	// ValidateAccountBridgeSecurity contract is untouched; this is runtime
+	// injection, not config mutation.
+	if tcpAddress, ok := listener.Addr().(*net.TCPAddr); ok && tcpAddress != nil && s.mgmt != nil {
+		s.mgmt.SetRuntimeListenPort(tcpAddress.Port)
+	}
 	if errReady := writeAccountBridgeReadiness(os.Stdout, listener.Addr()); errReady != nil {
 		_ = listener.Close()
 		return fmt.Errorf("failed to publish server readiness: %v", errReady)

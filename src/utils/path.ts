@@ -1,5 +1,6 @@
 import { homedir } from 'os'
 import { dirname, isAbsolute, join, normalize, relative, resolve } from 'path'
+import { fileURLToPath } from 'url'
 import { getCwd } from './cwd.js'
 import { getFsImplementation } from './fsOperations.js'
 import { getPlatform } from './platform.js'
@@ -152,4 +153,37 @@ export function normalizePathForConfigKey(path: string): string {
   // Then convert all backslashes to forward slashes for consistent JSON keys
   // This is safe because forward slashes work in Windows paths for most operations
   return normalized.replace(/\\/g, '/')
+}
+
+/**
+ * Converts a `file://` URI to a native filesystem path. Non-`file://` input is
+ * returned unchanged, so callers can pass through custom schemes untouched.
+ *
+ * 用它替换手写的 `uri.slice(7)` / `uri.replace('file://', '')`。那种朴素前缀算术
+ * 只对**我们自己手拼**的 `file://` + 裸路径成立，对规范形态一概失效：
+ *
+ *   file://C:\p\a.ts            剥7 -> 'C:\p\a.ts'            ← 只有这个形态能命中
+ *   file:///C:/p/a.ts           剥7 -> '/C:/p/a.ts'           ← 多一个前导斜杠，比较必挂
+ *   file:///C:/p/%E6%94%AF.ts   剥7 -> '/C:/p/%E6%94%AF.ts'   ← 百分号编码原样留着
+ *   file://server/share/a.ts    剥7 -> 'server/share/a.ts'    ← UNC 主机名被当成目录
+ *
+ * 而 `file:///…`（三斜杠 + 百分号编码）正是 RFC 8089 与 LSP/MCP 规范要求的形态，
+ * 也是 VS Code / JetBrains 等第三方回给我们的形态 —— 换句话说，朴素剥离**只认
+ * 我们自己写错的那一种**。fileURLToPath 上面四种全部正确还原（实测，2026-08-06）。
+ *
+ * 解析失败才退回朴素剥离：唯一已知触发是在 POSIX 上收到 `file://C:\…`（host 非空，
+ * Node 抛 ERR_INVALID_FILE_URL_HOST）。这条兜底保证本函数**永不比旧行为更差**。
+ *
+ * @param uri - A `file://` URI, or any other string (returned as-is)
+ * @returns The native filesystem path, or the original string for non-file URIs
+ */
+export function fileUriToPath(uri: string): string {
+  if (!uri.startsWith('file://')) {
+    return uri
+  }
+  try {
+    return fileURLToPath(uri)
+  } catch {
+    return uri.slice('file://'.length)
+  }
 }

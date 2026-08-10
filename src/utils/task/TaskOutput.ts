@@ -1,10 +1,17 @@
+import type { FileHandle } from 'fs/promises'
 import { unlink } from 'fs/promises'
 import { CircularBuffer } from '../CircularBuffer.js'
 import { logForDebugging } from '../debug.js'
 import { readFileRange, tailFile } from '../fsOperations.js'
 import { getMaxOutputLength } from '../shell/outputLimits.js'
 import { safeJoinLines } from '../stringUtils.js'
-import { DiskTaskOutput, getTaskOutputPath } from './diskOutput.js'
+import {
+  DiskTaskOutput,
+  getTaskOutputBackingPath,
+  getTaskOutputPath,
+  releaseTaskOutputPath,
+  resolveTaskOutputFileIdentity,
+} from './diskOutput.js'
 
 const DEFAULT_MAX_MEMORY = 8 * 1024 * 1024 // 8MB
 const POLL_INTERVAL_MS = 1000
@@ -21,10 +28,9 @@ type ProgressCallback = (
 /**
  * Single source of truth for a shell command's output.
  *
- * For bash commands (file mode): both stdout and stderr go directly to
- * a file via stdio fds — neither enters JS. Progress is extracted by
- * polling the file tail. getStderr() returns '' since stderr is
- * interleaved in the output file.
+ * For bash commands (file mode): the host drains stdout and stderr pipes into
+ * one host-opened file. Progress is extracted by polling the file tail.
+ * getStderr() returns '' since stderr is interleaved in that file.
  *
  * For hooks (pipe mode): data flows through writeStdout()/writeStderr()
  * and is buffered in memory, spilling to disk if it exceeds the limit.
@@ -111,7 +117,13 @@ export class TaskOutput {
       if (!entry.#onProgress) {
         continue
       }
-      void tailFile(entry.path, PROGRESS_TAIL_BYTES).then(
+      void resolveTaskOutputFileIdentity(entry.taskId).then(identity =>
+        tailFile(
+          getTaskOutputBackingPath(entry.taskId),
+          PROGRESS_TAIL_BYTES,
+          identity,
+        ),
+      ).then(
         ({ content, bytesRead, bytesTotal }) => {
           if (!entry.#onProgress) {
             return
@@ -279,9 +291,9 @@ export class TaskOutput {
    * Get stdout. In file mode, reads from the output file.
    * In pipe mode, returns the in-memory buffer or tail from CircularBuffer.
    */
-  async getStdout(): Promise<string> {
+  async getStdout(outputFileHandle?: FileHandle): Promise<string> {
     if (this.stdoutToFile) {
-      return this.#readStdoutFromFile()
+      return this.#readStdoutFromFile(outputFileHandle)
     }
     // Pipe mode (hooks) — use in-memory data
     if (this.#disk) {
@@ -294,10 +306,22 @@ export class TaskOutput {
     return this.#stdoutBuffer
   }
 
-  async #readStdoutFromFile(): Promise<string> {
+  async #readStdoutFromFile(outputFileHandle?: FileHandle): Promise<string> {
     const maxBytes = getMaxOutputLength()
     try {
-      const result = await readFileRange(this.path, 0, maxBytes)
+      const identity = await resolveTaskOutputFileIdentity(this.taskId)
+      const result = outputFileHandle
+        ? await this.#readStdoutFromHandle(
+            outputFileHandle,
+            maxBytes,
+            identity,
+          )
+        : await readFileRange(
+            getTaskOutputBackingPath(this.taskId),
+            0,
+            maxBytes,
+            identity,
+          )
       if (!result) {
         this.#outputFileRedundant = true
         return ''
@@ -322,6 +346,55 @@ export class TaskOutput {
         `TaskOutput.#readStdoutFromFile: failed to read ${this.path} (${code}): ${err}`,
       )
       return `<bash output unavailable: output file ${this.path} could not be read (${code}). This usually means another CrabCode process in the same project deleted it during startup cleanup.>`
+    }
+  }
+
+  /**
+   * Read through the descriptor opened by the host before spawn. The child may
+   * unlink or replace the published pathname, but it cannot redirect this
+   * descriptor to a different inode.
+   */
+  async #readStdoutFromHandle(
+    handle: FileHandle,
+    maxBytes: number,
+    expectedIdentity: { dev: bigint; ino: bigint },
+  ): Promise<{
+    content: string
+    bytesRead: number
+    bytesTotal: number
+  } | null> {
+    const stats = await handle.stat({ bigint: true })
+    if (
+      !stats.isFile() ||
+      stats.dev !== expectedIdentity.dev ||
+      stats.ino !== expectedIdentity.ino
+    ) {
+      const error = new Error(
+        `task output descriptor identity changed: ${this.path}`,
+      ) as NodeJS.ErrnoException
+      error.code = 'ESTALE'
+      throw error
+    }
+
+    const bytesTotal = Number(stats.size)
+    if (bytesTotal === 0) return null
+    const bytesToRead = Math.min(bytesTotal, maxBytes)
+    const buffer = Buffer.allocUnsafe(bytesToRead)
+    let bytesRead = 0
+    while (bytesRead < bytesToRead) {
+      const result = await handle.read(
+        buffer,
+        bytesRead,
+        bytesToRead - bytesRead,
+        bytesRead,
+      )
+      if (result.bytesRead === 0) break
+      bytesRead += result.bytesRead
+    }
+    return {
+      content: buffer.toString('utf8', 0, bytesRead),
+      bytesRead,
+      bytesTotal,
     }
   }
 
@@ -375,6 +448,10 @@ export class TaskOutput {
       await unlink(this.path)
     } catch {
       // File may already be deleted or not exist
+    } finally {
+      // The instance retains its immutable `path`, while future reuse of the
+      // task id should resolve against the then-current session.
+      releaseTaskOutputPath(this.taskId)
     }
   }
 

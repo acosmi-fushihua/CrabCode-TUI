@@ -326,8 +326,8 @@ export const FileWriteTool = buildTool({
     // Notify LSP servers about file modification (didChange) and save (didSave)
     const lspManager = getLspServerManager()
     if (lspManager) {
-      // Clear previously delivered diagnostics so new ones will be shown
-      clearDeliveredDiagnosticsForFile(`file://${fullFilePath}`)
+      // The registry stores normalized filesystem paths, not file URLs.
+      clearDeliveredDiagnosticsForFile(fullFilePath)
       // didChange: Content has been modified
       lspManager.changeFile(fullFilePath, content).catch((err: Error) => {
         logForDebugging(

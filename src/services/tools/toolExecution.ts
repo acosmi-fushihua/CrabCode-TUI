@@ -252,7 +252,6 @@ function decisionReasonToOTelSource(
     case 'classifier':
     case 'subcommandResults':
     case 'asyncAgent':
-    case 'sandboxOverride':
     case 'workingDir':
     case 'safetyCheck':
     case 'other':

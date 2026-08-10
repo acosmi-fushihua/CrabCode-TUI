@@ -262,7 +262,15 @@ func TestStartAndStopSuccess(t *testing.T) {
 	}
 }
 
-func TestStartFailsWhenConfigMissing(t *testing.T) {
+// F9 (2026-08-09) —— 这条用例原来断言的是「config 缺失 ⇒ Start 失败」，而那正是缺陷
+// 本身：宿主（CrabCode 账户接入管理器）拿到 healthz 后会删掉只含单次运行密钥的临时
+// config，而 readiness 在 listener bind 那一刻就发出去了，watcher 要再晚约 100ms 才
+// Add —— 删除恰好落进这道缝，于是 Start 返回错误、Service.Run 退出、宿主判「就绪后
+// 异常退出」并重启，如此循环（Windows 自 1.0.15 起恒败）。
+//
+// 新契约：config 监听失败只降级掉热重载，进程必须活着。auth 目录失败仍然致命，
+// 由 TestStartFailsWhenAuthDirMissing 守着 —— 两者失效后果不对称，判据本就不该一样。
+func TestStartToleratesMissingConfigFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := filepath.Join(tmpDir, "auth")
 	if err := os.MkdirAll(authDir, 0o755); err != nil {
@@ -279,8 +287,40 @@ func TestStartFailsWhenConfigMissing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := w.Start(ctx); err == nil {
-		t.Fatal("expected Start to fail for missing config file")
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("config 缺失只该降级掉热重载，不该让进程死掉: %v", err)
+	}
+}
+
+// 宿主真实时序的回放：先起来（config 还在），拿到就绪之后宿主把 config 删掉，
+// watcher 才去 Add。这条用例把 F9 的那道缝直接摆出来。
+func TestStartSurvivesConfigDeletedRightBeforeWatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("port: 0\n"), 0o600); err != nil {
+		t.Fatalf("failed to seed config: %v", err)
+	}
+
+	w, err := NewWatcher(configPath, authDir, nil)
+	if err != nil {
+		t.Fatalf("failed to create watcher: %v", err)
+	}
+	defer w.Stop()
+
+	// 宿主在 readiness 与 watcher.Add 之间删掉了它。
+	if err := os.Remove(configPath); err != nil {
+		t.Fatalf("failed to remove config: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("宿主删掉临时 config 后 watcher 必须照常启动: %v", err)
 	}
 }
 

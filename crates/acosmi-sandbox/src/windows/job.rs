@@ -22,6 +22,7 @@ use windows::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    TerminateJobObject,
 };
 
 use crate::config::ResourceLimits;
@@ -59,6 +60,34 @@ impl JobGuard {
             })?;
         }
         debug!("process assigned to job object");
+        Ok(())
+    }
+
+    /// Terminate every process still in this job.
+    ///
+    /// `KILL_ON_JOB_CLOSE` already covers the *implicit* case (drop the last
+    /// handle → the tree dies), and that is what protects us if the helper is
+    /// killed. This is the **explicit** case: the direct child has exited but
+    /// its own children may still be running and holding the job open. Calling
+    /// this before returning makes "the command finished" and "the process tree
+    /// is gone" the same instant, instead of leaving orphans whose lifetime
+    /// depends on when a handle happens to be dropped.
+    ///
+    /// Best-effort by design: a job with nothing left in it, or one already
+    /// being torn down, is a success from the caller's point of view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Win32`] if `TerminateJobObject` itself fails.
+    pub fn terminate(&self, exit_code: u32) -> Result<(), SandboxError> {
+        // SAFETY: self.handle is a valid Job Object handle we own.
+        unsafe {
+            TerminateJobObject(self.handle, exit_code).map_err(|e| SandboxError::Win32 {
+                operation: "TerminateJobObject".into(),
+                error_code: e.code().0 as u32,
+            })?;
+        }
+        debug!(exit_code, "job object terminated");
         Ok(())
     }
 }

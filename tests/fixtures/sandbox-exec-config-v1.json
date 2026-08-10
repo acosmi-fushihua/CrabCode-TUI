@@ -1,0 +1,35 @@
+{
+  "configVersion": 1,
+  "fidelity": {
+    "level": "partial",
+    "unenforced": ["network.allowedDomains"]
+  },
+  "securityLevel": "allowlist",
+  "cwd": "<CWD>",
+  "tmpDir": "<TMPDIR>",
+  "filesystem": {
+    "allowRead": ["<HOME>/.cache/shared-tooling"],
+    "allowWrite": [".", "<TMPDIR>", "<CWD_PROBE_FILE>", "<WORKTREE_MAIN_REPO>"],
+    "denyRead": ["<HOME>/.aws/**"],
+    "denyWrite": [
+      "<CWD>/.crabcode/settings.json",
+      "<CWD>/.crabcode/skills",
+      "<CWD>/HEAD",
+      "<CWD>/objects"
+    ]
+  },
+  "network": {
+    "policy": "restricted",
+    "allowedDomains": ["example.com"],
+    "deniedDomains": [],
+    "allowUnixSockets": [],
+    "allowAllUnixSockets": false,
+    "allowLocalBinding": false,
+    "httpProxyPort": 0,
+    "socksProxyPort": 0
+  },
+  "weaker": {
+    "nestedSandbox": false,
+    "networkIsolation": false
+  }
+}

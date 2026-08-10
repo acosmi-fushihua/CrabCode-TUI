@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/acosmi/OAuthAPI-LLM/internal/accountbridge"
 )
@@ -45,11 +46,11 @@ type accountBridgeBootstrapWire struct {
 
 func readAccountBridgeBootstrapFD(fd uintptr, trustRoot string) (*accountBridgeBootstrap, error) {
 	if !accountBridgeDescriptorIsOpen(fd) {
-		return nil, errors.New("account bridge bootstrap is unavailable")
+		return nil, errors.New("account bridge bootstrap channel is not a private pipe")
 	}
 	file := os.NewFile(fd, "account-bridge-bootstrap")
 	if file == nil {
-		return nil, errors.New("account bridge bootstrap is unavailable")
+		return nil, errors.New("account bridge bootstrap channel is unusable")
 	}
 	defer file.Close()
 	return decodeAccountBridgeBootstrap(file, trustRoot)
@@ -106,9 +107,17 @@ func decodeAccountBridgeBootstrap(reader io.Reader, trustRoot string) (*accountB
 	// Boot-level gate: the grant must be valid for its generation and name at
 	// least one connector. Per-connector reachability is enforced later by the
 	// runtime (membership, policy gates, CN floor).
-	if !verifier.Decide(wire.Grant).BootAllowed() {
+	// EligibilityReason is documented by its own type as a stable, non-sensitive
+	// fail-closed decision reason, so carrying it out of the sidecar is safe and
+	// turns "denied" into an actionable cause (expired / client version
+	// mismatch / invalid signature / ...). Underscores become spaces so the
+	// host's forensics redactor keeps the phrase verbatim.
+	if decision := verifier.Decide(wire.Grant); !decision.BootAllowed() {
 		clear(masterKey)
-		return nil, errors.New("account bridge eligibility denied")
+		return nil, fmt.Errorf(
+			"account bridge eligibility denied: %s",
+			strings.ReplaceAll(string(decision.Reason), "_", " "),
+		)
 	}
 	if err = accountbridge.ValidateConnectorPolicies(wire.ConnectorPolicies); err != nil {
 		clear(masterKey)

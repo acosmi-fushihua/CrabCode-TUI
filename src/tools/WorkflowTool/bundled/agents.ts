@@ -59,6 +59,8 @@ export const WEB_RESEARCHER_AGENT: BuiltInAgentDefinition = {
   // structured-output tool is appended by cloneAgentForWorkflow when the
   // workflow passes a schema.
   tools: [WEB_SEARCH_TOOL_NAME, WEB_FETCH_TOOL_NAME],
+  // Bound unattended workflow depth independently from the total wall clock.
+  maxTurns: 30,
   source: 'built-in',
   baseDir: 'built-in',
   getSystemPrompt: getWebResearcherSystemPrompt,

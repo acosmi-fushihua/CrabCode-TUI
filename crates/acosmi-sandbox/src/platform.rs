@@ -619,6 +619,814 @@ fn apply_to_self_windows(config: &SandboxConfig) -> Result<(), SandboxError> {
     Ok(())
 }
 
+// ── Exec-backend 能力探测（W-SANDBOX-ENFORCED-DEADCODE PR-2）───────────────
+
+/// `crabcode sandbox-probe` 的后端能力结论。
+///
+/// 只回答一个问题：**这台机器上，`sandbox-exec` 的自沙箱路径现在能用吗？**
+/// 不可用是一个被报告的事实（`available:false` + `reason`），不是错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecBackendProbe {
+    pub available: bool,
+    /// 不可用的原因 slug（单 token，TS 侧原样拼进 `backend-unavailable:<reason>`）。
+    pub reason: Option<&'static str>,
+}
+
+/// 本平台没有自沙箱实现。
+pub const PROBE_REASON_PLATFORM_UNSUPPORTED: &str = "platform-unsupported";
+/// Windows：受限令牌 / 作业对象 / 子进程创建这一链在本机跑不起来。
+pub const PROBE_REASON_WINDOWS_SPAWN_FAILED: &str = "windows-sandbox-spawn-failed";
+/// Windows：链路能跑，但一次 spawn 的开销越过了性能门。
+pub const PROBE_REASON_WINDOWS_TOO_SLOW: &str = "windows-sandbox-too-slow";
+
+/// Windows 性能门：一次沙箱 spawn 的墙钟上限。
+///
+/// 不是审美取值 —— 每一条 Bash 命令都要付这笔钱，它直接叠在用户等待上。越过就
+/// 不是"慢一点"，是把交互式工具变成不可用（本立项立项前实测 46 s/次，根因见
+/// [`crate::windows::acl`]）。越门时探测返 `available:false` 走诚实降级：宽松档
+/// 披露真因、严格档确定性拒绝，**绝不**假装可用后让用户逐条命令去发现。
+#[cfg(target_os = "windows")]
+pub const WINDOWS_SPAWN_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+/// Landlock 不可用（内核太老 / LSM 未启用 / ruleset 创建被拒）。
+pub const PROBE_REASON_LANDLOCK_UNAVAILABLE: &str = "landlock-unavailable";
+/// seccomp-BPF 不可用。
+pub const PROBE_REASON_SECCOMP_UNAVAILABLE: &str = "seccomp-unavailable";
+/// Seatbelt 不可用。
+pub const PROBE_REASON_SEATBELT_UNAVAILABLE: &str = "seatbelt-unavailable";
+
+/// 探测 `sandbox-exec` 自沙箱后端的可用性。
+///
+/// # 铁律：探测**不得**有副作用
+///
+/// 探测跑在**宿主自己的进程**里（`crabcode sandbox-probe`）。施加沙箱是
+/// **不可逆**的——`landlock_restrict_self` / `seccomp load` / `sandbox_init`
+/// 一旦调用就没有退路。所以这里只做「能不能创建」级别的动作：Landlock 创建一个
+/// ruleset fd 随即丢弃（不 `restrict_self`），seccomp 只读 `/proc` 探测，
+/// Seatbelt 只看实现存在性。
+///
+/// 探测通过 ≠ 运行期一定成功：真失败由 125 协议在**那一条命令**上诚实上报，
+/// 并把会话翻成降级。探测的职责是挡住「这台机器根本没有这个能力」，不是预演。
+#[must_use]
+#[allow(clippy::needless_return)]
+pub fn probe_exec_backend() -> ExecBackendProbe {
+    #[cfg(target_os = "linux")]
+    {
+        return probe_exec_backend_linux();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let caps = MacosCapabilities::detect();
+        return if caps.select_backend().is_some() {
+            ExecBackendProbe {
+                available: true,
+                reason: None,
+            }
+        } else {
+            ExecBackendProbe {
+                available: false,
+                reason: Some(PROBE_REASON_SEATBELT_UNAVAILABLE),
+            }
+        };
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return probe_exec_backend_windows();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        return ExecBackendProbe {
+            available: false,
+            reason: Some(PROBE_REASON_PLATFORM_UNSUPPORTED),
+        };
+    }
+}
+
+/// Windows 探测 = **真跑一次**沙箱 spawn 并给它计时。
+///
+/// # 为什么不是静态能力查询
+///
+/// 这条链上历史事故全部出在"能不能"与"多快"两件事上，而两件事都查不出来：
+/// `CreateRestrictedToken` 曾在本机直接失败（0x539/0x579）、受限令牌下的
+/// `cmd.exe` 曾被 NT loader 拒绝（0xC0000022）、ACL 授权曾把每次 spawn 拖到
+/// 46 s。这三件没有一件能靠"Job Object 可用吗"这种能力位问出来。所以探测跑的
+/// 就是**发货那条路径**（[`crate::windows::exec::run_child`]，与 helper 逐字
+/// 同一个函数），而不是一个形状相似的替身 —— 测替身等于没测。
+///
+/// 三重克制让"真跑"是安全的：workspace 是一个刚建的空临时目录（不碰用户的树，
+/// 也就不会付 `O(对象数)`）、子进程 stdio 全指向 `NUL`（探测的 stdout 必须逐字
+/// 只有一行 JSON）、并且带 5 s 硬超时（会挂死的探测比没有探测更糟）。
+#[cfg(target_os = "windows")]
+fn probe_exec_backend_windows() -> ExecBackendProbe {
+    use crate::config::SecurityLevel;
+    use crate::windows::exec::{ChildSpec, ChildStdio, run_child};
+
+    let caps = WindowsCapabilities::detect();
+    if caps.select_backend().is_none() {
+        return ExecBackendProbe {
+            available: false,
+            reason: Some(PROBE_REASON_WINDOWS_SPAWN_FAILED),
+        };
+    }
+
+    let Some(workspace) = probe_scratch_dir() else {
+        return ExecBackendProbe {
+            available: false,
+            reason: Some(PROBE_REASON_WINDOWS_SPAWN_FAILED),
+        };
+    };
+
+    // `cmd.exe` 刻意不是随便选的：受限令牌下的 cmd.exe 正是 2026-05 那次
+    // ACCESS_DENIED 的受害者，拿它当探测负载 = 每次会话都在复验那个修复。
+    let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    let started = std::time::Instant::now();
+    let outcome = run_child(&ChildSpec {
+        workspace: &workspace,
+        security_level: SecurityLevel::L1Allowlist,
+        program: &comspec,
+        args: &["/C".to_string(), "exit 0".to_string()],
+        stdio: ChildStdio::Null,
+        timeout: Some(std::time::Duration::from_secs(5)),
+    });
+    let elapsed = started.elapsed();
+    let _ = std::fs::remove_dir_all(&workspace);
+
+    match outcome {
+        Ok(0) => {}
+        Ok(code) => {
+            debug!(
+                exit_code = code,
+                "windows sandbox probe child exited non-zero"
+            );
+            return ExecBackendProbe {
+                available: false,
+                reason: Some(PROBE_REASON_WINDOWS_SPAWN_FAILED),
+            };
+        }
+        Err(e) => {
+            debug!(error = %e, "windows sandbox probe spawn failed");
+            return ExecBackendProbe {
+                available: false,
+                reason: Some(PROBE_REASON_WINDOWS_SPAWN_FAILED),
+            };
+        }
+    }
+
+    if elapsed > WINDOWS_SPAWN_BUDGET {
+        warn!(
+            elapsed_ms = elapsed.as_millis(),
+            budget_ms = WINDOWS_SPAWN_BUDGET.as_millis(),
+            "windows sandbox spawn is over budget — reporting the backend as unavailable"
+        );
+        return ExecBackendProbe {
+            available: false,
+            reason: Some(PROBE_REASON_WINDOWS_TOO_SLOW),
+        };
+    }
+
+    debug!(
+        elapsed_ms = elapsed.as_millis(),
+        "windows sandbox probe passed"
+    );
+    ExecBackendProbe {
+        available: true,
+        reason: None,
+    }
+}
+
+/// A fresh, empty directory for the probe to use as a workspace.
+///
+/// Empty is the requirement, not a convenience: the probe must measure this
+/// machine's fixed spawn cost, and a directory with a tree under it would fold
+/// that tree's size into the number (see [`crate::windows::acl`]).
+#[cfg(target_os = "windows")]
+fn probe_scratch_dir() -> Option<std::path::PathBuf> {
+    let unique = format!(
+        "crabcode-sandbox-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    let dir = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_exec_backend_linux() -> ExecBackendProbe {
+    use landlock::{Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+
+    let caps = LinuxCapabilities::detect();
+    if !caps.has_seccomp {
+        return ExecBackendProbe {
+            available: false,
+            reason: Some(PROBE_REASON_SECCOMP_UNAVAILABLE),
+        };
+    }
+
+    // 真探测：向内核要一个 ruleset。`/sys/kernel/security/lsm` 里列着 landlock
+    // **不等于**它能用（容器 / 老 ABI / seccomp 已经拦了这个 syscall 都会让
+    // 创建失败）。按名字猜是 SoT §3 #26 点名禁止的做法。
+    //
+    // 只 create、**绝不** restrict_self —— 后者不可逆，会把探测进程自己关进
+    // 沙箱，而这个进程接下来还要打印 JSON 并正常退出。
+    let created = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(crate::linux::landlock::REQUIRED_FS_ABI))
+        .and_then(Ruleset::create);
+    match created {
+        Ok(ruleset) => {
+            drop(ruleset); // fd 随即关闭；进程状态零改动。
+            ExecBackendProbe {
+                available: true,
+                reason: None,
+            }
+        }
+        Err(e) => {
+            debug!(error = %e, "landlock ruleset creation failed during probe");
+            ExecBackendProbe {
+                available: false,
+                reason: Some(PROBE_REASON_LANDLOCK_UNAVAILABLE),
+            }
+        }
+    }
+}
+
+// ── Plan-level self-sandbox（W-SANDBOX-ENFORCED-DEADCODE PR-2）─────────────
+
+/// 一次计划施加的结果。
+///
+/// `notices` 是**结构性事实**：这条规则在这个平台上兑现不了、这条 allow 指向
+/// 一个还不存在的路径、这条模式串翻译不出来。它们对同一个会话里的每条命令
+/// 都一样，所以**默认不进命令的 stderr**（那会把同样几行注入模型每一次的工具
+/// 结果里）——`CRABCODE_SANDBOX_EXEC_VERBOSE=1` 时才打印。
+///
+/// 「不打印」不等于「被吞掉」：它们在这里被逐条计算、命名、并原样返回给调用方。
+/// 面向用户的常规披露走的是**保真度报告**那条链（TS 侧 `fidelity` → 降级层
+/// 与 auto-allow 宽免），不是这里。
+pub struct ExecPlanReport {
+    /// 施加过程中的异常（罕见、值得当场喊）。
+    pub warnings: Vec<String>,
+    /// 结构性事实（恒定、按需查看）。
+    pub notices: Vec<String>,
+}
+
+/// 打印 `notices` 的开关。见 [`ExecPlanReport`]。
+pub const SANDBOX_EXEC_VERBOSE_ENV: &str = "CRABCODE_SANDBOX_EXEC_VERBOSE";
+
+// ── 出口锁的运行期实证（W-SANDBOX-ENFORCED-DEADCODE PR-8）─────────────────
+//
+// cfg 用的是 `linux`/`macos` 的并集而不是 `unix`：`libc` 在本 crate 的
+// `Cargo.toml` 里只对这两个 target 声明，写成 `cfg(unix)` 会让别的 Unix
+// （FreeBSD 等，当前走 `PlatformNotSupported` 分支）编不过。两者对本立项要过的
+// 三个 target 完全等价。
+
+/// 非阻塞 connect 探针。**当且仅当** `connect()` 被内核沙箱**同步拒绝**
+/// （errno `EPERM` 或 `EACCES`）时返回 `true`。
+///
+/// 其它每一种结果 —— `EINPROGRESS`、立刻成功、`ECONNREFUSED`、任何别的 errno、
+/// 以及 `socket()` 本身失败 —— 一律返回 `false`。**构造上 fail-closed**：只有
+/// 一次明确的权限拒绝才算「挡住了」。别的失败原因（fd 耗尽、路由不可达、
+/// 端口没人听）看起来也像「连不上」，但它们证明不了沙箱在生效，把它们算作
+/// 证据就等于允许一个没锁上的沙箱冒充锁上了。
+///
+/// 非阻塞是必须的而不是优化：探针打的是一个不可路由的地址，阻塞 connect 会在
+/// 内核 TCP 重传超时里挂上一两分钟。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn connect_syscall_denied(addr: [u8; 4], port: u16) -> bool {
+    // SAFETY: socket(2) 参数全是常量，不涉及任何内存生命周期。
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        // socket() 失败**不是**「被挡住」的证据（EMFILE 也长这样）。
+        return false;
+    }
+
+    // 转非阻塞。`SOCK_NONBLOCK` 是 Linux 扩展，Darwin 没有，所以走两侧都有的
+    // fcntl。拿不到 flags 就不设：探针会退化成阻塞式，慢，但结论不会变错。
+    // SAFETY: fcntl(2) 对本进程自己的 fd 操作，无内存要求。
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    sa.sin_family = libc::AF_INET as libc::sa_family_t;
+    sa.sin_port = port.to_be();
+    // `from_ne_bytes` 让 u32 的内存布局逐字节等于 `addr`，也就是网络字节序
+    // ——`s_addr` 要的正是这个。
+    sa.sin_addr = libc::in_addr {
+        s_addr: u32::from_ne_bytes(addr),
+    };
+
+    // SAFETY: `sa` 是本栈帧上一个已完整初始化的 sockaddr_in，长度如实传入；
+    // connect(2) 只在调用期间读它。
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            std::ptr::addr_of!(sa).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    let errno = if rc == 0 {
+        None
+    } else {
+        std::io::Error::last_os_error().raw_os_error()
+    };
+
+    // 无条件关闭：探针跑在自沙箱之后、`exec` 之前，漏一个 fd 就是把一个半开
+    // 套接字送进用户的命令。
+    // SAFETY: `fd` 是上面刚拿到的、本函数独占的有效 fd。
+    unsafe {
+        libc::close(fd);
+    }
+
+    matches!(errno, Some(libc::EPERM) | Some(libc::EACCES))
+}
+
+/// 出口锁施加完之后**证明**它生效了——证不出来就 `Err`，helper 按 125 协议失败。
+///
+/// 一条命令绝不能在「以为自己被过滤了」的状态下跑起来：那比没有沙箱更糟，因为
+/// 上层会据此放宽审批（`isSandboxAutoAllowActive`）。
+///
+///   (a) 外部 TCP（`192.0.2.1:80`，RFC 5737 TEST-NET-1，永不可路由）**必须**被拒；
+///   (b) 代理端口（`127.0.0.1:<proxy_port>`）**必须不**被拒，否则锁得太死、
+///       流量根本到不了代理，过滤同样不会发生。
+///
+/// # 两种已知的误报形态（都朝失败关闭那边倒，但文案会指错方向）
+///
+/// 1. **`policy == None` + 非零代理端口**：Linux 侧 `socket()` 直接 EPERM，
+///    探针按契约返回 `false`，于是本函数报 (a) 失败。那是一份自相矛盾的配置
+///    （既要求「完全无网络」又要求「走代理」），失败关闭是正确方向，但错误
+///    文案会指向内核而不是配置。TS 侧不产生这种组合。
+/// 2. **`proxy_port == 80`（仅 Linux）**：Landlock 的网络规则是端口模型、没有
+///    地址维度，所以放行「代理端口」就等于放行**任意主机**的该端口 —— 探针 (a)
+///    打的正好是 `:80`，于是它会被放行、判定「没锁上」、整条命令失败。macOS
+///    不受影响（SBPL 锁的是 `localhost:<port>`，带地址）。实践中够不着：代理
+///    监听的是内核分配的高位回环端口，且 Unix 上绑 80 要 root。真撞上时改的是
+///    探针端口，不是放宽判据。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_egress_locked_to_proxy(proxy_port: u16) -> Result<(), SandboxError> {
+    if !connect_syscall_denied([192, 0, 2, 1], 80) {
+        return Err(SandboxError::InvalidConfig {
+            message: "network egress canary failed: external TCP was NOT blocked after applying \
+                      the proxy egress lock — the kernel did not enforce it (kernel too old for \
+                      Landlock network / SBPL host-token mismatch). Refusing to run unfiltered."
+                .into(),
+        });
+    }
+    if connect_syscall_denied([127, 0, 0, 1], proxy_port) {
+        return Err(SandboxError::InvalidConfig {
+            message: "network egress canary failed: the filtering proxy port is itself blocked — \
+                      the egress lock is too strict and traffic cannot reach the proxy."
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+/// 按执行计划自沙箱当前进程（`crabcode sandbox-exec` 的 Unix 路径）。
+///
+/// 与 [`apply_sandbox_to_self`] 的差别就是本立项存在的理由：那个只吃
+/// [`SandboxConfig`]，而 `SandboxConfig` 表达不了 fs 四表 —— 事故里丢掉的正是
+/// 那批规则（SoT §1.5「配置保真度缺口」）。
+///
+/// 施加**不可逆**，且被 `exec` 出来的进程继承——这正是 helper 需要的语义。
+///
+/// # Errors
+///
+/// 施加失败即错误：调用方（helper）必须按 125 协议失败，**绝不**降级裸跑。
+#[allow(clippy::needless_return)]
+pub fn apply_exec_plan_to_self(
+    plan: &crate::exec_config::SandboxExecPlan,
+) -> Result<ExecPlanReport, SandboxError> {
+    let (resolved, notices) = resolve_plan_and_notices(plan)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        return apply_plan_to_self_macos(plan, &resolved, notices);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return apply_plan_to_self_linux(plan, &resolved, notices);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (&resolved, notices);
+        Err(SandboxError::PlatformNotSupported {
+            platform: std::env::consts::OS.into(),
+            reason: "self-sandboxing is not how this platform runs a plan — \
+                     Windows relays through `run_exec_plan_as_child`"
+                .into(),
+        })
+    }
+}
+
+/// Everything both plan entry points must do before they diverge: validate the
+/// workspace, resolve the fs tables against cwd/home, and name every rule that
+/// will not be honoured.
+///
+/// Shared on purpose. These notices are the only per-command forensic trail
+/// this link has — the config file is deleted the moment it is read, and on Unix
+/// the process becomes the user's command a few lines later — so "the Windows
+/// arm forgot to compute them" would be an invisible loss, not a visible bug.
+fn resolve_plan_and_notices(
+    plan: &crate::exec_config::SandboxExecPlan,
+) -> Result<(crate::exec_rules::ResolvedFsRules, Vec<String>), SandboxError> {
+    validate_workspace(&plan.base.workspace)?;
+
+    let resolved = crate::exec_rules::resolve_fs_rules(
+        &plan.filesystem,
+        &plan.base.workspace,
+        crate::exec_rules::home_dir_from_env().as_deref(),
+    );
+
+    let mut notices: Vec<String> = Vec::new();
+    for rule in &resolved.unresolvable {
+        // 翻译不出来的规则**不会**被近似成一个更宽（allow）或更窄（deny）的
+        // 范围——近似正是本立项要消灭的「假隔离」。allow 翻译失败只会让
+        // 沙箱更严，保留可取证 notice；deny 翻译失败会直接拆掉用户要求的防线，
+        // 所有平台都必须在 exec 前 fail closed（CLI 映射为 125）。
+        let message = format!(
+            "{} `{}` cannot be applied: {}",
+            rule.kind.wire_name(),
+            rule.source,
+            rule.why
+        );
+        if matches!(
+            rule.kind,
+            crate::exec_rules::FsRuleKind::DenyRead | crate::exec_rules::FsRuleKind::DenyWrite
+        ) {
+            return Err(SandboxError::InvalidConfig {
+                message: format!("refusing to run with an unenforceable deny rule; {message}"),
+            });
+        }
+        notices.push(format!("{message}; access remains denied by default"));
+    }
+
+    // TS 侧已经知道这几条兑现不了（保真度报告是它算的），但 helper 是这条链上
+    // **唯一**能被事后单独取证的环节：配置文件读完就删了，进程也马上变成别的
+    // 命令。把它原样念一遍，取证时才有东西可读。
+    if !plan.fidelity.unenforced.is_empty() {
+        notices.push(format!(
+            "the config was already marked partial by the policy layer; \
+             unenforceable by declaration: {}",
+            plan.fidelity.unenforced.join(", ")
+        ));
+    }
+
+    // `weaker.networkIsolation` 自 PR-8 起在 macOS 上**真的生效**了（Seatbelt
+    // 放行 trustd，见 `seatbelt::generate_profile_for_plan`）。它在 schema 上就是
+    // macOS-only，所以别的平台上它依旧是个 carried-but-unused 的开关——而
+    // **carried-but-unused 必须出声**：一个被读进来、校验过、然后谁也没用的安全
+    // 开关，正是 E1「可选安全字段链式失活」的形状。这次方向是「更弱」，不生效
+    // 是安全的，但用户仍然有权知道他打开的开关在这台机器上没有任何效果。
+    #[cfg(not(target_os = "macos"))]
+    if plan.weaker.network_isolation {
+        notices.push(
+            "weaker.networkIsolation has no effect on this platform — it relaxes macOS \
+             Seatbelt's Mach service filter (TLS trust evaluation) and has no counterpart \
+             here; the sandbox is STRICTER than this flag asks for"
+                .to_string(),
+        );
+    }
+
+    Ok((resolved, notices))
+}
+
+/// macOS：SBPL profile（含 fs 四表）→ 施加 → **逐条实测 deny**。
+#[cfg(target_os = "macos")]
+fn apply_plan_to_self_macos(
+    plan: &crate::exec_config::SandboxExecPlan,
+    resolved: &crate::exec_rules::ResolvedFsRules,
+    mut notices: Vec<String>,
+) -> Result<ExecPlanReport, SandboxError> {
+    use crate::macos::{ffi, seatbelt};
+
+    let profile = seatbelt::generate_profile_for_plan(plan, resolved)?;
+    let params_refs: Vec<(&str, &str)> = profile
+        .params
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let sandbox_args = ffi::SandboxArgs::new(&profile.sbpl, &params_refs)?;
+    sandbox_args.apply().map_err(|e| SandboxError::Seatbelt {
+        message: format!("self-sandbox failed: {e}"),
+    })?;
+
+    // ── deny 段的运行期实证 ────────────────────────────────────────────────
+    //
+    // SBPL 里 deny 压过 allow 靠的是「后写的规则赢」，而这条优先级假设本身没有
+    // 编译期证据。所以施加完就当场问 kernel：这些路径现在真的写不了 / 读不了吗？
+    // 证不出来 ⇒ 整条命令失败。放一个「以为挡住了」的沙箱出去，比没有沙箱更糟。
+    //
+    // 落在任何 allow 之外的 deny 由 `(deny default)` 天然兑现，同样会通过本检查
+    // ——所以这里不需要先算重叠，全量实测既更简单也更严。
+    for (rules, op, table) in [
+        (
+            &resolved.deny_write,
+            ffi::OP_FILE_WRITE_DATA,
+            "filesystem.denyWrite",
+        ),
+        (
+            &resolved.deny_read,
+            ffi::OP_FILE_READ_DATA,
+            "filesystem.denyRead",
+        ),
+    ] {
+        for rule in rules {
+            let path = seatbelt::canonicalize_best_effort(&rule.path);
+            let path_str = path.to_string_lossy();
+            let denied = ffi::seatbelt_operation_denied(op, &path_str)?;
+            if !denied {
+                return Err(SandboxError::InvalidConfig {
+                    message: format!(
+                        "sandbox canary failed: {table} `{}` is still permitted after applying the \
+                         profile — the deny rule did not take effect (resolved to `{path_str}`)",
+                        rule.source
+                    ),
+                });
+            }
+        }
+    }
+
+    if !plan.network.allow_unix_sockets.is_empty() && !plan.network.allow_all_unix_sockets {
+        notices.push(
+            "network.allowUnixSockets is enforced as an all-or-nothing switch on macOS: \
+             Seatbelt filters unix sockets by rule, not by the paths listed here"
+                .to_string(),
+        );
+    }
+
+    // ── 出口锁的运行期实证（PR-8）─────────────────────────────────────────
+    //
+    // 必须在**全部**限制都施加完之后（sandbox_init + 上面的 deny 实测）才问，
+    // 否则问到的是一个还没锁上的进程。`?` 直通既有的 125 路径。
+    if plan.network.http_proxy_port > 0 {
+        verify_egress_locked_to_proxy(plan.network.http_proxy_port)?;
+        notices.push(format!(
+            "egress lock verified against proxy port {}: external TCP is denied by the kernel \
+             and the proxy is reachable",
+            plan.network.http_proxy_port
+        ));
+    }
+
+    info!(
+        security_level = ?plan.base.security_level,
+        workspace = %plan.base.workspace.display(),
+        deny_rules = resolved.deny_read.len() + resolved.deny_write.len(),
+        proxy_port = plan.network.http_proxy_port,
+        "seatbelt exec-plan self-sandbox applied (irreversible, deny rules verified)"
+    );
+
+    Ok(ExecPlanReport {
+        warnings: Vec::new(),
+        notices,
+    })
+}
+
+/// Linux：NoNewPrivs → Landlock（含 fs allow 四表）→ Seccomp（含放宽）。
+///
+/// 顺序与 [`apply_to_self_linux`] 相同且不可换：NoNewPrivs 必须最先（否则
+/// non-root 加载 seccomp filter 会 EPERM），Seccomp 必须最后（它一生效就改不动
+/// Landlock 了）。
+#[cfg(target_os = "linux")]
+fn apply_plan_to_self_linux(
+    plan: &crate::exec_config::SandboxExecPlan,
+    resolved: &crate::exec_rules::ResolvedFsRules,
+    mut notices: Vec<String>,
+) -> Result<ExecPlanReport, SandboxError> {
+    use crate::linux::{landlock, seccomp};
+
+    // SAFETY: prctl 是 pure syscall，无内存生命周期要求。
+    let prctl_rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1_i32, 0_i32, 0_i32, 0_i32) };
+    if prctl_rc != 0 {
+        let errno = std::io::Error::last_os_error();
+        return Err(SandboxError::InvalidConfig {
+            message: format!("prctl(PR_SET_NO_NEW_PRIVS): {errno}"),
+        });
+    }
+
+    let extra: Vec<landlock::ExtraGrant> = resolved
+        .allow_read
+        .iter()
+        .map(|r| landlock::ExtraGrant {
+            path: r.path.clone(),
+            write: false,
+            source: r.source.clone(),
+        })
+        .chain(resolved.allow_write.iter().map(|r| landlock::ExtraGrant {
+            path: r.path.clone(),
+            write: true,
+            source: r.source.clone(),
+        }))
+        .collect();
+
+    // 出口锁（PR-8）：非零代理端口 ⇒ ruleset 额外管辖 connect(2)-TCP，并且只
+    // 放行这一个端口。`0` ⇒ `None` ⇒ 完全不声明网络管辖，行为逐字不变。
+    let connect_tcp_port = if plan.network.http_proxy_port > 0 {
+        Some(plan.network.http_proxy_port)
+    } else {
+        None
+    };
+
+    let outcome = landlock::apply_landlock_rules_with_grants(&plan.base, &extra, connect_tcp_port)?;
+
+    // ── UNENFORCEABLE(linux)：deny 表在已放行的子树里挖不了洞 ──────────────
+    //
+    // 证据与替代方案的否决理由见 `landlock::apply_landlock_rules_with_grants`
+    // 的文档（Landlock 是纯 allow-grant 模型；空权限集会被内核拒绝）。
+    // 与 allow **不重叠**的 deny 由 Landlock 的默认拒绝天然兑现，不报；重叠的
+    // 兑现不了，逐条留下名字。
+    for (rules, table) in [
+        (&resolved.deny_write, "filesystem.denyWrite"),
+        (&resolved.deny_read, "filesystem.denyRead"),
+    ] {
+        for rule in rules {
+            if let Some(grant) =
+                crate::exec_rules::shadowing_grant(&rule.path, &outcome.granted_roots)
+            {
+                notices.push(format!(
+                    "UNENFORCEABLE(linux): {table} `{}` overlaps the granted subtree `{}` — \
+                     Landlock is a pure allow-grant model and cannot carve a hole inside a \
+                     granted hierarchy",
+                    rule.source,
+                    grant.display()
+                ));
+            }
+        }
+    }
+
+    if !plan.network.allow_unix_sockets.is_empty() && !plan.network.allow_all_unix_sockets {
+        // 方向是「比承诺更严」（全拦），不是安全缺口 —— 但仍要留下名字，
+        // 否则用户只会看到一个没有解释的 EPERM。
+        notices.push(
+            "network.allowUnixSockets is enforced as an all-or-nothing switch on Linux: \
+             seccomp filters `socket(AF_UNIX)` by domain and cannot read the socket path, \
+             so every unix socket is blocked"
+                .to_string(),
+        );
+    }
+
+    seccomp::apply_seccomp_filter_with_relaxations(
+        &plan.base,
+        seccomp::SeccompRelaxations {
+            nested_sandbox: plan.weaker.nested_sandbox,
+            all_unix_sockets: plan.network.allow_all_unix_sockets,
+        },
+    )?;
+
+    // ── 出口锁的运行期实证（PR-8）─────────────────────────────────────────
+    //
+    // 必须在 seccomp 之后：探针要走的 `socket()`/`connect()`/`close()` 全都得
+    // 在最终那套 filter 下也能跑，早问一步问到的就不是最终状态。老内核
+    // （ABI < V4）上 landlock 的 best-effort 会静默丢掉网络那一档 —— 这里就是
+    // 那个「静默」被抓住的地方。`?` 直通既有的 125 路径。
+    if plan.network.http_proxy_port > 0 {
+        verify_egress_locked_to_proxy(plan.network.http_proxy_port)?;
+        notices.push(format!(
+            "egress lock verified against proxy port {}: external TCP is denied by the kernel \
+             and the proxy is reachable",
+            plan.network.http_proxy_port
+        ));
+    }
+
+    info!(
+        security_level = ?plan.base.security_level,
+        workspace = %plan.base.workspace.display(),
+        granted = outcome.granted_roots.len(),
+        proxy_port = plan.network.http_proxy_port,
+        "linux exec-plan self-sandbox applied (NoNewPrivs + Landlock + Seccomp, irreversible)"
+    );
+
+    Ok(ExecPlanReport {
+        warnings: outcome.warnings,
+        notices,
+    })
+}
+
+// ── Plan-level child execution (Windows, W-SANDBOX-ENFORCED-DEADCODE PR-3)──
+
+/// Result of relaying one command through the Windows sandbox.
+#[cfg(target_os = "windows")]
+pub struct ExecPlanChildOutcome {
+    /// The child's exit code, verbatim.
+    pub exit_code: i32,
+    pub report: ExecPlanReport,
+}
+
+/// Run a plan's command as a sandboxed **child** and wait for it.
+///
+/// The Windows counterpart of [`apply_exec_plan_to_self`], and a different shape
+/// on purpose: Windows cannot restrict a process after it has started, so there
+/// is no "apply to self" to perform. The helper stays alive as a relay instead
+/// (see [`crate::windows::exec`] for why that is invisible to the host).
+///
+/// # Single-threaded only
+///
+/// This mutates the process environment (`TMP`/`TEMP`) so the child inherits the
+/// sandbox's temp directory, which is only sound while no other thread is
+/// running. Its one caller is `crabcode sandbox-exec`, a helper process that has
+/// started no threads by this point. **Do not call it from a server or a
+/// runtime.**
+///
+/// # Errors
+///
+/// Returns [`SandboxError`] if the plan is invalid or any isolation step fails.
+/// The caller must translate that into the 125 protocol — never into a silent
+/// unsandboxed re-run.
+#[cfg(target_os = "windows")]
+pub fn run_exec_plan_as_child(
+    plan: &crate::exec_config::SandboxExecPlan,
+) -> Result<ExecPlanChildOutcome, SandboxError> {
+    use crate::windows::exec::{ChildSpec, ChildStdio, run_child};
+
+    let (resolved, mut notices) = resolve_plan_and_notices(plan)?;
+
+    // ── UNENFORCEABLE(windows): the filesystem tables ────────────────────
+    //
+    // This backend isolates by token and job object. It has no path filter —
+    // there is no Landlock/Seatbelt equivalent wired here — so every fs rule is
+    // carried, validated, and then *not applied*. Saying so is the whole point:
+    // an allow list that is silently ignored reads as "the sandbox confines the
+    // command to these paths" while the command can still reach everything.
+    //
+    // Deny rules get named individually (they are the explicit "must not touch"
+    // list, and forensics needs the names); the allow tables are summarised by
+    // count because their failure mode is structural, not per-entry.
+    let allow_rules = resolved.allow_read.len() + resolved.allow_write.len();
+    if allow_rules > 0 {
+        notices.push(format!(
+            "UNENFORCEABLE(windows): filesystem.allowRead/allowWrite ({allow_rules} rules) \
+             are not applied — this backend restricts the token and the job object, not \
+             filesystem paths, so nothing narrows the command to these locations"
+        ));
+    }
+    for (rules, table) in [
+        (&resolved.deny_write, "filesystem.denyWrite"),
+        (&resolved.deny_read, "filesystem.denyRead"),
+    ] {
+        for rule in rules {
+            notices.push(format!(
+                "UNENFORCEABLE(windows): {table} `{}` is not applied — this backend has no \
+                 path-level filter",
+                rule.source
+            ));
+        }
+    }
+
+    // Network: same story. `base.network_policy` reaches the Windows runner but
+    // nothing there acts on it, and the domain-level enforcement everyone
+    // actually wants needs the filtering proxy (PR-8).
+    notices.push(format!(
+        "UNENFORCEABLE(windows): network policy `{:?}` is not applied — the Windows backend \
+         has no network filter; domain-level enforcement arrives with the filtering proxy",
+        plan.network.policy
+    ));
+
+    // TMPDIR's Windows spelling. The Unix lane sets TMPDIR because the sandbox
+    // rules read it; here nothing reads it, but the temp directory the policy
+    // layer picked (and put in allowWrite) should still be the one the command
+    // uses, or the two lanes quietly disagree about where scratch files live.
+    // SAFETY: single-threaded — the helper has started no threads at this point.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("TMP", &plan.tmp_dir);
+        std::env::set_var("TEMP", &plan.tmp_dir);
+    }
+
+    let exit_code = run_child(&ChildSpec {
+        workspace: &plan.base.workspace,
+        security_level: plan.base.security_level,
+        program: &plan.base.command,
+        args: &plan.base.args,
+        stdio: ChildStdio::Inherit,
+        // No ceiling here: the host owns the command's lifetime (see `ChildSpec`).
+        timeout: None,
+    })?;
+
+    info!(
+        security_level = ?plan.base.security_level,
+        workspace = %plan.base.workspace.display(),
+        exit_code,
+        "windows exec-plan child completed (restricted token + job object)"
+    );
+
+    Ok(ExecPlanChildOutcome {
+        exit_code,
+        report: ExecPlanReport {
+            warnings: Vec::new(),
+            notices,
+        },
+    })
+}
+
 /// Canary 检测：验证当前进程是否真的受到沙箱/资源控制约束。
 ///
 /// ROOT-CAUSE FIX 背景：之前 Worker 完全信 `OA_SANDBOX_APPLIED=1` 环境变量
@@ -796,5 +1604,114 @@ fn select_auto_runner(config: &SandboxConfig) -> Result<Box<dyn SandboxRunner>, 
                 }),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod exec_plan_validation_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::config::{NetworkPolicy, ResourceLimits, SecurityLevel};
+    use crate::exec_config::{
+        FidelityLevel, FidelityReport, FsRules, NetworkRules, SandboxExecPlan, WeakerFlags,
+    };
+
+    fn plan(workspace: &std::path::Path, filesystem: FsRules) -> SandboxExecPlan {
+        SandboxExecPlan {
+            base: SandboxConfig {
+                security_level: SecurityLevel::L0Deny,
+                command: "true".into(),
+                args: Vec::new(),
+                workspace: workspace.to_path_buf(),
+                mounts: Vec::new(),
+                resource_limits: ResourceLimits::default(),
+                network_policy: Some(NetworkPolicy::None),
+                env_vars: HashMap::new(),
+                format: Default::default(),
+                backend: Default::default(),
+            },
+            filesystem,
+            network: NetworkRules {
+                policy: NetworkPolicy::None,
+                allowed_domains: Vec::new(),
+                denied_domains: Vec::new(),
+                allow_unix_sockets: Vec::new(),
+                allow_all_unix_sockets: false,
+                allow_local_binding: false,
+                http_proxy_port: 0,
+                socks_proxy_port: 0,
+            },
+            weaker: WeakerFlags {
+                nested_sandbox: false,
+                network_isolation: false,
+            },
+            tmp_dir: workspace.to_path_buf(),
+            fidelity: FidelityReport {
+                level: FidelityLevel::Full,
+                unenforced: Vec::new(),
+            },
+        }
+    }
+
+    fn empty_fs_rules() -> FsRules {
+        FsRules {
+            allow_read: Vec::new(),
+            allow_write: Vec::new(),
+            deny_read: Vec::new(),
+            deny_write: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unresolvable_deny_rules_fail_closed_before_platform_dispatch() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+
+        for deny_read in [true, false] {
+            let mut filesystem = empty_fs_rules();
+            if deny_read {
+                filesystem.deny_read.push("/secret/*.pem".into());
+            } else {
+                filesystem.deny_write.push("/secret/*.pem".into());
+            }
+
+            let error = resolve_plan_and_notices(&plan(workspace.path(), filesystem))
+                .expect_err("an unresolvable deny must refuse execution");
+            let rendered = error.to_string();
+            assert!(rendered.contains("refusing to run"));
+            assert!(rendered.contains(if deny_read {
+                "filesystem.denyRead"
+            } else {
+                "filesystem.denyWrite"
+            }));
+        }
+    }
+
+    #[test]
+    fn unresolvable_allow_rules_remain_visible_and_security_stricter() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let mut filesystem = empty_fs_rules();
+        filesystem.allow_read.push("/optional/*.pem".into());
+        filesystem.allow_write.push("/optional/*.tmp".into());
+
+        let (resolved, notices) = resolve_plan_and_notices(&plan(workspace.path(), filesystem))
+            .expect("an unresolvable allow may continue with narrower access");
+        assert!(resolved.allow_read.is_empty());
+        assert!(resolved.allow_write.is_empty());
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("filesystem.allowRead"))
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("filesystem.allowWrite"))
+        );
+        assert!(
+            notices
+                .iter()
+                .all(|notice| notice.contains("access remains denied by default"))
+        );
     }
 }

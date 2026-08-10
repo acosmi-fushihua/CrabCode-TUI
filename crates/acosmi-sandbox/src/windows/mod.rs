@@ -6,7 +6,7 @@
 //! |-------|-----------|-------------|
 //! | **Job Object** | Yes | Resource limits (memory, CPU, PIDs) + kill-on-close |
 //! | **Restricted Token** | Yes* | Stripped privileges, deny-only groups, Medium IL |
-//! | **NTFS ACL** | Yes* | Temporary workspace access grant, auto-revoked |
+//! | **NTFS ACL** | Only if needed* | Temporary workspace access grant, auto-revoked |
 //!
 //! *Only with `WindowsFull` backend. `WindowsJobOnly` uses Job Objects alone.
 //!
@@ -17,15 +17,31 @@
 //!        │
 //!        ├── 1. Create Job Object (resource limits + KILL_ON_JOB_CLOSE)
 //!        ├── 2. Create Restricted Token (strip privileges, Medium IL)
-//!        ├── 3. Grant workspace NTFS ACL access to restricted SID
+//!        ├── 3. AccessCheck: can the restricted token already use the
+//!        │      workspace?  yes ⇒ nothing to do (the normal case)
+//!        │      no  ⇒ grant a temporary NTFS ACE, revoked on drop
 //!        ├── 4. CreateProcessAsUserW with restricted token
 //!        ├── 5. AssignProcessToJobObject
 //!        ├── 6. ResumeThread (process starts suspended)
 //!        ├── 7. Timeout thread + WaitForSingleObject
 //!        │
 //!        ▼
-//!        Drop: AclGuard revokes ACL, JobGuard kills processes
+//!        Drop: AclGuard (if any) revokes ACL, JobGuard kills processes
 //! ```
+//!
+//! Step 3 is conditional since W-SANDBOX-ENFORCED-DEADCODE PR-3: writing a DACL
+//! onto a directory with inheritable ACEs re-propagates inheritance across the
+//! whole subtree, which measured **15.7 s + 14.6 s per spawn** on a 57k-object
+//! workspace here. See [`acl`] for the measurements and why skipping is provably
+//! behaviour-preserving.
+//!
+//! # Two entry points, on purpose
+//!
+//! [`WindowsRunner::run`] captures stdout/stderr into a [`SandboxOutput`] for
+//! callers that want a value back. The `sandbox-exec` helper needs the opposite
+//! — the child must write straight to the host's own handles — so it uses
+//! [`exec::run_child`] instead. They share the token / job / ACL machinery and
+//! differ only in what happens to the three standard streams.
 //!
 //! # Degradation chain
 //!
@@ -49,6 +65,7 @@
 
 pub mod acl;
 pub mod async_runner;
+pub mod exec;
 pub mod job;
 pub mod token;
 
@@ -124,9 +141,10 @@ impl SandboxRunner for WindowsRunner {
             None
         };
 
-        // ── 3. Grant workspace ACL access ────────────────────────────────
+        // ── 3. Ensure workspace ACL access ───────────────────────────────
         // The restricted token has stripped privileges and deny-only groups, so
-        // workspace ACL access is still granted explicitly and then revoked.
+        // workspace access is verified first and only granted (then revoked)
+        // when the token genuinely lacks it — see the module header and [`acl`].
         let _acl_guards: Vec<acl::AclGuard> = if use_restricted_token {
             let mut guards = Vec::new();
 
@@ -144,8 +162,9 @@ impl SandboxRunner for WindowsRunner {
                 .map_or(HANDLE::default(), token::RestrictedToken::handle);
             let user_sid = get_token_user_sid(token_handle)?;
 
-            guards.push(acl::grant_workspace_access(
+            guards.extend(acl::ensure_workspace_access(
                 &config.workspace,
+                token_handle,
                 user_sid.sid,
                 workspace_mode,
             )?);
@@ -153,8 +172,9 @@ impl SandboxRunner for WindowsRunner {
             // Additional mounts
             for mount in &config.mounts {
                 if mount.host_path.exists() {
-                    guards.push(acl::grant_workspace_access(
+                    guards.extend(acl::ensure_workspace_access(
                         &mount.host_path,
+                        token_handle,
                         user_sid.sid,
                         mount.mode,
                     )?);
@@ -523,13 +543,43 @@ fn build_command_line(command: &str, args: &[String]) -> String {
 
 /// Quote a single command-line argument for Windows.
 ///
-/// If the argument contains spaces, quotes, or is empty, wraps it in double quotes
-/// and escapes internal backslashes and quotes per Windows conventions.
+/// If the argument contains spaces, quotes, or is empty, wraps it in double
+/// quotes and escapes backslashes and quotes the way `CommandLineToArgvW`
+/// un-escapes them:
+///
+/// - a run of `n` backslashes **not** followed by `"` stays `n` backslashes;
+/// - a run of `n` backslashes followed by `"` becomes `2n+1` backslashes plus
+///   the quote (so the quote survives as data);
+/// - a run of `n` backslashes at the very end becomes `2n` (the closing quote
+///   follows it, and must not be escaped by it).
+///
+/// # This used to silently eat backslashes
+///
+/// The previous implementation counted a backslash run but only ever emitted it
+/// when a `"` or the end of the argument came next — so in the ordinary case
+/// (`\` followed by a normal character) the run was **dropped**. Every Windows
+/// path inside a quoted argument came out mangled:
+///
+/// ```text
+/// echo x > C:\Users\me\out.txt   →   echo x > C:Usersmeout.txt
+/// ```
+///
+/// which is a *valid relative path*, so the command happily succeeded, wrote to
+/// somewhere nobody was looking, and returned 0 with empty stdout and stderr.
+/// The only test that touched this asserted the exit code, so it stayed green
+/// for months. It surfaced on 2026-08-08 the moment
+/// `can_write_to_workspace_in_l1` started asserting that the file it asked for
+/// actually exists.
+///
+/// The lesson is in the test, not here: **asserting a success code is not
+/// asserting the effect.**
 fn quote_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "\"\"".into();
     }
 
+    // Backslashes are only special next to a quote, so an argument with neither
+    // whitespace nor quotes needs no escaping at all.
     if !arg.contains(' ') && !arg.contains('"') && !arg.contains('\t') {
         return arg.into();
     }
@@ -537,28 +587,31 @@ fn quote_arg(arg: &str) -> String {
     let mut quoted = String::with_capacity(arg.len() + 2);
     quoted.push('"');
 
-    let mut backslash_count = 0u32;
+    let mut backslashes = 0usize;
     for c in arg.chars() {
         match c {
-            '\\' => backslash_count += 1,
+            '\\' => backslashes += 1,
             '"' => {
-                // Double the backslashes before a quote
-                for _ in 0..backslash_count {
+                // The run now precedes a quote: double it, then escape the quote.
+                for _ in 0..backslashes * 2 + 1 {
                     quoted.push('\\');
                 }
-                backslash_count = 0;
-                quoted.push('\\');
+                backslashes = 0;
                 quoted.push('"');
             }
             _ => {
-                backslash_count = 0;
+                // Ordinary character: the run was literal — emit it verbatim.
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                }
+                backslashes = 0;
                 quoted.push(c);
             }
         }
     }
 
-    // Double backslashes at the end (before closing quote)
-    for _ in 0..backslash_count {
+    // The closing quote follows the trailing run, so double it.
+    for _ in 0..backslashes * 2 {
         quoted.push('\\');
     }
     quoted.push('"');
@@ -687,6 +740,43 @@ mod tests {
     #[test]
     fn test_quote_arg_with_quotes() {
         assert_eq!(quote_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn quoted_arguments_keep_their_backslashes() {
+        // The regression this file shipped for months: any Windows path inside a
+        // quoted argument lost every separator, turning an absolute path into a
+        // relative one that still "worked".
+        assert_eq!(
+            quote_arg(r"echo x > C:\Users\me\out.txt"),
+            "\"echo x > C:\\Users\\me\\out.txt\""
+        );
+        assert_eq!(
+            quote_arg(r"C:\Program Files\Git\bin\bash.exe"),
+            "\"C:\\Program Files\\Git\\bin\\bash.exe\""
+        );
+    }
+
+    #[test]
+    fn backslashes_are_only_doubled_where_a_quote_follows() {
+        // `CommandLineToArgvW`'s three cases, one assertion each.
+        // 1. run followed by an ordinary char → literal.
+        assert_eq!(quote_arg(r"a\b c"), "\"a\\b c\"");
+        // 2. run followed by a quote → 2n+1 backslashes, then the quote.
+        assert_eq!(quote_arg("a b\\\"c"), "\"a b\\\\\\\"c\"");
+        // 3. run at the end → 2n, because the closing quote comes next and must
+        //    not be escaped by it.
+        assert_eq!(quote_arg(r"a b\"), "\"a b\\\\\"");
+        assert_eq!(quote_arg(r"a b\\"), "\"a b\\\\\\\\\"");
+    }
+
+    #[test]
+    fn unquoted_arguments_are_passed_through_untouched() {
+        // No whitespace and no quote ⇒ backslashes are not special ⇒ no escaping.
+        assert_eq!(
+            quote_arg(r"C:\Windows\system32\cmd.exe"),
+            r"C:\Windows\system32\cmd.exe"
+        );
     }
 
     #[test]

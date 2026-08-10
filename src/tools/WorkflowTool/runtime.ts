@@ -6,7 +6,7 @@ import {
   BackgroundSlotCancelledError,
   getBackgroundAgentScheduler,
 } from '../../services/agents/BackgroundAgentScheduler.js'
-import type { ToolPermissionContext, ToolUseContext } from '../../Tool.js'
+import type { Tools, ToolPermissionContext, ToolUseContext } from '../../Tool.js'
 import type { Message } from '../../types/message.js'
 import { createChildAbortController } from '../../utils/abortController.js'
 import { getQuerySourceForAgent } from '../../utils/promptCategory.js'
@@ -22,6 +22,7 @@ import {
 import { getTokenCountFromUsage } from '../../utils/tokens.js'
 import {
   countToolUses,
+  resolveAgentTools,
 } from '../AgentTool/agentToolUtils.js'
 import { AGENT_TOOL_NAME } from '../AgentTool/constants.js'
 import {
@@ -34,7 +35,9 @@ import {
   SYNTHETIC_OUTPUT_TOOL_NAME,
 } from '../SyntheticOutputTool/SyntheticOutputTool.js'
 import {
+  parseWorkflowAgentIdleTimeoutMs,
   WORKFLOW_AGENT_DRAIN_TIMEOUT_MS,
+  WORKFLOW_DRAIN_GRACE_MS,
   WORKFLOW_HEARTBEAT_TIMEOUT_MS,
   WORKFLOW_MAX_AGENT_PROMPT_BYTES,
   WORKFLOW_MAX_AGENT_CALLS,
@@ -190,6 +193,89 @@ export class WorkflowBudgetExceededError extends Error {
   override readonly name = 'WorkflowBudgetExceededError'
 }
 
+/** Children are cancelled after a budgeted run has produced a partial result. */
+export class WorkflowPartialDrainError extends Error {
+  override readonly name = 'WorkflowPartialDrainError'
+  constructor(
+    readonly workflowName: string,
+    readonly inFlightAgents: number,
+  ) {
+    super(
+      `Workflow ${workflowName} returned a partial result; ${inFlightAgents} in-flight agent${inFlightAgents === 1 ? '' : 's'} must drain`,
+    )
+  }
+}
+
+export class WorkflowAgentIdleTimeoutError extends Error {
+  override readonly name = 'WorkflowAgentIdleTimeoutError'
+  constructor(
+    readonly agentLabel: string,
+    readonly idleTimeoutMs: number,
+  ) {
+    super(
+      `Workflow agent ${agentLabel} produced no events for ${idleTimeoutMs}ms and was abandoned`,
+    )
+  }
+}
+
+export type IdleWatchdog = {
+  arm: () => void
+  reset: () => void
+  disarm: () => void
+}
+
+export function createIdleWatchdog(params: {
+  timeoutMs: number | null
+  onIdle: () => void
+}): IdleWatchdog {
+  const { timeoutMs, onIdle } = params
+  if (timeoutMs === null || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return { arm: () => {}, reset: () => {}, disarm: () => {} }
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let armed = false
+  let done = false
+  const clear = (): void => {
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      timer = undefined
+    }
+  }
+  const start = (): void => {
+    clear()
+    timer = setTimeout(() => {
+      timer = undefined
+      if (done) return
+      done = true
+      armed = false
+      onIdle()
+    }, timeoutMs)
+    timer.unref?.()
+  }
+  return {
+    arm: () => {
+      if (done) return
+      armed = true
+      start()
+    },
+    reset: () => {
+      if (done || !armed) return
+      start()
+    },
+    disarm: () => {
+      done = true
+      armed = false
+      clear()
+    },
+  }
+}
+
+export function resolveWorkflowAgentIdleTimeoutMs(): number | null {
+  return parseWorkflowAgentIdleTimeoutMs(
+    process.env.CRABCODE_WORKFLOW_AGENT_IDLE_MS,
+  )
+}
+
 export function createWorkflowModelBudgetGuard(
   maxBudgetUsd: number,
   readTotalCost: () => number = getTotalCost,
@@ -224,6 +310,63 @@ type WorkerMessage =
     }
   | { type: 'result'; value: unknown }
   | { type: 'error'; message: string }
+
+/**
+ * Globals a workflow script can actually see.
+ *
+ * `vm.createContext` over a null-prototype sandbox supplies the plain
+ * ECMAScript intrinsics and **nothing else** — every host global (`URL`,
+ * `fetch`, `TextEncoder`, …) is absent. That is easy to get wrong from
+ * reading the code: `try { new URL(u) } catch { … }` looks like defensive
+ * programming and is in fact a branch that always takes the fallback.
+ * `deepResearch.ts` shipped with exactly that bug (URL de-duplication
+ * silently degraded to raw string comparison, wasting the fetch budget and
+ * labelling every source `unknown`).
+ *
+ * Measured on Bun 1.3.11 with a probe of this exact sandbox shape (68 own
+ * property names before the bootstrap script runs); pinned by
+ * `tests/unit/workflow-sandbox-globals.test.ts` so a future runtime change is
+ * a red test rather than another silent degradation. Anything not listed as
+ * available must be implemented in plain ECMAScript — do not widen the
+ * sandbox to import a host global.
+ */
+export const WORKFLOW_SANDBOX_AVAILABLE_GLOBALS = Object.freeze([
+  'Array',
+  'BigInt',
+  'Date',
+  'Error',
+  'Intl',
+  'JSON',
+  'Map',
+  'Math',
+  'Object',
+  'Promise',
+  'Proxy',
+  'Reflect',
+  'RegExp',
+  'Set',
+  'String',
+  'Symbol',
+  'WeakMap',
+  'WeakRef',
+  'console',
+] as const)
+
+/** Host globals that are NOT reachable from a workflow script. */
+export const WORKFLOW_SANDBOX_MISSING_GLOBALS = Object.freeze([
+  'AbortController',
+  'Buffer',
+  'TextDecoder',
+  'TextEncoder',
+  'URL',
+  'URLSearchParams',
+  'fetch',
+  'performance',
+  'process',
+  'queueMicrotask',
+  'require',
+  'structuredClone',
+] as const)
 
 const WORKFLOW_WORKER_SOURCE = String.raw`
 'use strict'
@@ -350,6 +493,7 @@ try {
     __crabcodeMaxSteps: workerData.maxSteps,
     __crabcodeMaxAgentCalls: workerData.maxAgentCalls,
     __crabcodeMaxRuntimeMs: workerData.maxRuntimeMs,
+    __crabcodeDeadlineAtMs: workerData.deadlineAtMs,
   })
   const context = vm.createContext(sandbox, {
     name: 'crabcode-workflow',
@@ -365,12 +509,14 @@ try {
   const maxSteps = globalThis.__crabcodeMaxSteps
   const maxAgentCalls = globalThis.__crabcodeMaxAgentCalls
   const maxRuntimeMs = globalThis.__crabcodeMaxRuntimeMs
+  const deadlineAtMs = globalThis.__crabcodeDeadlineAtMs
   delete globalThis.__crabcodeHostBridge
   delete globalThis.__crabcodeRegisterDelivery
   delete globalThis.__crabcodeArgsJson
   delete globalThis.__crabcodeMaxSteps
   delete globalThis.__crabcodeMaxAgentCalls
   delete globalThis.__crabcodeMaxRuntimeMs
+  delete globalThis.__crabcodeDeadlineAtMs
 
   const safeParse = JSON.parse.bind(JSON)
   const safeStringify = JSON.stringify.bind(JSON)
@@ -527,6 +673,19 @@ try {
     }
   })
 
+  // The workflow's own wall clock, so a long script can return a partial
+  // result instead of being cut off. Computed from Date.now() inside the
+  // sandbox — Date is one of the plain ECMAScript intrinsics vm.createContext
+  // provides (see the measured global list in the host source above).
+  const deadline = Object.freeze({
+    remainingMs() {
+      return Math.max(0, deadlineAtMs - Date.now())
+    },
+    exceeded() {
+      return Date.now() >= deadlineAtMs
+    },
+  })
+
   Object.assign(globalThis, {
     args: safeParse(argsJson),
     log,
@@ -535,6 +694,7 @@ try {
     pipeline,
     parallel,
     sleep,
+    deadline,
     setTimeout: workflowSetTimeout,
     clearTimeout: workflowClearTimeout,
   })
@@ -612,6 +772,21 @@ export async function executeWorkflowSource(params: {
   observer: Pick<WorkflowRuntimeObserver, 'log' | 'phase'>
   agent: WorkflowAgentRunner
   onRuntimeTerminated?: (error: Error) => void
+  /**
+   * Total wall clock for this run. Defaults to `WORKFLOW_MAX_RUNTIME_MS`;
+   * tests shorten it. Reaching it is a graceful three-stage stop (refuse new
+   * agents → drain grace → host-assembled partial result), not a rejection.
+   */
+  maxRuntimeMs?: number
+  /** Grace period for the script and its in-flight agents to wind down. */
+  drainGraceMs?: number
+  /**
+   * Host-side partial result used when the script has not returned by the end
+   * of the drain grace. Returning `undefined` (or omitting the callback) makes
+   * the budget a hard failure instead — the pre-W-WORKFLOW-TURN-BUDGET
+   * behaviour, kept for callers with nothing partial to report.
+   */
+  buildPartialResult?: () => unknown
 }): Promise<unknown> {
   const {
     workflow,
@@ -620,6 +795,9 @@ export async function executeWorkflowSource(params: {
     observer,
     agent,
     onRuntimeTerminated,
+    maxRuntimeMs = WORKFLOW_MAX_RUNTIME_MS,
+    drainGraceMs = WORKFLOW_DRAIN_GRACE_MS,
+    buildPartialResult,
   } = params
   throwIfAborted(signal)
   jsonByteLength(args, 'arguments', WORKFLOW_MAX_ARGS_BYTES)
@@ -632,7 +810,13 @@ export async function executeWorkflowSource(params: {
     let lastHeartbeat = Date.now()
     let workerResultReceived = false
     let workerResult: unknown
+    // Set when the runtime budget expires: in-flight agents keep draining but
+    // no new one starts, so the script can wind down instead of being cut off
+    // mid-fan-out.
+    let refusingNewAgents = false
+    let budgetDrainTimer: ReturnType<typeof globalThis.setTimeout> | undefined
     const activeAgentCalls = new Set<Promise<void>>()
+    const deadlineAtMs = Date.now() + maxRuntimeMs
     const worker = new Worker(WORKFLOW_WORKER_SOURCE, {
       eval: true,
       resourceLimits: WORKFLOW_WORKER_RESOURCE_LIMITS,
@@ -642,13 +826,15 @@ export async function executeWorkflowSource(params: {
         filename: `crabcode-workflow-${workflow.name}.js`,
         maxSteps: WORKFLOW_MAX_STEPS,
         maxAgentCalls: WORKFLOW_MAX_AGENT_CALLS,
-        maxRuntimeMs: WORKFLOW_MAX_RUNTIME_MS,
+        maxRuntimeMs,
+        deadlineAtMs,
       },
     })
 
     const cleanup = (): void => {
       signal.removeEventListener('abort', onAbort)
       globalThis.clearTimeout(deadline)
+      if (budgetDrainTimer !== undefined) globalThis.clearTimeout(budgetDrainTimer)
       globalThis.clearInterval(watchdog)
       worker.removeAllListeners()
     }
@@ -659,19 +845,26 @@ export async function executeWorkflowSource(params: {
       settled = true
       cleanup()
       void worker.terminate()
-      if (outcome.ok) {
-        resolve(outcome.value)
+      const finish = outcome.ok
+        ? () => resolve(outcome.value)
+        : () => reject(outcome.error)
+      const active = [...activeAgentCalls]
+      if (outcome.ok && active.length === 0) {
+        finish()
         return
       }
       try {
-        onRuntimeTerminated?.(outcome.error)
+        onRuntimeTerminated?.(
+          outcome.ok
+            ? new WorkflowPartialDrainError(workflow.name, active.length)
+            : outcome.error,
+        )
       } catch {
-        // Runtime termination must still drain and reject even if the host's
+        // Runtime termination must still drain and settle even if the host's
         // cancellation observer fails.
       }
-      const active = [...activeAgentCalls]
       if (active.length === 0) {
-        reject(outcome.error)
+        finish()
         return
       }
       let drainTimer: ReturnType<typeof globalThis.setTimeout> | undefined
@@ -686,7 +879,7 @@ export async function executeWorkflowSource(params: {
         drainTimeout,
       ]).finally(() => {
         if (drainTimer !== undefined) globalThis.clearTimeout(drainTimer)
-        reject(outcome.error)
+        finish()
       })
     }
     const finishWorkerResultIfDrained = (): void => {
@@ -719,14 +912,32 @@ export async function executeWorkflowSource(params: {
     }
     signal.addEventListener('abort', onAbort, { once: true })
 
+    // Reaching the runtime budget is a graceful stop, not a rejection. The old
+    // behaviour (`settle({ok:false})`) discarded every source already fetched
+    // and every claim already verified; with the workflow now able to outlive
+    // its turn, this budget is the only total-duration guard there is, so it
+    // has to end in something the user can read.
     const deadline = globalThis.setTimeout(() => {
-      settle({
-        ok: false,
-        error: new Error(
-          `Workflow ${workflow.name} exceeded its ${WORKFLOW_MAX_RUNTIME_MS}ms runtime limit`,
-        ),
-      })
-    }, WORKFLOW_MAX_RUNTIME_MS)
+      if (settled || refusingNewAgents) return
+      refusingNewAgents = true
+      observer.log(
+        `Workflow ${workflow.name} reached its ${maxRuntimeMs}ms runtime budget; no further agents will start. Returning within ${drainGraceMs}ms.`,
+      )
+      budgetDrainTimer = globalThis.setTimeout(() => {
+        if (settled) return
+        const partial = buildPartialResult?.()
+        if (partial === undefined) {
+          settle({
+            ok: false,
+            error: new Error(
+              `Workflow ${workflow.name} exceeded its ${maxRuntimeMs}ms runtime limit`,
+            ),
+          })
+          return
+        }
+        settle({ ok: true, value: partial })
+      }, drainGraceMs)
+    }, maxRuntimeMs)
     const watchdog = globalThis.setInterval(() => {
       if (Date.now() - lastHeartbeat <= WORKFLOW_HEARTBEAT_TIMEOUT_MS) return
       settle({
@@ -770,6 +981,18 @@ export async function executeWorkflowSource(params: {
         return
       }
       if (raw.type === 'agent') {
+        if (refusingNewAgents) {
+          // Answered rather than dropped: the script's `agent()` promise is
+          // still pending in the sandbox, and leaving it unresolved would wedge
+          // the run until the drain grace expired with nothing to show.
+          worker.postMessage({
+            type: 'agent-result',
+            id: raw.id,
+            ok: false,
+            error: `Workflow ${workflow.name} is past its runtime budget and is not starting new agents`,
+          })
+          return
+        }
         let activeCall!: Promise<void>
         activeCall = Promise.resolve()
           .then(() => {
@@ -986,6 +1209,41 @@ export function constrainWorkflowAgentPermissions(
   }
 }
 
+/**
+ * Fail loudly when an agent a workflow depends on cannot get the tools its
+ * definition declares.
+ *
+ * `runAgent` resolves the same list and **silently drops** whatever is
+ * missing, which is right for a user-authored agent (a smaller pool still does
+ * useful work) and wrong for a workflow: `deep-research` declares
+ * `[WebSearch, WebFetch]`, and with WebSearch absent its five search agents
+ * are told in their system prompt that they can search, find they cannot, and
+ * burn the run producing nothing. §16's no-progress watchdog does not catch it
+ * either — a model that answers in prose instead of erroring never trips the
+ * "every tool_result is_error" condition.
+ *
+ * Resolution goes through `resolveAgentTools` with the same arguments
+ * `runAgent` will use, so this check cannot drift away from what actually gets
+ * handed to the agent. A `tools: ['*']` (or absent) declaration asks for
+ * whatever exists and is therefore never unsatisfiable.
+ */
+export function assertWorkflowAgentToolsAreAvailable(
+  agent: AgentDefinition,
+  availableTools: Tools,
+): void {
+  const resolution = resolveAgentTools(agent, availableTools, true)
+  if (resolution.hasWildcard || resolution.invalidTools.length === 0) return
+  throw new Error(
+    `Workflow agent '${agent.agentType}' declares ${resolution.invalidTools
+      .map(name => `'${name}'`)
+      .join(', ')}, which ${
+      resolution.invalidTools.length === 1 ? 'is' : 'are'
+    } not available in this session. The workflow cannot run without ${
+      resolution.invalidTools.length === 1 ? 'it' : 'them'
+    }.`,
+  )
+}
+
 export async function runWorkflowAgent(params: {
   workflow: DiscoveredWorkflow
   taskId: string
@@ -1078,6 +1336,7 @@ export async function runWorkflowAgent(params: {
   const availableTools = syntheticTool
     ? [...baseTools, syntheticTool]
     : baseTools
+  assertWorkflowAgentToolsAreAvailable(workflowAgent, availableTools)
   const maxBudgetUsd = toolUseContext.options.maxBudgetUsd
   const modelBudgetGuard =
     maxBudgetUsd === undefined
@@ -1122,41 +1381,56 @@ export async function runWorkflowAgent(params: {
 
     const messages: Message[] = []
     const structuredOutputs: unknown[] = []
-    for await (const message of runAgent({
-      agentDefinition: workflowAgent,
-      promptMessages: [createUserMessage({ content: prompt })],
-      toolUseContext: {
-        ...sealedToolUseContext,
-        // This marker is created only after the root ticket is running.
-        // Descendant foreground AgentTools borrow this same lease instead of
-        // deadlocking on a second slot from the process-global pool.
-        agentSchedulerRootLeaseHeld: true,
+    let idleError: WorkflowAgentIdleTimeoutError | undefined
+    const idleTimeoutMs = resolveWorkflowAgentIdleTimeoutMs()
+    const idleWatchdog = createIdleWatchdog({
+      timeoutMs: idleTimeoutMs,
+      onIdle: () => {
+        idleError = new WorkflowAgentIdleTimeoutError(
+          options.label ?? options.agentType,
+          idleTimeoutMs ?? 0,
+        )
+        abortController.abort(idleError)
       },
-      canUseTool,
-      isAsync: true,
-      querySource: getQuerySourceForAgent(
-        workflowAgent.agentType,
-        isBuiltInAgent(workflowAgent),
-      ),
-      override: { abortController },
-      availableTools,
-      // Parent session approvals are ambient mutable state, not authority that
-      // a plugin-authored Workflow may silently inherit. Preserve only
-      // process-start CLI grants (runAgent's documented contract) and require
-      // normal permission evaluation for every other operation.
-      allowedTools: permissionPolicy.allowedTools,
-      transcriptSubdir: `workflows/${taskId}`,
-      description: options.label ?? workflowAgent.agentType,
-      requireFinalText: !syntheticTool,
-    })) {
-      messages.push(message)
-      if (
-        message.type === 'attachment' &&
-        message.attachment.type === 'structured_output'
-      ) {
-        structuredOutputs.push(message.attachment.data)
+    })
+    idleWatchdog.arm()
+    try {
+      for await (const message of runAgent({
+        agentDefinition: workflowAgent,
+        promptMessages: [createUserMessage({ content: prompt })],
+        toolUseContext: {
+          ...sealedToolUseContext,
+          // Descendant foreground AgentTools borrow this running root lease.
+          agentSchedulerRootLeaseHeld: true,
+        },
+        canUseTool,
+        isAsync: true,
+        querySource: getQuerySourceForAgent(
+          workflowAgent.agentType,
+          isBuiltInAgent(workflowAgent),
+        ),
+        override: { abortController },
+        availableTools,
+        allowedTools: permissionPolicy.allowedTools,
+        transcriptSubdir: `workflows/${taskId}`,
+        description: options.label ?? workflowAgent.agentType,
+        requireFinalText: !syntheticTool,
+      })) {
+        idleWatchdog.reset()
+        messages.push(message)
+        if (
+          message.type === 'attachment' &&
+          message.attachment.type === 'structured_output'
+        ) {
+          structuredOutputs.push(message.attachment.data)
+        }
       }
+    } catch (error) {
+      throw idleError ?? error
+    } finally {
+      idleWatchdog.disarm()
     }
+    if (idleError) throw idleError
     throwIfAborted(abortController.signal)
 
     const lastAssistant = getLastAssistantMessage(messages)

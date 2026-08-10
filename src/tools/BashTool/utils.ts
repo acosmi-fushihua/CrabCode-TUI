@@ -109,22 +109,29 @@ export async function resizeShellImageOutput(
   outputFilePath: string | undefined,
   outputFileSize: number | undefined,
 ): Promise<string | null> {
-  let source = stdout
-  if (outputFilePath) {
-    const size = outputFileSize ?? (await stat(outputFilePath)).size
-    if (size > MAX_IMAGE_FILE_SIZE) return null
-    source = await readFile(outputFilePath, 'utf8')
+  try {
+    let source = stdout
+    if (outputFilePath) {
+      const size = outputFileSize ?? (await stat(outputFilePath)).size
+      if (size > MAX_IMAGE_FILE_SIZE) return null
+      source = await readFile(outputFilePath, 'utf8')
+    }
+    const parsed = parseDataUri(source)
+    if (!parsed) return null
+    const buf = Buffer.from(parsed.data, 'base64')
+    const ext = parsed.mediaType.split('/')[1] || 'png'
+    const resized = await maybeResizeAndDownsampleImageBuffer(
+      buf,
+      buf.length,
+      ext,
+    )
+    return `data:image/${resized.mediaType};base64,${resized.buffer.toString('base64')}`
+  } catch {
+    // Missing/corrupt full output (or a truncated preview) degrades to bounded
+    // text; it must not turn an otherwise successful shell command into a
+    // tool failure.
+    return null
   }
-  const parsed = parseDataUri(source)
-  if (!parsed) return null
-  const buf = Buffer.from(parsed.data, 'base64')
-  const ext = parsed.mediaType.split('/')[1] || 'png'
-  const resized = await maybeResizeAndDownsampleImageBuffer(
-    buf,
-    buf.length,
-    ext,
-  )
-  return `data:image/${resized.mediaType};base64,${resized.buffer.toString('base64')}`
 }
 
 export function formatOutput(content: string): {

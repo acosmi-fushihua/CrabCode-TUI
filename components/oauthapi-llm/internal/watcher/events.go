@@ -27,11 +27,23 @@ func matchProvider(provider string, targets []string) (string, bool) {
 }
 
 func (w *Watcher) start(ctx context.Context) error {
+	// F9 (2026-08-09): 配置文件监听失败**不再致命**。
+	//
+	// 宿主（CrabCode 账户接入管理器）拿到 healthz 之后会删掉那份只含单次运行密钥的
+	// 临时 config，而 readiness 是在 listener bind 那一刻就发出去的（internal/api
+	// server.go 的 writeAccountBridgeReadiness），watcher 要再晚约 100ms 才走到这里
+	// Add。删除恰好落进这道缝：Add 收 ENOENT → 这里原本 `return errAddConfig` →
+	// Service.Run 返回错误 → 整个进程退出 → 宿主判「就绪后异常退出」→ 重启 → 再死。
+	// Windows 自 1.0.15 起恒败，每个周期真正「就绪」只有约 100ms。
+	//
+	// 丢掉配置热重载远好过让进程死掉：热重载是便利，进程活着是前提。auth 目录的监听
+	// 仍是硬要求（凭据变更必须被看见），失败照旧返回错误——两者的失效后果不对称，
+	// 所以判据也不该一样。
 	if errAddConfig := w.watcher.Add(w.configPath); errAddConfig != nil {
-		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
-		return errAddConfig
+		log.Warnf("config file %s is not watchable (%v); continuing without config hot-reload", w.configPath, errAddConfig)
+	} else {
+		log.Debugf("watching config file: %s", w.configPath)
 	}
-	log.Debugf("watching config file: %s", w.configPath)
 
 	if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
 		log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)

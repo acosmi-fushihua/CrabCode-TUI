@@ -37,8 +37,19 @@
 //     that fits; sets truncatedByBytes in the result.  Never throws.
 // ---------------------------------------------------------------------------
 
-import { createReadStream, fstat } from 'fs'
-import { stat as fsStat, readFile } from 'fs/promises'
+import {
+  type BigIntStats,
+  constants as fsConstants,
+  createReadStream,
+  fstat,
+} from 'fs'
+import {
+  type FileHandle,
+  open,
+  readFile,
+  stat as fsStat,
+} from 'fs/promises'
+import type { FileIdentity } from './fsOperations.js'
 import { formatFileSize } from './format.js'
 
 const FAST_PATH_MAX_SIZE = 10 * 1024 * 1024 // 10 MB
@@ -77,9 +88,22 @@ export async function readFileInRange(
   maxBytes?: number,
   signal?: AbortSignal,
   options?: { truncateOnByteLimit?: boolean },
+  expectedIdentity?: FileIdentity,
 ): Promise<ReadFileRangeResult> {
   signal?.throwIfAborted()
   const truncateOnByteLimit = options?.truncateOnByteLimit ?? false
+
+  if (expectedIdentity !== undefined) {
+    return readFileInRangeBound(
+      filePath,
+      expectedIdentity,
+      offset,
+      maxLines,
+      maxBytes,
+      truncateOnByteLimit,
+      signal,
+    )
+  }
 
   // stat to decide the code path and guard against OOM.
   // For regular files under 10 MB: readFile + in-memory split (fast).
@@ -119,6 +143,79 @@ export async function readFileInRange(
     truncateOnByteLimit,
     signal,
   )
+}
+
+function assertBoundFile(
+  filePath: string,
+  stats: BigIntStats,
+  expectedIdentity: FileIdentity,
+): void {
+  if (
+    stats.isFile() &&
+    stats.dev === expectedIdentity.dev &&
+    stats.ino === expectedIdentity.ino
+  ) {
+    return
+  }
+  const error = new Error(
+    `file identity changed before read: ${filePath}`,
+  ) as NodeJS.ErrnoException
+  error.code = 'ESTALE'
+  throw error
+}
+
+async function readFileInRangeBound(
+  filePath: string,
+  expectedIdentity: FileIdentity,
+  offset: number,
+  maxLines: number | undefined,
+  maxBytes: number | undefined,
+  truncateOnByteLimit: boolean,
+  signal?: AbortSignal,
+): Promise<ReadFileRangeResult> {
+  const handle = await open(
+    filePath,
+    process.platform === 'win32'
+      ? 'r'
+      : fsConstants.O_RDONLY | fsConstants.O_NONBLOCK,
+  )
+  try {
+    const identityStats = await handle.stat({ bigint: true })
+    assertBoundFile(filePath, identityStats, expectedIdentity)
+    const stats = await handle.stat()
+
+    if (stats.size < FAST_PATH_MAX_SIZE) {
+      if (
+        !truncateOnByteLimit &&
+        maxBytes !== undefined &&
+        stats.size > maxBytes
+      ) {
+        throw new FileTooLargeError(stats.size, maxBytes)
+      }
+      signal?.throwIfAborted()
+      const raw = await handle.readFile({ encoding: 'utf8' })
+      signal?.throwIfAborted()
+      return readFileInRangeFast(
+        raw,
+        stats.mtimeMs,
+        offset,
+        maxLines,
+        truncateOnByteLimit ? maxBytes : undefined,
+      )
+    }
+
+    return await readFileInRangeStreamingHandle(
+      handle,
+      stats.mtimeMs,
+      offset,
+      maxLines,
+      maxBytes,
+      truncateOnByteLimit,
+      signal,
+    )
+  } finally {
+    await handle.close()
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +473,45 @@ function readFileInRangeStreaming(
     })
 
     state.stream.once('open', streamOnOpen.bind(state))
+    state.stream.on('data', streamOnData.bind(state))
+    state.stream.once('end', streamOnEnd.bind(state))
+    state.stream.once('error', reject)
+  })
+}
+
+function readFileInRangeStreamingHandle(
+  handle: FileHandle,
+  mtimeMs: number,
+  offset: number,
+  maxLines: number | undefined,
+  maxBytes: number | undefined,
+  truncateOnByteLimit: boolean,
+  signal?: AbortSignal,
+): Promise<ReadFileRangeResult> {
+  return new Promise((resolve, reject) => {
+    const state: StreamState = {
+      stream: handle.createReadStream({
+        autoClose: false,
+        encoding: 'utf8',
+        highWaterMark: 512 * 1024,
+        ...(signal ? { signal } : undefined),
+      }),
+      offset,
+      endLine: maxLines !== undefined ? offset + maxLines : Infinity,
+      maxBytes,
+      truncateOnByteLimit,
+      resolve,
+      totalBytesRead: 0,
+      selectedBytes: 0,
+      truncatedByBytes: false,
+      currentLineIndex: 0,
+      selectedLines: [],
+      partial: '',
+      isFirstChunk: true,
+      resolveMtime: () => {},
+      mtimeReady: Promise.resolve(mtimeMs),
+    }
+
     state.stream.on('data', streamOnData.bind(state))
     state.stream.once('end', streamOnEnd.bind(state))
     state.stream.once('error', reject)

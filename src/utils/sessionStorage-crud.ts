@@ -91,6 +91,24 @@ import {
 let project: Project | null = null
 let cleanupRegistered = false
 
+// Public transcript record/removal calls are admitted in invocation order.
+// `recordTranscript()` resolves after preparing/enqueuing its JSONL entries,
+// not after the lazy file drain; the per-file mutation queue below then keeps
+// those appends and a following tombstone in the same durable order. This also
+// prevents a later same-UUID retry from racing ahead of the removal.
+let transcriptMutationTail: Promise<void> = Promise.resolve()
+
+function enqueueTranscriptMutation<T>(mutation: () => Promise<T>): Promise<T> {
+  const result = transcriptMutationTail.then(mutation)
+  // Keep the chain live after a fail-soft persistence error, and attach the
+  // rejection handler immediately for deliberately fire-and-forget callers.
+  transcriptMutationTail = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  return result
+}
+
 function getProject(): Project {
   if (!project) {
     project = new Project()
@@ -132,6 +150,7 @@ export function resetProjectFlushStateForTesting(): void {
  */
 export function resetProjectForTesting(): void {
   project = null
+  transcriptMutationTail = Promise.resolve()
 }
 
 export function setSessionFileForTesting(path: string): void {
@@ -161,11 +180,14 @@ class Project {
   private pendingEntries: Entry[] = []
   private pendingWriteCount: number = 0
   private flushResolvers: Array<() => void> = []
-  // Per-file write queues. Each entry carries a resolve callback so
-  // callers of enqueueWrite can optionally await their specific write.
+  // Per-file mutation queues. Appends and tombstone removals share this one
+  // ordered stream so an r+/truncate removal can never race an append drain.
   private writeQueues = new Map<
     string,
-    Array<{ entry: Entry; resolve: () => void }>
+    Array<
+      | { kind: 'append'; entry: Entry; resolve: () => void }
+      | { kind: 'remove-message'; targetUuid: UUID; resolve: () => void }
+    >
   >()
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private activeDrain: Promise<void> | null = null
@@ -215,7 +237,22 @@ class Project {
         queue = []
         this.writeQueues.set(filePath, queue)
       }
-      queue.push({ entry, resolve })
+      queue.push({ kind: 'append', entry, resolve })
+      this.scheduleDrain()
+    })
+  }
+
+  private enqueueMessageRemoval(
+    filePath: string,
+    targetUuid: UUID,
+  ): Promise<void> {
+    return new Promise<void>(resolve => {
+      let queue = this.writeQueues.get(filePath)
+      if (!queue) {
+        queue = []
+        this.writeQueues.set(filePath, queue)
+      }
+      queue.push({ kind: 'remove-message', targetUuid, resolve })
       this.scheduleDrain()
     })
   }
@@ -257,29 +294,35 @@ class Project {
       let content = ''
       const resolvers: Array<() => void> = []
 
-      for (const { entry, resolve } of batch) {
-        const line = jsonStringify(entry) + '\n'
+      const flushAppendBatch = async (): Promise<void> => {
+        if (content.length === 0) return
+        await this.appendToFile(filePath, content)
+        content = ''
+        for (const resolve of resolvers.splice(0)) resolve()
+      }
+
+      for (const mutation of batch) {
+        if (mutation.kind === 'remove-message') {
+          // Preserve file order: every earlier append is durable before the
+          // positional truncate, and every later append runs after it.
+          await flushAppendBatch()
+          await this.removeMessageFromFile(filePath, mutation.targetUuid)
+          mutation.resolve()
+          continue
+        }
+
+        const line = jsonStringify(mutation.entry) + '\n'
 
         if (content.length + line.length >= this.MAX_CHUNK_BYTES) {
           // Flush chunk and resolve its entries before starting a new one
-          await this.appendToFile(filePath, content)
-          for (const r of resolvers) {
-            r()
-          }
-          resolvers.length = 0
-          content = ''
+          await flushAppendBatch()
         }
 
         content += line
-        resolvers.push(resolve)
+        resolvers.push(mutation.resolve)
       }
 
-      if (content.length > 0) {
-        await this.appendToFile(filePath, content)
-        for (const r of resolvers) {
-          r()
-        }
-      }
+      await flushAppendBatch()
     }
 
     // Clean up empty queues
@@ -475,84 +518,103 @@ class Project {
    */
   async removeMessageByUuid(targetUuid: UUID): Promise<void> {
     return this.trackWrite(async () => {
-      if (this.sessionFile === null) return
+      const sessionFile = this.sessionFile
+      if (sessionFile === null) return
+
+      await this.enqueueMessageRemoval(sessionFile, targetUuid)
+
+      // The memoized UUID set is the in-memory authority used by the next
+      // recordTranscript() dedup pass. Keeping a removed UUID here would make a
+      // retry that intentionally reuses it disappear from disk as well.
       try {
-        let fileSize = 0
-        const fh = await fsOpen(this.sessionFile, 'r+')
-        try {
-          const { size } = await fh.stat()
-          fileSize = size
-          if (size === 0) return
-
-          const chunkLen = Math.min(size, LITE_READ_BUF_SIZE)
-          const tailStart = size - chunkLen
-          const buf = Buffer.allocUnsafe(chunkLen)
-          const { bytesRead } = await fh.read(buf, 0, chunkLen, tailStart)
-          const tail = buf.subarray(0, bytesRead)
-
-          // Entries are serialized via JSON.stringify (no key-value
-          // whitespace). Search for the full `"uuid":"..."` pattern, not
-          // just the bare UUID, so we do not match the same value sitting
-          // in `parentUuid` of a child entry. UUIDs are pure ASCII so a
-          // byte-level search is correct.
-          const needle = `"uuid":"${targetUuid}"`
-          const matchIdx = tail.lastIndexOf(needle)
-
-          if (matchIdx >= 0) {
-            // 0x0a never appears inside a UTF-8 multi-byte sequence, so
-            // byte-scanning for line boundaries is safe even if the chunk
-            // starts mid-character.
-            const prevNl = tail.lastIndexOf(0x0a, matchIdx)
-            // If the preceding newline is outside our chunk and we did not
-            // read from the start of the file, the line is longer than the
-            // window - fall through to the slow path.
-            if (prevNl >= 0 || tailStart === 0) {
-              const lineStart = prevNl + 1 // 0 when prevNl === -1
-              const nextNl = tail.indexOf(0x0a, matchIdx + needle.length)
-              const lineEnd = nextNl >= 0 ? nextNl + 1 : bytesRead
-
-              const absLineStart = tailStart + lineStart
-              const afterLen = bytesRead - lineEnd
-              // Truncate first, then re-append the trailing lines. In the
-              // common case (target is the last entry) afterLen is 0 and
-              // this is a single ftruncate.
-              await fh.truncate(absLineStart)
-              if (afterLen > 0) {
-                await fh.write(tail, lineEnd, afterLen, absLineStart)
-              }
-              return
-            }
-          }
-        } finally {
-          await fh.close()
-        }
-
-        // Slow path: target was not in the last 64KB. Rare - requires many
-        // large entries to have landed between the write and the tombstone.
-        if (fileSize > MAX_TOMBSTONE_REWRITE_BYTES) {
-          logForDebugging(
-            `Skipping tombstone removal: session file too large (${formatFileSize(fileSize)})`,
-            { level: 'warn' },
-          )
-          return
-        }
-        const content = await readFile(this.sessionFile, { encoding: 'utf-8' })
-        const lines = content.split('\n').filter((line: string) => {
-          if (!line.trim()) return true
-          try {
-            const entry = jsonParse(line)
-            return entry.uuid !== targetUuid
-          } catch {
-            return true // Keep malformed lines
-          }
-        })
-        await writeFile(this.sessionFile, lines.join('\n'), {
-          encoding: 'utf8',
-        })
+        const messageSet = await getSessionMessages(getSessionId() as UUID)
+        messageSet.delete(targetUuid)
       } catch {
-        // Silently ignore errors - the file might not exist yet
+        // Disk removal is fail-soft; cache maintenance must be as well. Drop a
+        // rejected/stale memoized read so the next recording gets a fresh view.
+        clearSessionMessagesCache()
       }
     })
+  }
+
+  private async removeMessageFromFile(
+    filePath: string,
+    targetUuid: UUID,
+  ): Promise<void> {
+    try {
+      let fileSize = 0
+      const fh = await fsOpen(filePath, 'r+')
+      try {
+        const { size } = await fh.stat()
+        fileSize = size
+        if (size === 0) return
+
+        const chunkLen = Math.min(size, LITE_READ_BUF_SIZE)
+        const tailStart = size - chunkLen
+        const buf = Buffer.allocUnsafe(chunkLen)
+        const { bytesRead } = await fh.read(buf, 0, chunkLen, tailStart)
+        const tail = buf.subarray(0, bytesRead)
+
+        // Entries are serialized via JSON.stringify (no key-value
+        // whitespace). Search for the full `"uuid":"..."` pattern, not
+        // just the bare UUID, so we do not match the same value sitting
+        // in `parentUuid` of a child entry. UUIDs are pure ASCII so a
+        // byte-level search is correct.
+        const needle = `"uuid":"${targetUuid}"`
+        const matchIdx = tail.lastIndexOf(needle)
+
+        if (matchIdx >= 0) {
+          // 0x0a never appears inside a UTF-8 multi-byte sequence, so
+          // byte-scanning for line boundaries is safe even if the chunk
+          // starts mid-character.
+          const prevNl = tail.lastIndexOf(0x0a, matchIdx)
+          // If the preceding newline is outside our chunk and we did not
+          // read from the start of the file, the line is longer than the
+          // window - fall through to the slow path.
+          if (prevNl >= 0 || tailStart === 0) {
+            const lineStart = prevNl + 1 // 0 when prevNl === -1
+            const nextNl = tail.indexOf(0x0a, matchIdx + needle.length)
+            const lineEnd = nextNl >= 0 ? nextNl + 1 : bytesRead
+
+            const absLineStart = tailStart + lineStart
+            const afterLen = bytesRead - lineEnd
+            // Truncate first, then re-append the trailing lines. In the
+            // common case (target is the last entry) afterLen is 0 and
+            // this is a single ftruncate.
+            await fh.truncate(absLineStart)
+            if (afterLen > 0) {
+              await fh.write(tail, lineEnd, afterLen, absLineStart)
+            }
+            return
+          }
+        }
+      } finally {
+        await fh.close()
+      }
+
+      // Slow path: target was not in the last 64KB. Rare - requires many
+      // large entries to have landed between the write and the tombstone.
+      if (fileSize > MAX_TOMBSTONE_REWRITE_BYTES) {
+        logForDebugging(
+          `Skipping tombstone removal: session file too large (${formatFileSize(fileSize)})`,
+          { level: 'warn' },
+        )
+        return
+      }
+      const content = await readFile(filePath, { encoding: 'utf-8' })
+      const lines = content.split('\n').filter((line: string) => {
+        if (!line.trim()) return true
+        try {
+          const entry = jsonParse(line)
+          return entry.uuid !== targetUuid
+        } catch {
+          return true // Keep malformed lines
+        }
+      })
+      await writeFile(filePath, lines.join('\n'), { encoding: 'utf8' })
+    } catch {
+      // Silently ignore errors - the file might not exist yet
+    }
   }
 
   /**
@@ -915,7 +977,23 @@ class Project {
 //  - Compaction (useLogMessages): new CB/summary appear FIRST, then recorded
 //    messagesToKeep → not a prefix → not tracked → CB gets parentUuid=null
 //    (correct: truncates --continue chain at compact boundary).
-export async function recordTranscript(
+export function recordTranscript(
+  messages: Message[],
+  teamInfo?: TeamInfo,
+  startingParentUuidHint?: UUID,
+  allMessages?: readonly Message[],
+): Promise<UUID | null> {
+  return enqueueTranscriptMutation(() =>
+    recordTranscriptImpl(
+      messages,
+      teamInfo,
+      startingParentUuidHint,
+      allMessages,
+    ),
+  )
+}
+
+async function recordTranscriptImpl(
   messages: Message[],
   teamInfo?: TeamInfo,
   startingParentUuidHint?: UUID,
@@ -1013,7 +1091,9 @@ export async function recordQueueOperation(queueOp: QueueOperationMessage) {
  * Used when a tombstone is received for an orphaned message.
  */
 export async function removeTranscriptMessage(targetUuid: UUID): Promise<void> {
-  await getProject().removeMessageByUuid(targetUuid)
+  await enqueueTranscriptMutation(() =>
+    getProject().removeMessageByUuid(targetUuid),
+  )
 }
 
 export async function recordFileHistorySnapshot(

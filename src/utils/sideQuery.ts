@@ -22,6 +22,7 @@ import {
 import { logEvent } from '../services/analytics/index.js'
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../services/analytics/metadata.js'
 import { isAcosmiSubscriber, isEnterpriseSubscriber } from './auth.js'
+import { createCombinedAbortSignal } from './combinedAbortSignal.js'
 import { sleep } from './sleep.js'
 import { normalizeModelStringForAPI } from './model/model.js'
 import { isNonGatewayModelReference } from './model/nonGatewayModelReference.js'
@@ -36,6 +37,23 @@ type BetaMessage = Acosmi.Beta.Messages.BetaMessage
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type BetaJSONOutputFormat = any
 type BetaThinkingConfigParam = Acosmi.Beta.Messages.BetaThinkingConfigParam
+
+/**
+ * sideQuery 单次尝试的显式墙钟预算。
+ *
+ * 2026-08-06 之前这里不传预算, 于是隐式继承 SDK `doJSONFullRaw` 的 30s 默认值。
+ * 该默认值本是给控制面端点用的, 却因为 chat 链路漏传第 5 实参而成了全链路的实际
+ * 上限。显式预算可避免上游长期静默时无限占用当前直连会话。修复
+ * 把 chat 的真实预算恢复成 11min 之后, **本调用点会跟着从 30s 静默涨到 11min** ——
+ * 对主对话是必需的, 对 sideQuery 则是纯回归: 它的 11 个调用点里 permissionExplainer /
+ * yoloClassifier 就挂在用户盯着权限提示等待的交互路径上。
+ *
+ * 所以这里显式声明自己的预算, 与 tokenEstimation 的 TOKEN_COUNT_REQUEST_TIMEOUT_MS
+ * 同值同理由 —— 隐式继承别人的默认值正是本次事故的形态本身。取 60s 而不是照抄回
+ * 原先的 30s: 30s 是一个控制面默认值意外落到这里的结果, 把它当成有意的取值等于把
+ * 事故固化成契约; 60s 比它宽裕 (视觉理解一类 sideQuery 确实可能慢), 又远小于主链路。
+ */
+const SIDE_QUERY_REQUEST_TIMEOUT_MS = 60_000
 
 export type SideQueryOptions = {
   /** Model to use for the query */
@@ -81,6 +99,28 @@ export type SideQueryOptions = {
   stop_sequences?: string[]
   /** Attributes this call in tengu_api_success for COGS joining against reporting.sampling_calls. */
   querySource: QuerySource
+}
+
+/**
+ * `Error.name` stamped on sideQuery's own pre-flight destination/validator
+ * guards (2026-08-01, W-VISION-DEGRADE-RUNAWAY PR-2).
+ *
+ * These throws never reach the network, so callers that summarize failures
+ * structurally — `chatMediaSidecar.ts::safeSidecarErrorSummary` keeps only
+ * `name`/`code`/`status`, deliberately dropping `message` because a provider
+ * exception can embed the request body — used to render them as an
+ * indistinguishable bare `Error`. That is exactly how F2 (a transport guard
+ * rejecting every consented cross-provider vision call) hid behind a generic
+ * `call_failed` for five days. Naming the class is the whole fix: it is
+ * derived from OUR constant, carries no provider data, and makes "our own
+ * guard rejected this" a distinct, greppable signal.
+ */
+export const SIDE_QUERY_DESTINATION_ERROR_NAME = 'SideQueryDestinationError'
+
+function destinationGuardError(message: string): Error {
+  const error = new Error(message)
+  error.name = SIDE_QUERY_DESTINATION_ERROR_NAME
+  return error
 }
 
 /**
@@ -200,19 +240,41 @@ export async function sideQuery(
     querySource: opts.querySource,
   })
   const normalizedModel = normalizeModelStringForAPI(runtimeModel)
+  // Transport-layer destination guard. Both privacy-sensitive sources require
+  // an EXACT approved provider/model destination — nothing more.
+  //
+  // 2026-08-01 (W-VISION-DEGRADE-RUNAWAY PR-2, F2 真根因): this used to demand
+  // `exactDestination.mainModelId` for `chat_media_understanding`, a leftover
+  // from the era when a chat sidecar could only route INSIDE the main model's
+  // provider. When 2026-07-27 licensed cross-provider routing, the construction
+  // side (`chatMediaSidecar.ts::runChatMediaSidecarDetailed`) and the egress
+  // side (`services/acosmi/client.ts::assertExactChatDestination` +
+  // `ExactChatDestination.mainModelId?`) were both updated to omit / tolerate
+  // the main-model tie on a cross-provider route — but this transport assertion
+  // was not. Result: whenever the main model's provider ships no vision sibling
+  // (the ONLY situation a cross-provider fallback exists for), the sidecar threw
+  // here BEFORE issuing any network request, and the caller's catch folded it
+  // into an indistinguishable `call_failed`. Cross-provider vision fallback had
+  // therefore never once succeeded in production since 2026-07-27.
+  //
+  // Consent semantics are held by three other layers and are NOT re-held here:
+  // resolution (`resolveChatSidecarDestination`), re-check
+  // (`isExpectedDestinationStillConsented` + the `validateEgress` asserted just
+  // below), and egress (`assertExactChatDestination`). A transport layer that
+  // duplicates a policy predicate can only drift away from it.
   if (
     opts.querySource === 'chat_media_understanding' &&
-    exactDestination?.mainModelId === undefined
+    exactDestination === undefined
   ) {
-    throw new Error(
-      'sideQuery: chat media understanding requires a live-bound main provider plus exact sidecar destination',
+    throw destinationGuardError(
+      `sideQuery: ${opts.querySource} requires an exact approved provider/model destination`,
     )
   }
   if (
     opts.querySource === 'chat_media_understanding' &&
     validateEgress === undefined
   ) {
-    throw new Error(
+    throw destinationGuardError(
       `sideQuery: ${opts.querySource} requires a final canonical egress validator`,
     )
   }
@@ -220,7 +282,7 @@ export async function sideQuery(
     exactDestination !== undefined &&
     exactDestination.modelId !== normalizedModel
   ) {
-    throw new Error(
+    throw destinationGuardError(
       `sideQuery: exact destination model does not match runtime model (${exactDestination.modelId} != ${normalizedModel})`,
     )
   }
@@ -267,7 +329,7 @@ export async function sideQuery(
   // W-SIDEQUERY-RETRY (X1): `maxRetries` used to be a dead option (destructured,
   // never read) — callers like yoloClassifier.ts passed it believing sideQuery
   // retried transient errors internally (a false claim in its own docstring).
-  // This bounds retries to 429s, only when
+  // This bounds it to the CLAUDE.md §8 contract: only 429s, only when
   // classified `transient` (quota still fails fast, unchanged), capped at
   // TRANSIENT_429_MAX_ATTEMPTS regardless of what a caller passes in, so no
   // caller can accidentally exceed the §8 ceiling.
@@ -280,6 +342,13 @@ export async function sideQuery(
 
   let sdkResp
   for (let attempt = 0; ; attempt++) {
+    // 每次尝试各自一份预算 (见 SIDE_QUERY_REQUEST_TIMEOUT_MS)。刻意按尝试计而不是
+    // 整条链路共享一条 deadline: 429 退避的睡眠是 §8 契约内的**有意**等待, 拿总预算
+    // 去砍它会把「限流后本该成功的重试」直接变成失败。约束的是单次挂死, 而重试次数
+    // 早已由 boundedMaxRetries 封顶, 总时长因此仍然有界。
+    const budget = createCombinedAbortSignal(signal, {
+      timeoutMs: SIDE_QUERY_REQUEST_TIMEOUT_MS,
+    })
     try {
       sdkResp = await chatComplete(
         normalizedModel,
@@ -291,13 +360,21 @@ export async function sideQuery(
           temperature,
           thinking: thinkingConfig as never,
         },
-        signal,
+        budget.signal,
         exactDestination,
         validateEgress,
       )
       break
     } catch (err) {
-      if (err instanceof Error && err.name === 'NetworkError') {
+      // 预算到期与传输失败对调用方是同一件事: 辅助答案没能按时到达, 故走同一条
+      // fail-soft 分支。但调用方自己 abort 时不是失败而是取消 —— 那种情况必须原样
+      // 抛出, 不能伪装成「网络不可用」把一个空结果塞给调用方。
+      // Caller cancellation always wins over transport classification. Some
+      // SDK layers wrap an AbortError as NetworkError; checking the error name
+      // first would turn an explicit cancel into an empty successful result.
+      if (signal?.aborted === true) throw err
+      const budgetExpired = budget.signal.aborted
+      if (budgetExpired || (err instanceof Error && err.name === 'NetworkError')) {
         // Provider-bound media/desktop calls are security-sensitive transactions:
         // swallowing the transport failure would let callers mistake an empty
         // observation for a successful, policy-bound response. Preserve the
@@ -305,7 +382,9 @@ export async function sideQuery(
         // was asserted.
         if (exactDestination) throw err
         console.warn(
-          '[sideQuery] SDK network unavailable; returning an empty result (provider details omitted)',
+          budgetExpired
+            ? `[sideQuery] no response within ${SIDE_QUERY_REQUEST_TIMEOUT_MS}ms; returning an empty result (provider details omitted)`
+            : '[sideQuery] SDK network unavailable; returning an empty result (provider details omitted)',
         )
         // Return a minimal BetaMessage-compatible empty response so callers
         // degrade gracefully instead of crashing.
@@ -337,6 +416,9 @@ export async function sideQuery(
         continue
       }
       throw err
+    } finally {
+      // break / continue / return / throw 四条出口都会经过这里, 定时器不泄漏。
+      budget.cleanup()
     }
   }
 

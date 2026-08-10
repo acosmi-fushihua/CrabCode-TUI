@@ -16,7 +16,7 @@ import {
 } from '../bootstrap/state.js'
 import {
   isOAuthTokenExpired,
-  refreshOAuthToken,
+  renewStoredOAuthTokens,
   shouldUseAcosmiAuth,
 } from '../services/oauth/client.js'
 import { getOauthProfileFromOauthToken } from '../services/oauth/getOauthProfile.js'
@@ -746,7 +746,7 @@ export async function saveOAuthTokensIfNeeded(
           scopes: tokens.scopes,
           clientId: tokens.clientId ?? existingOauth?.clientId,
           serverUrl: tokens.serverUrl ?? existingOauth?.serverUrl,
-          // Profile fetch in refreshOAuthToken swallows errors and returns null
+          // Profile fetch during token renewal swallows errors and returns null
           // on transient failures (network, 5xx, rate limit). Don't clobber a
           // valid stored subscription with null — fall back to the existing
           // value.
@@ -1170,7 +1170,7 @@ async function checkAndRefreshOAuthTokenIfNeededImpl(
   const freshTokens = await getAcosmiOAuthTokensAsync()
   if (
     !freshTokens?.refreshToken ||
-    !isOAuthTokenExpired(freshTokens.expiresAt)
+    (!force && !isOAuthTokenExpired(freshTokens.expiresAt))
   ) {
     // Another process refreshed — token is valid now. Not an error, but we
     // didn't refresh ourselves. Treat as temporary (callers already handle
@@ -1183,6 +1183,7 @@ async function checkAndRefreshOAuthTokenIfNeededImpl(
   await mkdir(crabCodeDir, { recursive: true })
 
   let release
+  let lockedTokens: OAuthTokens | null = null
   try {
     logEvent('tengu_oauth_token_refresh_lock_acquiring', {})
     release = await lockfile.lock(crabCodeDir)
@@ -1215,10 +1216,10 @@ async function checkAndRefreshOAuthTokenIfNeededImpl(
     // Check one more time after acquiring lock
     getAcosmiOAuthTokens.cache?.clear?.()
     clearKeychainCache()
-    const lockedTokens = await getAcosmiOAuthTokensAsync()
+    lockedTokens = await getAcosmiOAuthTokensAsync()
     if (
       !lockedTokens?.refreshToken ||
-      !isOAuthTokenExpired(lockedTokens.expiresAt)
+      (!force && !isOAuthTokenExpired(lockedTokens.expiresAt))
     ) {
       logEvent('tengu_oauth_token_refresh_race_resolved', {})
       // Another process won the race and refreshed; token is now valid.
@@ -1226,14 +1227,9 @@ async function checkAndRefreshOAuthTokenIfNeededImpl(
     }
 
     logEvent('tengu_oauth_token_refresh_starting', {})
-    const refreshedTokens = await refreshOAuthToken(lockedTokens.refreshToken, {
-      // For Acosmi subscribers, omit scopes so the default
-      // ACOSMI_OAUTH_SCOPES applies — this allows scope expansion
-      // (e.g. adding user:file_upload) on refresh without re-login.
-      scopes: shouldUseAcosmiAuth(lockedTokens.scopes)
-        ? undefined
-        : lockedTokens.scopes,
-    })
+    const refreshedTokens = await renewStoredOAuthTokens(
+      lockedTokens.accessToken,
+    )
     const storageResult = await saveOAuthTokensIfNeeded(refreshedTokens)
     if (!storageResult.success && !storageResult.committed) {
       throw new Error(
@@ -1251,14 +1247,21 @@ async function checkAndRefreshOAuthTokenIfNeededImpl(
     getAcosmiOAuthTokens.cache?.clear?.()
     clearKeychainCache()
     const currentTokens = await getAcosmiOAuthTokensAsync()
-    if (currentTokens && !isOAuthTokenExpired(currentTokens.expiresAt)) {
+    if (
+      currentTokens &&
+      ((lockedTokens !== null &&
+        currentTokens.accessToken !== lockedTokens.accessToken) ||
+        (!force && !isOAuthTokenExpired(currentTokens.expiresAt)))
+    ) {
       logEvent('tengu_oauth_token_refresh_race_recovered', {})
       return 'refreshed'
     }
 
     // Distinguish permanent auth failure (HTTP 400/401 = token revoked) from
     // temporary network errors. Permanent failures should not be retried.
-    const httpStatus = (error as { response?: { status?: number } })?.response?.status
+    const httpStatus =
+      (error as { response?: { status?: number } })?.response?.status ??
+      (error as { status?: number })?.status
     if (httpStatus === 400 || httpStatus === 401) {
       logEvent('tengu_oauth_token_refresh_permanent_failure', {})
       return 'permanent_failure'

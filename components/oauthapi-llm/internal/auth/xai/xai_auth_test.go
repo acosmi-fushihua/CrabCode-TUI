@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/acosmi/OAuthAPI-LLM/internal/auth/autherrors"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -324,4 +326,104 @@ func fakeJWTWithEmail(email, subject string) string {
 	header := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 	payload := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte(`{"email":"` + email + `","sub":"` + subject + `"}`))
 	return header + "." + payload + ".sig"
+}
+
+// V3 (2026-08-08 账户接入审计 §12.3): transient exchange failures retry at
+// most twice with exponential backoff; deterministic failures never retry.
+func TestPollForTokenRetriesTransientFailures(t *testing.T) {
+	var pollCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		count := atomic.AddInt32(&pollCount, 1)
+		if count == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("<html>bad gateway</html>"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "access-after-retry",
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		})
+	}))
+	defer server.Close()
+
+	started := time.Now()
+	auth := NewXAIAuth(nil)
+	tokenData, err := auth.PollForToken(context.Background(), &DeviceCodeResponse{
+		DeviceCode:    "device-abc",
+		UserCode:      "ABCD-1234",
+		ExpiresIn:     60,
+		Interval:      1,
+		TokenEndpoint: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("PollForToken() after transient failure = %v", err)
+	}
+	if tokenData.AccessToken != "access-after-retry" {
+		t.Fatalf("access token = %q", tokenData.AccessToken)
+	}
+	if got := atomic.LoadInt32(&pollCount); got != 2 {
+		t.Fatalf("poll count = %d, want 2 (one transient, one success)", got)
+	}
+	if elapsed := time.Since(started); elapsed < transientExchangeRetryBase {
+		t.Fatalf("retry backoff not observed: elapsed %v < %v", elapsed, transientExchangeRetryBase)
+	}
+}
+
+func TestPollForTokenTransientRetriesAreBounded(t *testing.T) {
+	var pollCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&pollCount, 1)
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("<html>bad gateway</html>"))
+	}))
+	defer server.Close()
+
+	auth := NewXAIAuth(nil)
+	_, err := auth.PollForToken(context.Background(), &DeviceCodeResponse{
+		DeviceCode:    "device-abc",
+		UserCode:      "ABCD-1234",
+		ExpiresIn:     60,
+		Interval:      1,
+		TokenEndpoint: server.URL,
+	})
+	if err == nil {
+		t.Fatal("expected terminal error after bounded retries")
+	}
+	if !errors.Is(err, autherrors.ErrUpstreamUnavailable) {
+		t.Fatalf("terminal error unclassified: %v", err)
+	}
+	if got := atomic.LoadInt32(&pollCount); got != int32(1+transientExchangeRetryLimit) {
+		t.Fatalf("poll count = %d, want %d (initial + bounded retries)", got, 1+transientExchangeRetryLimit)
+	}
+}
+
+func TestPollForTokenDeterministicFailureDoesNotRetry(t *testing.T) {
+	var pollCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&pollCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":             "access_denied",
+			"error_description": "The user rejected the request",
+		})
+	}))
+	defer server.Close()
+
+	auth := NewXAIAuth(nil)
+	_, err := auth.PollForToken(context.Background(), &DeviceCodeResponse{
+		DeviceCode:    "device-abc",
+		UserCode:      "ABCD-1234",
+		ExpiresIn:     60,
+		Interval:      1,
+		TokenEndpoint: server.URL,
+	})
+	if !errors.Is(err, autherrors.ErrAuthorizationDenied) {
+		t.Fatalf("denied error unclassified: %v", err)
+	}
+	if got := atomic.LoadInt32(&pollCount); got != 1 {
+		t.Fatalf("poll count = %d, want 1 (deterministic failures never retry)", got)
+	}
 }

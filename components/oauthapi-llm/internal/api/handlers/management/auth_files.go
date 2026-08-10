@@ -15,13 +15,16 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/acosmi/OAuthAPI-LLM/internal/auth/antigravity"
+	"github.com/acosmi/OAuthAPI-LLM/internal/auth/autherrors"
 	"github.com/acosmi/OAuthAPI-LLM/internal/auth/claude"
 	"github.com/acosmi/OAuthAPI-LLM/internal/auth/codex"
 	"github.com/acosmi/OAuthAPI-LLM/internal/auth/kimi"
@@ -48,6 +51,14 @@ const (
 	anthropicCallbackPort = 54545
 	codexCallbackPort     = 1455
 )
+
+// deviceFlowExpiresInFallbackSecs is the conservative device-code window the
+// facade advertises when the upstream start response omits expires_in (V4,
+// 2026-08-08 账户接入审计 §12.3 — 600s). The host validator hard-requires
+// expires_in on device flows, so omitting the key is a structural login
+// failure, not a cosmetic gap. It also caps zai: its internal wait deadline
+// is 10 minutes, so any larger upstream-derived remaining over-promises.
+const deviceFlowExpiresInFallbackSecs = 600
 
 type callbackForwarder struct {
 	provider string
@@ -136,6 +147,38 @@ func isWebUIRequest(c *gin.Context) bool {
 	}
 }
 
+// callbackForwarderStartErrorCode makes a fixed-port bind conflict
+// distinguishable on the wire (F1: "callback_port_busy"). 1455/54545 are
+// provider-registered redirect URIs, so another CLI login (Codex/Claude)
+// legitimately holds them — the user remedy differs entirely from a generic
+// server failure. Everything else keeps the historical opaque message.
+func callbackForwarderStartErrorCode(err error) string {
+	if isAddrInUse(err) {
+		return "callback_port_busy"
+	}
+	return "failed to start callback server"
+}
+
+// isAddrInUse detects a bind conflict cross-platform. errors.Is against
+// syscall.EADDRINUSE covers POSIX; on Windows the wrapped errno is
+// WSAEADDRINUSE (10048), which Go's syscall.EADDRINUSE does NOT match —
+// proven by the double-bind case in
+// TestCallbackForwarderStartErrorCodeDistinguishesPortBusy on this repo's
+// Windows gate, so the literal stays until the test says otherwise.
+func isAddrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	var errno syscall.Errno
+	return errors.As(err, &errno) && errno == 10048
+}
+
 func startCallbackForwarder(port int, provider, targetBase string) (*callbackForwarder, error) {
 	callbackForwardersMu.Lock()
 	prev := callbackForwarders[port]
@@ -174,12 +217,7 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
 	}
 	done := make(chan struct{})
 
-	go func() {
-		if errServe := srv.Serve(ln); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
-			log.WithError(errServe).Warnf("callback forwarder for %s stopped unexpectedly", provider)
-		}
-		close(done)
-	}()
+	go runCallbackForwarder(provider, done, func() error { return srv.Serve(ln) })
 
 	forwarder := &callbackForwarder{
 		provider: provider,
@@ -194,6 +232,16 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
 	log.Infof("callback forwarder for %s listening on %s", provider, addr)
 
 	return forwarder, nil
+}
+
+func runCallbackForwarder(provider string, done chan struct{}, serve func() error) {
+	// `done` is the shutdown join point. It must close on every return path,
+	// including a panic recovered by the following defer.
+	defer close(done)
+	defer recoverOAuthGoroutine("callback forwarder (" + provider + ")")
+	if errServe := serve(); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
+		log.WithError(errServe).Warnf("callback forwarder for %s stopped unexpectedly", provider)
+	}
 }
 
 func stopCallbackForwarderInstance(port int, forwarder *callbackForwarder) {
@@ -230,7 +278,18 @@ func stopForwarderInstance(port int, forwarder *callbackForwarder) {
 }
 
 func (h *Handler) managementCallbackURL(path string) (string, error) {
-	if h == nil || h.cfg == nil || h.cfg.Port <= 0 {
+	if h == nil || h.cfg == nil {
+		return "", fmt.Errorf("server port is not configured")
+	}
+	// F1: account-bridge mode pins cfg.Port to 0 (dynamic assignment contract)
+	// — the real port arrives via SetRuntimeListenPort after bind. Before this
+	// fallback existed, every browser-flow login start in bridge mode was a
+	// structural 500 ("callback server unavailable").
+	port := h.cfg.Port
+	if port <= 0 {
+		port = int(h.runtimeListenPort.Load())
+	}
+	if port <= 0 || port > 65535 {
 		return "", fmt.Errorf("server port is not configured")
 	}
 	if !strings.HasPrefix(path, "/") {
@@ -240,7 +299,7 @@ func (h *Handler) managementCallbackURL(path string) (string, error) {
 	if h.cfg.TLS.Enable {
 		scheme = "https"
 	}
-	return fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, h.cfg.Port, path), nil
+	return fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, port, path), nil
 }
 
 func pluginAuthProviderFromPath(path string) (string, bool) {
@@ -1958,12 +2017,13 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(anthropicCallbackPort, "anthropic", targetURL); errStart != nil {
 			log.WithError(errStart).Error("failed to start anthropic callback forwarder")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": callbackForwarderStartErrorCode(errStart)})
 			return
 		}
 	}
 
 	go func() {
+		defer recoverOAuthWaiterGoroutine("anthropic oauth waiter", state, "anthropic")
 		if isWebUI {
 			defer stopCallbackForwarderInstance(anthropicCallbackPort, forwarder)
 		}
@@ -1977,7 +2037,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 					return nil, errOAuthSessionNotPending
 				}
 				if time.Now().After(deadline) {
-					SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
+					SetOAuthSessionErrorCoded(state, OAuthSessionErrLoginTimeout, "Timeout waiting for OAuth callback")
 					return nil, fmt.Errorf("timeout waiting for OAuth callback")
 				}
 				data, errRead := os.ReadFile(path)
@@ -2005,13 +2065,13 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		if errStr := resultMap["error"]; errStr != "" {
 			oauthErr := claude.NewOAuthError(errStr, "", http.StatusBadRequest)
 			log.Error(claude.GetUserFriendlyMessage(oauthErr))
-			SetOAuthSessionError(state, "Bad request")
+			SetOAuthSessionErrorCoded(state, OAuthSessionErrAuthorizationDenied, "Bad request")
 			return
 		}
 		if resultMap["state"] != state {
 			authErr := claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, resultMap["state"]))
 			log.Error(claude.GetUserFriendlyMessage(authErr))
-			SetOAuthSessionError(state, "State code error")
+			SetOAuthSessionErrorCoded(state, OAuthSessionErrStateMismatch, "State code error")
 			return
 		}
 
@@ -2024,7 +2084,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		if errExchange != nil {
 			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
-			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			SetOAuthSessionErrorCoded(state, OAuthSessionErrTokenExchangeFailed, "Failed to exchange authorization code for tokens")
 			return
 		}
 
@@ -2111,12 +2171,13 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(codexCallbackPort, "codex", targetURL); errStart != nil {
 			log.WithError(errStart).Error("failed to start codex callback forwarder")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": callbackForwarderStartErrorCode(errStart)})
 			return
 		}
 	}
 
 	go func() {
+		defer recoverOAuthWaiterGoroutine("codex oauth waiter", state, "codex")
 		if isWebUI {
 			defer stopCallbackForwarderInstance(codexCallbackPort, forwarder)
 		}
@@ -2132,7 +2193,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			if time.Now().After(deadline) {
 				authErr := codex.NewAuthenticationError(codex.ErrCallbackTimeout, fmt.Errorf("timeout waiting for OAuth callback"))
 				log.Error(codex.GetUserFriendlyMessage(authErr))
-				SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
+				SetOAuthSessionErrorCoded(state, OAuthSessionErrLoginTimeout, "Timeout waiting for OAuth callback")
 				return
 			}
 			if data, errR := os.ReadFile(waitFile); errR == nil {
@@ -2142,12 +2203,12 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				if errStr := m["error"]; errStr != "" {
 					oauthErr := codex.NewOAuthError(errStr, "", http.StatusBadRequest)
 					log.Error(codex.GetUserFriendlyMessage(oauthErr))
-					SetOAuthSessionError(state, "Bad Request")
+					SetOAuthSessionErrorCoded(state, OAuthSessionErrAuthorizationDenied, "Bad Request")
 					return
 				}
 				if m["state"] != state {
 					authErr := codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, m["state"]))
-					SetOAuthSessionError(state, "State code error")
+					SetOAuthSessionErrorCoded(state, OAuthSessionErrStateMismatch, "State code error")
 					log.Error(codex.GetUserFriendlyMessage(authErr))
 					return
 				}
@@ -2162,7 +2223,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
+			SetOAuthSessionErrorCoded(state, OAuthSessionErrTokenExchangeFailed, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
 			return
 		}
@@ -2256,6 +2317,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	}
 
 	go func() {
+		defer recoverOAuthWaiterGoroutine("antigravity oauth waiter", state, "antigravity")
 		if isWebUI {
 			defer stopCallbackForwarderInstance(antigravity.CallbackPort, forwarder)
 		}
@@ -2414,6 +2476,7 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 	RegisterOAuthSession(state, "xai")
 
 	go func() {
+		defer recoverOAuthWaiterGoroutine("xai oauth waiter", state, "xai")
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
 		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "xai")
@@ -2425,7 +2488,7 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 				return
 			}
 			log.Errorf("xAI authentication failed: %v", errWaitForAuthorization)
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
+			SetOAuthSessionErrorCoded(state, oauthWaitErrorCode(errWaitForAuthorization), oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
 			return
 		}
 		if !IsOAuthSessionPending(state, "xai") {
@@ -2435,7 +2498,7 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 		tokenStorage := authSvc.CreateTokenStorage(bundle)
 		if tokenStorage == nil || strings.TrimSpace(tokenStorage.AccessToken) == "" {
 			log.Error("xAI token exchange returned empty access token")
-			SetOAuthSessionError(state, "Failed to exchange token")
+			SetOAuthSessionErrorCoded(state, OAuthSessionErrTokenExchangeFailed, "Failed to exchange token")
 			return
 		}
 
@@ -2535,6 +2598,7 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 	RegisterOAuthSession(state, "kimi")
 
 	go func() {
+		defer recoverOAuthWaiterGoroutine("kimi oauth waiter", state, "kimi")
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
 		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "kimi")
@@ -2545,7 +2609,7 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 			if !IsOAuthSessionPending(state, "kimi") {
 				return
 			}
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
+			SetOAuthSessionErrorCoded(state, oauthWaitErrorCode(errWaitForAuthorization), oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
 			fmt.Printf("Authentication failed: %v\n", errWaitForAuthorization)
 			return
 		}
@@ -2608,6 +2672,8 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 	}
 	if deviceFlow.ExpiresIn > 0 {
 		response["expires_in"] = deviceFlow.ExpiresIn
+	} else {
+		response["expires_in"] = deviceFlowExpiresInFallbackSecs
 	}
 	c.JSON(200, response)
 }
@@ -2638,6 +2704,7 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 	RegisterOAuthSession(state, "qwen")
 
 	go func() {
+		defer recoverOAuthWaiterGoroutine("qwen oauth waiter", state, "qwen")
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
 		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "qwen")
@@ -2648,7 +2715,7 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 			if !IsOAuthSessionPending(state, "qwen") {
 				return
 			}
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
+			SetOAuthSessionErrorCoded(state, oauthWaitErrorCode(errWaitForAuthorization), oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
 			fmt.Printf("Authentication failed: %v\n", errWaitForAuthorization)
 			return
 		}
@@ -2717,6 +2784,8 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 	}
 	if deviceFlow.ExpiresIn > 0 {
 		response["expires_in"] = deviceFlow.ExpiresIn
+	} else {
+		response["expires_in"] = deviceFlowExpiresInFallbackSecs
 	}
 	c.JSON(200, response)
 }
@@ -2743,6 +2812,7 @@ func (h *Handler) RequestZaiToken(c *gin.Context) {
 	RegisterOAuthSession(state, "zai")
 
 	go func() {
+		defer recoverOAuthWaiterGoroutine("zai oauth waiter", state, "zai")
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
 		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "zai")
@@ -2754,7 +2824,7 @@ func (h *Handler) RequestZaiToken(c *gin.Context) {
 				return
 			}
 			log.Errorf("Z.AI authentication failed: %v", errWaitForAuthorization)
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
+			SetOAuthSessionErrorCoded(state, oauthWaitErrorCode(errWaitForAuthorization), oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
 			return
 		}
 		if !IsOAuthSessionPending(state, "zai") {
@@ -2768,7 +2838,7 @@ func (h *Handler) RequestZaiToken(c *gin.Context) {
 				return
 			}
 			log.Errorf("Z.AI API key provisioning failed: %v", errMint)
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to provision coding-plan API key", errMint))
+			SetOAuthSessionErrorCoded(state, OAuthSessionErrProvisioningFailed, oauthSessionErrorWithCause("Failed to provision coding-plan API key", errMint))
 			return
 		}
 
@@ -2832,16 +2902,72 @@ func (h *Handler) RequestZaiToken(c *gin.Context) {
 	}()
 
 	response := gin.H{"status": "ok", "url": initResp.AuthorizeURL, "state": state, "flow": "device"}
+	expiresIn := deviceFlowExpiresInFallbackSecs
 	if initResp.ExpiresAt > 0 {
-		if remaining := int(time.Until(time.Unix(initResp.ExpiresAt, 0)) / time.Second); remaining > 0 {
-			response["expires_in"] = remaining
+		if remaining := int(time.Until(time.Unix(initResp.ExpiresAt, 0)) / time.Second); remaining > 0 && remaining < expiresIn {
+			expiresIn = remaining
 		}
 	}
+	response["expires_in"] = expiresIn
 	c.JSON(200, response)
+}
+
+// oauthWaitErrorCode maps a device-flow WaitForAuthorization failure onto the
+// bounded poll errorCode enum via the autherrors sentinels (V2). Unclassified
+// errors return "" and degrade to the residual "login_failed" at the facade.
+func oauthWaitErrorCode(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, autherrors.ErrAuthorizationDenied):
+		return OAuthSessionErrAuthorizationDenied
+	case errors.Is(err, autherrors.ErrAuthorizationTimeout):
+		return OAuthSessionErrLoginTimeout
+	case errors.Is(err, autherrors.ErrUpstreamUnavailable):
+		return OAuthSessionErrUpstreamUnavailable
+	default:
+		return ""
+	}
+}
+
+// recoverOAuthGoroutine is the generic panic boundary for background workers
+// that do not own an OAuth session. Waiters use recoverOAuthWaiterGoroutine so
+// their panic also publishes a terminal result. Panics are logged locally and
+// never take down the direct-TUI sidecar.
+func recoverOAuthGoroutine(scope string) {
+	// recover() only works in the body of the function the runtime defers —
+	// every recovery entry point calls it directly instead of sharing a helper
+	// frame.
+	if recovered := recover(); recovered != nil {
+		reportOAuthGoroutinePanic(scope, recovered)
+	}
+}
+
+// recoverOAuthWaiterGoroutine turns a waiter panic into the bounded
+// login_failed terminal state before the goroutine disappears. It must call
+// recover directly: wrapping recoverOAuthGoroutine would lose the panic frame.
+func recoverOAuthWaiterGoroutine(scope, state, provider string) {
+	if recovered := recover(); recovered != nil {
+		reportOAuthGoroutinePanic(scope, recovered)
+		oauthSessions.FailPanickedWaiter(state, provider)
+	}
+}
+
+// RecoverAccountBridgeGoroutine exposes the same guard to sibling packages
+// (internal/api quota fan-out workers).
+func RecoverAccountBridgeGoroutine(scope string) {
+	if recovered := recover(); recovered != nil {
+		reportOAuthGoroutinePanic(scope, recovered)
+	}
+}
+
+func reportOAuthGoroutinePanic(scope string, recovered any) {
+	log.Errorf("account bridge %s panicked: %v\n%s", scope, recovered, string(debug.Stack()))
 }
 
 // watchOAuthSessionCancel cancels pollCtx once the OAuth session is no longer pending.
 func watchOAuthSessionCancel(pollCtx context.Context, cancel context.CancelFunc, state, provider string) {
+	defer recoverOAuthGoroutine("cancel watcher (" + provider + ")")
 	if cancel == nil {
 		return
 	}
@@ -2957,7 +3083,7 @@ func (h *Handler) AdvancePluginOAuthSession(c *gin.Context, state string) {
 		if message == "" {
 			message = "Authentication failed"
 		}
-		SetOAuthSessionError(state, message)
+		SetOAuthSessionErrorCoded(state, OAuthSessionErrUpstreamUnavailable, message)
 		return
 	}
 	switch resp.Status {
@@ -2968,11 +3094,11 @@ func (h *Handler) AdvancePluginOAuthSession(c *gin.Context, state string) {
 		if message == "" {
 			message = "Authentication failed"
 		}
-		SetOAuthSessionError(state, message)
+		SetOAuthSessionErrorCoded(state, OAuthSessionErrAuthorizationDenied, message)
 	case pluginapi.AuthLoginStatusSuccess:
 		records := pluginLoginPollAuths(host, resp)
 		if len(records) == 0 {
-			SetOAuthSessionError(state, "Authentication failed")
+			SetOAuthSessionErrorCoded(state, OAuthSessionErrStateMismatch, "Authentication failed")
 			return
 		}
 		if !promotePluginOAuthSessionPollToSave(state, provider) {

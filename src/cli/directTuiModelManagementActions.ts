@@ -488,7 +488,14 @@ export const directTuiModelManagementResultSchema = z.discriminatedUnion(
     z
       .object({
         kind: z.literal('model.account.login_poll'),
-        state: z.enum(['pending', 'succeeded', 'failed', 'cancelled', 'expired']),
+        state: z.enum([
+          'pending',
+          'succeeded',
+          'failed',
+          'cancelled',
+          'expired',
+          'session-lost',
+        ]),
         accountId: z.string().max(512).nullable(),
         errorCode: z.string().max(512).nullable(),
       })

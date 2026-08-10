@@ -28,6 +28,7 @@ import { mkdtemp } from 'node:fs/promises'
 import { access } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import * as path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { localExecBridge } from 'src/runtime/localProcess.js'
 import { getCrabCodeConfigHomeDir } from '../envUtils.js'
 
@@ -229,8 +230,9 @@ export async function convertOfficeToPdf(
 
   const outDir = await makeOutDir()
   const profileDir = path.join(outDir, '.profile')
-  // LibreOffice wants a file:// URL for -env:UserInstallation.
-  const profileUrl = `file://${profileDir}`
+  // LibreOffice requires a canonical file URL; string concatenation produces
+  // an invalid drive-letter URL on Windows.
+  const profileUrl = pathToFileURL(profileDir).href
 
   // 根因 B（liveness）— execa 的 `timeout` 在 Windows 下形同虚设：soffice.exe 启动后
   // 再 spawn soffice.bin 孙进程并继承 stdout/stderr 管道；execa 超时只对直接子进程发
