@@ -24,7 +24,7 @@
 //! adapted file closes only the renderer-owned transcript lifecycle and must
 //! not be counted as a full line-for-line port of the upstream AgentView.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,7 +66,6 @@ use ratatui::Frame;
 use ratatui::backend::Backend;
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
@@ -77,12 +76,13 @@ use crate::scrollback_projection::{
     RendererNoticePlacement, RendererNoticeProjection, SynchronizationOptions,
     direct_api_error_retry_attempt,
 };
-use crate::sdk_projection::DirectProgressPresentation;
+use crate::sdk_projection::{DirectProgressPresentation, ProjectedItem, ProjectedKind};
+use crate::task_panel::TaskPanelSnapshot;
 use crate::text_safety::sanitize_bounded_terminal_text;
 use crate::tui_app::{TuiApp, TuiRendererNoticePlacement, UiLanguage, projected_item_is_visible};
 use crate::tui_links::{LinkTarget, MermaidAffordanceAction};
 use crate::tui_render::CrabCodeTheme;
-use crate::tui_ui::{CrabWordmarkLayout, TranscriptRenderOutcome, crab_wordmark_lines};
+use crate::tui_ui::{TranscriptRenderOutcome, empty_transcript_welcome_lines};
 
 /// Fixed-source multi-click window for word/line selection.
 const MULTI_CLICK_TIMEOUT: Duration = Duration::from_millis(300);
@@ -300,6 +300,116 @@ pub(crate) struct AgentView {
     last_delta: ProjectionScrollbackDelta,
 }
 
+/// Find renderer rows that are safely superseded by the task card.
+///
+/// A task call remains visible until its latest result is both structurally
+/// accepted and applied to the current card snapshot. A later failed result
+/// therefore restores the whole lifecycle in ordinary presentation, while
+/// verbose mode bypasses compaction entirely. The returned stable keys are
+/// renderer-local; the authoritative projection remains untouched.
+fn confirmed_task_history_compaction_keys(
+    items: &[ProjectedItem],
+    snapshot: Option<&TaskPanelSnapshot>,
+    degraded: bool,
+    presentation_verbose: bool,
+) -> HashSet<String> {
+    if presentation_verbose || degraded {
+        return HashSet::new();
+    }
+    let Some(snapshot) = snapshot else {
+        return HashSet::new();
+    };
+
+    let task_tool_use_ids = items
+        .iter()
+        .filter_map(|item| {
+            (item.kind == ProjectedKind::ToolUse
+                && item
+                    .presentation
+                    .tool
+                    .as_ref()
+                    .and_then(|tool| tool.name.as_deref())
+                    .is_some_and(|name| matches!(name, "TaskCreate" | "TaskUpdate")))
+            .then(|| item.tool_use_id.as_deref())
+            .flatten()
+        })
+        .collect::<HashSet<_>>();
+
+    // Results can be replayed with the same tool_use_id. Only the most recent
+    // terminal result may authorize compaction; an earlier success must never
+    // hide a later failure or compatibility fallback.
+    let mut latest_results = HashMap::<&str, (u64, usize)>::new();
+    for (index, item) in items.iter().enumerate() {
+        if item.kind != ProjectedKind::ToolResult {
+            continue;
+        }
+        let Some(tool_use_id) = item.tool_use_id.as_deref() else {
+            continue;
+        };
+        if !task_tool_use_ids.contains(tool_use_id) {
+            continue;
+        }
+        let sequence = item.raw_sequences.iter().copied().max().unwrap_or_default();
+        let replace = match latest_results.get(tool_use_id) {
+            Some((previous_sequence, previous_index)) => {
+                sequence > *previous_sequence
+                    || (sequence == *previous_sequence && index > *previous_index)
+            }
+            None => true,
+        };
+        if replace {
+            latest_results.insert(tool_use_id, (sequence, index));
+        }
+    }
+
+    let confirmed_tool_use_ids = latest_results
+        .iter()
+        .filter_map(|(tool_use_id, (_, index))| {
+            snapshot
+                .mutation_result_succeeded(&items[*index].key)
+                .then_some(*tool_use_id)
+        })
+        .collect::<HashSet<_>>();
+    if confirmed_tool_use_ids.is_empty() {
+        return HashSet::new();
+    }
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let tool_use_id = item.tool_use_id.as_deref()?;
+            if !confirmed_tool_use_ids.contains(tool_use_id) {
+                return None;
+            }
+            match item.kind {
+                ProjectedKind::ToolUse
+                    if item
+                        .presentation
+                        .tool
+                        .as_ref()
+                        .and_then(|tool| tool.name.as_deref())
+                        .is_some_and(|name| matches!(name, "TaskCreate" | "TaskUpdate")) =>
+                {
+                    Some(item.key.clone())
+                }
+                ProjectedKind::ToolResult if snapshot.mutation_result_succeeded(&item.key) => {
+                    Some(item.key.clone())
+                }
+                ProjectedKind::User
+                | ProjectedKind::Assistant
+                | ProjectedKind::Thinking
+                | ProjectedKind::ToolUse
+                | ProjectedKind::ToolResult
+                | ProjectedKind::TerminalOutput
+                | ProjectedKind::System
+                | ProjectedKind::Progress
+                | ProjectedKind::Warning
+                | ProjectedKind::Error => None,
+            }
+        })
+        .collect()
+}
+
 impl Default for AgentView {
     fn default() -> Self {
         Self::new()
@@ -385,7 +495,21 @@ impl AgentView {
     pub(crate) fn prepare(&mut self, app: &mut TuiApp) -> Result<(), ProjectionScrollbackError> {
         let presentation_verbose = app.presentation_verbose();
         let agent_transcript_mode = app.direct_agent_transcript_mode();
+        let session_id = app.projection.session_id().map(str::to_string);
+        let task_panel_state = app.task_panel_projection_state();
         let projected_items = app.projection.items();
+        let compacted_task_history_keys = confirmed_task_history_compaction_keys(
+            projected_items,
+            task_panel_state.snapshot.as_deref(),
+            task_panel_state.degraded,
+            presentation_verbose,
+        );
+        let mut lifecycle_delta = if compacted_task_history_keys.is_empty() {
+            ProjectionScrollbackDelta::default()
+        } else {
+            self.projection
+                .retire_rendered_keys(&mut self.scrollback, &compacted_task_history_keys)?
+        };
         let visible_items = projected_items
             .iter()
             .enumerate()
@@ -403,7 +527,8 @@ impl AgentView {
                 // after the outer Agent/Skill envelope has participated in
                 // last-three grouping. Retain every typed nested item here;
                 // the adapter performs that inner visibility decision.
-                nested_message || projected_item_is_visible(item, presentation_verbose)
+                (nested_message || projected_item_is_visible(item, presentation_verbose))
+                    && !compacted_task_history_keys.contains(&item.key)
             })
             .map(|(_, item)| item)
             .cloned()
@@ -432,14 +557,13 @@ impl AgentView {
                 .collect::<Vec<_>>()
         };
         let item_removals = app.projection.item_removals().to_vec();
-        let session_id = app.projection.session_id().map(str::to_string);
         let stream_activity = app.projection.direct_stream_activity().clone();
         let latest_sequence = app
             .projection
             .raw_envelopes()
             .last()
             .map_or(0, |envelope| envelope.sequence);
-        self.last_delta = self.projection.advance_lifecycle_with_options_and_notices(
+        lifecycle_delta += self.projection.advance_lifecycle_with_options_and_notices(
             &mut self.scrollback,
             &visible_items,
             &renderer_notices,
@@ -451,6 +575,7 @@ impl AgentView {
             stream_activity.request_started_sequence,
             latest_sequence,
         )?;
+        self.last_delta = lifecycle_delta;
         let language = renderer_language(language);
         if self.scrollback.appearance().language != language {
             let mut appearance = self.scrollback.appearance().clone();
@@ -2398,34 +2523,9 @@ impl AgentView {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let mut lines = Vec::new();
-        if !app.minimal_mode()
-            && usize::from(area.width) >= crate::tui_ui::CRAB_WORDMARK_STACKED_WIDTH
-        {
-            lines.extend(crab_wordmark_lines(
-                CrabWordmarkLayout::Stacked,
-                app.renderer_theme_kind(),
-            ));
-            lines.push(Line::default());
-        }
-        lines.extend([
-            Line::styled(
-                app.ui_language()
-                    .text("CrabCode 已就绪。", "CrabCode is ready."),
-                Style::default()
-                    .fg(theme.text_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::styled(
-                app.ui_language().text(
-                    "请在下方输入提示词。使用 /help 查看 TUI 操作说明。",
-                    "Type a prompt below. /help shows TUI controls.",
-                ),
-                Style::default().fg(theme.gray),
-            ),
-        ]);
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(theme.bg_base)),
+            Paragraph::new(empty_transcript_welcome_lines(app, area.width, theme))
+                .style(Style::default().bg(theme.bg_base)),
             area,
         );
     }

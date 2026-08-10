@@ -392,6 +392,21 @@ impl ContextVisualization {
         &self.model
     }
 
+    /// Tokens currently occupying the active model context.
+    pub const fn total_tokens(&self) -> u64 {
+        self.total_tokens
+    }
+
+    /// Runtime-reported hard context-window size before presentation reserves.
+    pub const fn raw_max_tokens(&self) -> u64 {
+        self.raw_max_tokens
+    }
+
+    /// Runtime-computed percentage of the context window currently in use.
+    pub const fn percentage(&self) -> u64 {
+        self.percentage
+    }
+
     fn legend_lines(
         &self,
         theme: CrabCodeTheme,

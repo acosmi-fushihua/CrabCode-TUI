@@ -1,5 +1,12 @@
 export const MEMORY_SEARCH_TOOL_NAME = 'MemorySearch'
 
+/**
+ * Kept next to explicit MemorySearch results so a historical environment or
+ * capability observation cannot silently override the current executable.
+ */
+export const MEMORY_SEARCH_DRIFT_REMINDER =
+  '<system-reminder>Memory search results are historical snapshots, not live capability or environment state. Verify current tool availability, network access, configuration, and code behavior against the current runtime before reporting them as facts. If a live observation conflicts, trust the live observation and treat the memory as stale.</system-reminder>'
+
 export const DESCRIPTION = `Search your long-term memory, the user's personal knowledge base, and evolution artifacts for context relevant to the current task.
 
 Searchable content spans three scopes (W-MEMORY-LIFECYCLE K4/K9):

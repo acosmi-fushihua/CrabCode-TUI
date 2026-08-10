@@ -3281,7 +3281,15 @@ impl Projection {
                 let title = match subtype {
                     SystemSubtype::TaskStarted => "Task started",
                     SystemSubtype::TaskProgress => "Task progress",
-                    _ => "Task completed",
+                    SystemSubtype::TaskNotification => {
+                        match value.get("status").and_then(serde_json::Value::as_str) {
+                            Some("completed") => "Task completed",
+                            Some("failed") => "Task failed",
+                            Some("stopped") => "Task stopped",
+                            _ => unreachable!("task_notification status was validated above"),
+                        }
+                    }
+                    _ => unreachable!("the outer match restricts task subtypes"),
                 };
                 let text = join_present(
                     value,
@@ -5191,20 +5199,27 @@ impl Projection {
             }
             _ => None,
         };
-        let text = if progress.is_none() {
-            "Running…".to_string()
-        } else if let Some(percentage) = percentage {
-            progress_message.as_ref().map_or_else(
-                || format!("{percentage}%"),
-                |message| format!("{message}\n{percentage}%"),
-            )
-        } else {
-            progress_message.clone().unwrap_or_else(|| {
+        let text = match status.as_str() {
+            "completed" => progress_message
+                .clone()
+                .unwrap_or_else(|| "Completed".to_string()),
+            "failed" => progress_message
+                .clone()
+                .unwrap_or_else(|| "Failed".to_string()),
+            _ if progress.is_none() => "Running…".to_string(),
+            _ if percentage.is_some() => {
+                let percentage = percentage.expect("the branch established percentage");
+                progress_message.as_ref().map_or_else(
+                    || format!("{percentage}%"),
+                    |message| format!("{message}\n{percentage}%"),
+                )
+            }
+            _ => progress_message.clone().unwrap_or_else(|| {
                 format!(
                     "Processing… {}",
                     progress.as_ref().expect("the branch established progress")
                 )
-            })
+            }),
         };
         self.upsert_stream_item_with_presentation(
             format!("direct-mcp-progress:{parent_tool_use_id}"),
@@ -12034,6 +12049,41 @@ mod tests {
                 && progress_message.as_deref() == Some("Reading")
         ));
 
+        for (status, expected_text) in [("completed", "Completed"), ("failed", "Failed")] {
+            let mut terminal = Projection::default();
+            assert_eq!(
+                terminal.ingest(raw(
+                    0,
+                    json!({
+                        "type":"progress",
+                        "data":{
+                            "type":"mcp_progress",
+                            "status":status,
+                            "serverName":"filesystem",
+                            "toolName":"read_file",
+                            "elapsedTimeMs":250
+                        },
+                        "toolUseID":format!("mcp-{status}-progress"),
+                        "parentToolUseID":format!("mcp-{status}-tool"),
+                        "uuid":format!("mcp-{status}"),
+                        "timestamp":"2026-07-27T00:00:00.000Z"
+                    })
+                )),
+                ProjectionEffect::None
+            );
+            assert_eq!(terminal.items()[0].text, expected_text, "status: {status}");
+            assert!(matches!(
+                terminal.items()[0].presentation.direct_progress.as_ref(),
+                Some(DirectProgressPresentation::Mcp {
+                    status: projected_status,
+                    progress: None,
+                    total: None,
+                    progress_message: None,
+                    ..
+                }) if projected_status == status
+            ));
+        }
+
         let mut search = Projection::default();
         for (sequence, data) in [
             json!({"type":"query_update","query":"rust tui"}),
@@ -15002,6 +15052,40 @@ mod tests {
                 .pointer("/structured_output/ok"),
             Some(&Value::Bool(true))
         );
+    }
+
+    #[test]
+    fn task_notification_title_matches_terminal_status() {
+        for (sequence, (status, expected_title)) in [
+            ("completed", "Task completed"),
+            ("failed", "Task failed"),
+            ("stopped", "Task stopped"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut projection = Projection::default();
+            assert_eq!(
+                projection.ingest(raw(
+                    sequence as u64,
+                    json!({
+                        "type":"system",
+                        "subtype":"task_notification",
+                        "task_id":format!("task-{status}"),
+                        "status":status,
+                        "output_file":format!("/tmp/task-{status}"),
+                        "summary":format!("task {status}"),
+                        "uuid":format!("notification-{status}"),
+                        "session_id":"s"
+                    })
+                )),
+                ProjectionEffect::None
+            );
+            let item = projection.items().first().expect("task notification row");
+            assert_eq!(item.title, expected_title, "status: {status}");
+            assert!(item.text.lines().any(|line| line == status));
+            assert!(!item.streaming);
+        }
     }
 
     #[test]

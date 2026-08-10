@@ -2610,6 +2610,7 @@ fn expected_result_kind(purpose: &PrivateRuntimePurpose) -> Option<&'static str>
         PrivateRuntimePurpose::ModelAccountLoginCancel => "model.account.login_cancel",
         PrivateRuntimePurpose::ModelAccountRemove => "model.account.remove",
         PrivateRuntimePurpose::HealthSnapshot
+        | PrivateRuntimePurpose::BugReportSubmit
         | PrivateRuntimePurpose::RetainedIdentitySnapshot
         | PrivateRuntimePurpose::RetainedColorApply
         | PrivateRuntimePurpose::RetainedRenameApply

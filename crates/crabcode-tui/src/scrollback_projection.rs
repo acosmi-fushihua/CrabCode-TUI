@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 
 use crabcode_pager_render::diff::diff_hunks_from_strings;
 use crabcode_pager_render::scrollback::blocks::tool::{
-    ExecuteToolCallBlock, ListDirToolCallBlock, OtherToolCallBlock, ReadToolCallBlock,
+    DiscoveredTool, EditToolCallBlock, ExecuteToolCallBlock, IntegrationSearchToolCallBlock,
+    ListDirToolCallBlock, MemorySearchToolCallBlock, OtherToolCallBlock, ReadToolCallBlock,
     SearchInputMeta, SearchOutputMode, SearchToolCallBlock, ToolCallBlock, UseToolCallBlock,
-    WebFetchToolCallBlock, WebSearchToolCallBlock,
+    WebFetchToolCallBlock, WebSearchResult, WebSearchToolCallBlock, parse_memory_results,
 };
 use crabcode_pager_render::scrollback::blocks::{
     CrabCodeAdvisorBlock, CrabCodeAdvisorInvocationState, CrabCodeDiagnostic,
@@ -25,6 +26,7 @@ use crabcode_pager_render::scrollback::blocks::{
     WorkflowBlock, WorkflowBlockPhase, WorkflowBlockStatus,
 };
 use crabcode_pager_render::scrollback::{EntryId, RenderBlock, ScrollbackEntry, ScrollbackState};
+use crabcode_pager_render::text_safety::sanitize_bounded_terminal_text;
 use thiserror::Error;
 
 use crate::sdk_projection::{
@@ -70,10 +72,18 @@ pub(crate) struct RendererNoticeProjection {
 #[derive(Debug)]
 enum PreparedRenderBlock {
     Render(RenderBlock),
-    SkipToolResult { diagnostic: String },
+    RenderWithDiagnostic {
+        block: RenderBlock,
+        diagnostic: String,
+    },
 }
 
 const DIRECT_NESTED_LIVE_MESSAGE_LIMIT: usize = 3;
+const MAX_STRUCTURED_MEMORY_SEARCH_RESULTS: usize = 64;
+const MAX_STRUCTURED_INTEGRATION_SEARCH_RESULTS: usize = 64;
+const MAX_STRUCTURED_WEB_SEARCH_RESULTS: usize = 64;
+const MAX_WEB_SEARCH_CITATIONS: usize = 64;
+const MAX_WEB_SEARCH_COMMENTARY_BYTES: usize = 64 * 1024;
 const NO_CONTENT_MESSAGE: &str = "(no content)";
 const LOCAL_COMMAND_CAVEAT_TAG: &str = "local-command-caveat";
 const TICK_TAG: &str = "tick";
@@ -315,6 +325,48 @@ impl ProjectionScrollbackAdapter {
             turn_running,
             request_started_sequence,
         );
+        Ok(delta)
+    }
+
+    /// Retire renderer-owned entries without mutating the authoritative SDK
+    /// projection or consuming its monotonic item-removal stream.
+    ///
+    /// This is deliberately narrower than snapshot synchronization: callers
+    /// must also omit the same keys from their next lifecycle input or the
+    /// entries will be materialized again. It exists for renderer-local
+    /// deduplication where another visible surface already owns the successful
+    /// semantic result while verbose/audit presentation can later re-add the
+    /// untouched projected items.
+    pub(crate) fn retire_rendered_keys(
+        &mut self,
+        state: &mut ScrollbackState,
+        keys: &HashSet<String>,
+    ) -> Result<ProjectionScrollbackDelta, ProjectionScrollbackError> {
+        self.validate_lifecycle_ownership(state)?;
+        let selected_before = state.selected();
+        let selected_id =
+            selected_before.and_then(|index| state.entry(index).map(|entry| entry.id));
+        let mut delta = ProjectionScrollbackDelta::default();
+        for key in keys {
+            let Some(tracked) = self.tracked.remove(key) else {
+                continue;
+            };
+            if state.remove_entry(tracked.entry_id) {
+                delta.removed = delta.removed.saturating_add(1);
+            }
+            self.order.retain(|ordered| ordered != key);
+            self.entry_order.retain(|id| *id != tracked.entry_id);
+        }
+        if let Some(selected_before) = selected_before {
+            if let Some(index) = selected_id.and_then(|id| state.index_of_id(id)) {
+                state.set_selected(Some(index));
+            } else if !state.is_empty() {
+                state.set_selected(Some(selected_before.min(state.len() - 1)));
+            } else {
+                state.set_selected(None);
+            }
+        }
+        self.validate_lifecycle_ownership(state)?;
         Ok(delta)
     }
 
@@ -1315,19 +1367,7 @@ fn prepare_transcript(
                     )
                 {
                     let (source, inner) = prepare_direct_nested_inner(item)?;
-                    match inner {
-                        PreparedRenderBlock::Render(inner) => {
-                            push_prepared_render(
-                                &mut prepared,
-                                &mut prepared_keys,
-                                source,
-                                PreparedRenderBlock::Render(inner),
-                            )?;
-                        }
-                        PreparedRenderBlock::SkipToolResult { diagnostic } => {
-                            prepared.diagnostics.push(diagnostic);
-                        }
-                    }
+                    push_prepared_render(&mut prepared, &mut prepared_keys, source, inner)?;
                 }
             }
             DirectNestedFamilyKind::Skill => {
@@ -1364,17 +1404,7 @@ fn prepare_transcript(
                             continue;
                         }
                         let (source, inner) = prepare_direct_nested_inner(group_item)?;
-                        match inner {
-                            PreparedRenderBlock::Render(inner) => push_prepared_render(
-                                &mut prepared,
-                                &mut prepared_keys,
-                                source,
-                                PreparedRenderBlock::Render(inner),
-                            )?,
-                            PreparedRenderBlock::SkipToolResult { diagnostic } => {
-                                prepared.diagnostics.push(diagnostic);
-                            }
-                        }
+                        push_prepared_render(&mut prepared, &mut prepared_keys, source, inner)?;
                     }
                 }
             }
@@ -1475,14 +1505,32 @@ fn coalesce_tool_lifecycles(items: &[ProjectedItem]) -> Vec<ProjectedItem> {
             }
         }
         if matches!(
-            event.kind,
-            ProjectedKind::ToolResult | ProjectedKind::TerminalOutput
-        ) || matches!(
             event.presentation.direct_progress,
-            Some(DirectProgressPresentation::Mcp { ref status, .. })
-                if matches!(status.as_str(), "completed" | "failed")
+            Some(DirectProgressPresentation::Mcp { ref status, .. }) if status == "failed"
         ) {
+            // MCP terminal progress precedes the ordinary ToolResult on the
+            // real direct wire. Preserve the failed state during that gap;
+            // the later ToolResult, when present, replaces the fallback text
+            // with the producer's actual error detail.
+            invocation_tool.is_error = Some(true);
+        }
+        let terminal = event.kind == ProjectedKind::ToolResult
+            || (event.kind == ProjectedKind::TerminalOutput && !event.streaming)
+            || matches!(
+                event.presentation.direct_progress,
+                Some(DirectProgressPresentation::Mcp { ref status, .. })
+                    if matches!(status.as_str(), "completed" | "failed")
+            );
+        if terminal {
             invocation.streaming = false;
+        } else if event.streaming {
+            // A ToolUse can be finalized when the assistant message closes,
+            // before its actual execution starts. A later progress event is
+            // therefore authoritative for reopening the invocation's running
+            // state. In particular, direct shell progress is represented as a
+            // streaming TerminalOutput and must not look completed merely
+            // because of that projected kind.
+            invocation.streaming = true;
         }
         consumed.insert(event_index);
     }
@@ -1746,16 +1794,18 @@ fn push_prepared_render(
     source: ProjectedItem,
     block: PreparedRenderBlock,
 ) -> Result<(), ProjectionScrollbackError> {
-    match block {
-        PreparedRenderBlock::Render(block) => {
-            if !seen.insert(source.key.clone()) {
-                return Err(ProjectionScrollbackError::DuplicateKey { key: source.key });
-            }
-            prepared.rows.push((source, block));
+    let (block, diagnostic) = match block {
+        PreparedRenderBlock::Render(block) => (block, None),
+        PreparedRenderBlock::RenderWithDiagnostic { block, diagnostic } => {
+            (block, Some(diagnostic))
         }
-        PreparedRenderBlock::SkipToolResult { diagnostic } => {
-            prepared.diagnostics.push(diagnostic);
-        }
+    };
+    if !seen.insert(source.key.clone()) {
+        return Err(ProjectionScrollbackError::DuplicateKey { key: source.key });
+    }
+    prepared.rows.push((source, block));
+    if let Some(diagnostic) = diagnostic {
+        prepared.diagnostics.push(diagnostic);
     }
     Ok(())
 }
@@ -1769,10 +1819,9 @@ fn push_prepared_render(
 /// [`ToolPresentation`] carrier and all production painting is an exhaustive
 /// Rust enum match. The remaining fallible boundary is therefore this typed
 /// conversion. A failure for a named ordinary result is logged with the tool
-/// name and original error and removes only that result row. Its independently
-/// projected invocation remains in `prepared`, matching the historical
-/// collapsed-call-site behavior without attempting to catch arbitrary Rust
-/// panics under the release `panic=abort` profile.
+/// name and original error, while a terminal-safe compatibility row remains
+/// visible. This avoids making a result disappear merely because a newer
+/// producer shape reached an older renderer.
 fn prepare_render_block(
     item: &ProjectedItem,
 ) -> Result<PreparedRenderBlock, ProjectionScrollbackError> {
@@ -1782,11 +1831,48 @@ fn prepare_render_block(
             let Some(tool_name) = degradable_tool_result_name(item) else {
                 return Err(error);
             };
-            Ok(PreparedRenderBlock::SkipToolResult {
+            Ok(PreparedRenderBlock::RenderWithDiagnostic {
+                block: compatibility_tool_result_block(item, tool_name),
                 diagnostic: format!("Error rendering tool result for {tool_name}: {error}"),
             })
         }
     }
+}
+
+fn compatibility_tool_result_block(item: &ProjectedItem, tool_name: &str) -> RenderBlock {
+    const HINT: &str = "工具结果格式与当前 TUI 暂不兼容；已保留安全摘要。";
+    let source = item
+        .presentation
+        .tool
+        .as_ref()
+        .and_then(native_tool_output)
+        .or_else(|| (!item.text.trim().is_empty()).then(|| item.text.clone()));
+    if item
+        .presentation
+        .tool
+        .as_ref()
+        .is_some_and(|tool| tool.is_error == Some(true))
+    {
+        return RenderBlock::ToolCall(ToolCallBlock::Other(
+            OtherToolCallBlock::new(tool_name, "结果格式暂不兼容").with_error(
+                source
+                    .filter(|source| !source.is_empty())
+                    .unwrap_or_else(|| "Tool result reported an error".to_string()),
+            ),
+        ));
+    }
+
+    let mut output = HINT.to_string();
+    if let Some(source) = source {
+        let safe = sanitize_bounded_terminal_text(&source);
+        if !safe.trim().is_empty() {
+            output.push_str("\n\n");
+            output.push_str(&safe);
+        }
+    }
+    RenderBlock::ToolCall(ToolCallBlock::Other(
+        OtherToolCallBlock::new(tool_name, "结果格式暂不兼容").with_output(output),
+    ))
 }
 
 fn degradable_tool_result_name(item: &ProjectedItem) -> Option<&str> {
@@ -2096,18 +2182,20 @@ fn map_tool(item: &ProjectedItem) -> Result<RenderBlock, ProjectionScrollbackErr
         ProjectedKind::ToolUse => return map_tool_invocation(item, tool),
         ProjectedKind::ToolResult | ProjectedKind::TerminalOutput => {
             let Some(block) = map_tool_result(item, tool)? else {
-                let mut fallback = OtherToolCallBlock::new(
+                let fallback = OtherToolCallBlock::new(
                     tool.name.as_deref().unwrap_or("Uncorrelated tool result"),
                     "",
-                )
-                .with_output(item.text.clone());
-                if tool.is_error == Some(true) {
-                    fallback = fallback.with_error(if item.text.is_empty() {
-                        "Tool result reported an error".to_string()
-                    } else {
-                        item.text.clone()
-                    });
-                }
+                );
+                let fallback = if tool.is_error == Some(true) {
+                    fallback.with_error(
+                        native_tool_output(tool)
+                            .filter(|output| !output.is_empty())
+                            .or_else(|| (!item.text.is_empty()).then(|| item.text.clone()))
+                            .unwrap_or_else(|| "Tool result reported an error".to_string()),
+                    )
+                } else {
+                    fallback.with_output(item.text.clone())
+                };
                 return Ok(RenderBlock::ToolCall(ToolCallBlock::Other(fallback)));
             };
             let CrabCodeToolBlock::Result {
@@ -2120,17 +2208,18 @@ fn map_tool(item: &ProjectedItem) -> Result<RenderBlock, ProjectionScrollbackErr
                 unreachable!("map_tool_result returns only result blocks")
             };
             let output = tool_payload_text(result);
-            let mut fallback = OtherToolCallBlock::new(name, "result");
-            if !output.is_empty() {
-                fallback = fallback.with_output(output.clone());
-            }
-            if is_error == Some(true) {
-                fallback = fallback.with_error(if output.is_empty() {
+            let fallback = OtherToolCallBlock::new(name, "result");
+            let fallback = if is_error == Some(true) {
+                fallback.with_error(if output.is_empty() {
                     "Tool result reported an error".to_string()
                 } else {
                     output
-                });
-            }
+                })
+            } else if output.is_empty() {
+                fallback
+            } else {
+                fallback.with_output(output)
+            };
             return Ok(RenderBlock::ToolCall(ToolCallBlock::Other(fallback)));
         }
         ProjectedKind::Progress => map_tool_progress(item, tool)?,
@@ -2191,9 +2280,10 @@ fn map_tool_invocation(
     );
     let mut fallback = OtherToolCallBlock::new(name, summary);
     if let Some(output) = native_tool_output(tool) {
-        fallback = fallback.with_output(output.clone());
         if tool.is_error == Some(true) {
             fallback = fallback.with_error(output);
+        } else {
+            fallback = fallback.with_output(output);
         }
     } else if tool.is_error == Some(true) {
         fallback = fallback.with_error("Tool call failed");
@@ -2208,13 +2298,21 @@ fn map_native_tool_lifecycle(
     input: &serde_json::Value,
 ) -> Option<RenderBlock> {
     let normalized = name.to_ascii_lowercase();
-    let output = native_tool_output(tool);
+    let failed = tool.is_error == Some(true);
+    let native_output = native_tool_output(tool);
     let error = (tool.is_error == Some(true)).then(|| {
-        output
-            .clone()
+        native_output
+            .as_ref()
             .filter(|text| !text.is_empty())
+            .cloned()
             .unwrap_or_else(|| "Tool call failed".to_string())
     });
+    // A failed producer payload has one semantic role: error detail. Keeping
+    // it out of ordinary result fields prevents duplicate painting and keeps
+    // every failed tool behind the renderer's shared error budget. The raw
+    // ProjectedItem remains untouched for audit/export paths.
+    let output = if failed { None } else { native_output };
+    let result = if failed { None } else { tool.result.as_ref() };
 
     if matches!(
         normalized.as_str(),
@@ -2254,12 +2352,49 @@ fn map_native_tool_lifecycle(
         return Some(RenderBlock::ToolCall(ToolCallBlock::Read(block)));
     }
 
-    if matches!(normalized.as_str(), "edit" | "replace" | "write") {
-        let path = input_string(input, &["file_path", "path"])?;
+    if matches!(
+        normalized.as_str(),
+        "edit"
+            | "replace"
+            | "search_replace"
+            | "strreplace"
+            | "write"
+            | "apply_patch"
+            | "applypatch"
+    ) {
+        let patch_target = input
+            .get("patch")
+            .and_then(serde_json::Value::as_str)
+            .and_then(first_apply_patch_target);
+        let path = input_string(input, &["file_path", "path"])
+            .or_else(|| patch_target.as_ref().map(|target| target.path.clone()))
+            .unwrap_or_else(|| "patch".to_string());
         if let Some(error) = error {
             return Some(RenderBlock::edit_failed(path, error));
         }
-        return map_exact_file_edit_invocation(name, input);
+        if normalized == "write" {
+            let content = input
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            return Some(RenderBlock::ToolCall(ToolCallBlock::Edit(
+                EditToolCallBlock::new(path, diff_hunks_from_strings("", content, 1))
+                    .with_prefix("Creating "),
+            )));
+        }
+        if matches!(normalized.as_str(), "apply_patch" | "applypatch") {
+            let mut block = EditToolCallBlock::new(path, Vec::new()).with_untrusted_summary();
+            if patch_target.is_some_and(|target| target.creating) {
+                block = block.with_prefix("Creating ");
+            }
+            return Some(RenderBlock::ToolCall(ToolCallBlock::Edit(block)));
+        }
+        return Some(map_exact_file_edit_invocation(input).unwrap_or_else(|| {
+            RenderBlock::ToolCall(ToolCallBlock::Edit(EditToolCallBlock::new(
+                path,
+                Vec::new(),
+            )))
+        }));
     }
 
     if matches!(
@@ -2289,11 +2424,12 @@ fn map_native_tool_lifecycle(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
         };
-        if let Some(paths) = tool.result.as_ref().and_then(value_string_array) {
+        if let Some(paths) = result.and_then(value_string_array) {
             block.match_count = paths.len();
             block.file_paths = paths;
         } else if let Some(output) = output.as_ref().filter(|output| !output.is_empty()) {
             block.match_count = output.lines().count();
+            block.set_raw_output(output.clone());
         }
         if let Some(error) = error {
             block = block.with_error(error);
@@ -2318,15 +2454,50 @@ fn map_native_tool_lifecycle(
 
     if matches!(
         normalized.as_str(),
+        "memorysearch" | "memory_search" | "search_memory"
+    ) {
+        let query = input_string(input, &["query", "search_query"])?;
+        let mut block = MemorySearchToolCallBlock::new(query);
+        if let Some(result) = result {
+            block.results = structured_memory_search_results(result);
+        }
+        block.error = error;
+        return Some(RenderBlock::ToolCall(ToolCallBlock::MemorySearch(block)));
+    }
+
+    if matches!(
+        normalized.as_str(),
+        "toolsearch" | "tool_search" | "search_tool" | "integrationsearch" | "integration_search"
+    ) {
+        let query = input_string(input, &["query", "search_query"])?;
+        let mut block = IntegrationSearchToolCallBlock::new(query);
+        block.limit =
+            input_u64(input, &["max_results", "limit"]).and_then(|limit| u8::try_from(limit).ok());
+        if let Some(result) = result {
+            block.results = structured_integration_search_results(result);
+            block.result_count = block.results.len();
+            block.content = Some(result_value_text(result));
+        }
+        block.error = error;
+        return Some(RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(
+            block,
+        )));
+    }
+
+    if matches!(
+        normalized.as_str(),
         "websearch" | "web_search" | "search_web"
     ) {
         let query = input_string(input, &["query", "search_query"])?;
         let mut block = WebSearchToolCallBlock::new(query);
-        block.content = output;
-        if let Some(result) = tool.result.as_ref() {
+        if let Some(result) = result {
+            block.results = structured_web_search_results(result);
+            block.content = structured_web_search_commentary(result).or(output);
             collect_urls(result, &mut block.citations);
             block.citations.sort();
             block.citations.dedup();
+        } else {
+            block.content = output;
         }
         block.error = error;
         return Some(RenderBlock::ToolCall(ToolCallBlock::WebSearch(block)));
@@ -2335,22 +2506,37 @@ fn map_native_tool_lifecycle(
     if matches!(normalized.as_str(), "webfetch" | "web_fetch" | "fetch") {
         let url = input_string(input, &["url", "uri"])?;
         let mut block = WebFetchToolCallBlock::new(url);
-        block.output = output;
-        if let Some(result) = tool.result.as_ref().and_then(serde_json::Value::as_object) {
-            block.status_code = result
-                .get("status")
-                .or_else(|| result.get("status_code"))
+        if let Some(result_object) = tool.result.as_ref().and_then(serde_json::Value::as_object) {
+            if !failed {
+                block.output = result_object
+                    .get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or(output);
+            }
+            block.status_code = result_object
+                .get("code")
+                .or_else(|| result_object.get("status"))
+                .or_else(|| result_object.get("status_code"))
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|status| u16::try_from(status).ok());
-            block.content_type = result
-                .get("content_type")
-                .or_else(|| result.get("contentType"))
+            block.status_text = result_object
+                .get("codeText")
+                .or_else(|| result_object.get("statusText"))
+                .or_else(|| result_object.get("status_text"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            block.bytes = result
+            block.content_type = result_object
+                .get("content_type")
+                .or_else(|| result_object.get("contentType"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            block.bytes = result_object
                 .get("bytes")
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|bytes| usize::try_from(bytes).ok());
+        } else {
+            block.output = output;
         }
         block.error = error;
         return Some(RenderBlock::ToolCall(ToolCallBlock::WebFetch(block)));
@@ -2490,21 +2676,254 @@ fn value_string_array(value: &serde_json::Value) -> Option<Vec<String>> {
     })
 }
 
+fn structured_memory_search_results(
+    value: &serde_json::Value,
+) -> Vec<crabcode_pager_render::scrollback::blocks::tool::MemoryResult> {
+    let candidate = value.get("results").unwrap_or(value);
+    let encoded = match candidate {
+        serde_json::Value::String(text) => {
+            let text = text
+                .find('[')
+                .map_or(text.as_str(), |array_start| &text[array_start..]);
+            text.to_string()
+        }
+        _ => compact_json(candidate),
+    };
+    let mut results = parse_memory_results(&encoded);
+    results.truncate(MAX_STRUCTURED_MEMORY_SEARCH_RESULTS);
+    results
+}
+
+fn structured_integration_search_results(value: &serde_json::Value) -> Vec<DiscoveredTool> {
+    let entries = value
+        .get("matches")
+        .or_else(|| value.get("results"))
+        .or_else(|| value.get("tools"))
+        .unwrap_or(value);
+    let Some(entries) = entries.as_array() else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in entries {
+        if results.len() >= MAX_STRUCTURED_INTEGRATION_SEARCH_RESULTS {
+            break;
+        }
+        let parsed = match entry {
+            serde_json::Value::String(name) => discovered_tool_from_name(name, None, None, None),
+            serde_json::Value::Object(object) => {
+                let Some(name) = object
+                    .get("name")
+                    .or_else(|| object.get("tool_name"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                discovered_tool_from_name(
+                    name,
+                    object
+                        .get("server")
+                        .or_else(|| object.get("server_name"))
+                        .and_then(serde_json::Value::as_str),
+                    object
+                        .get("description")
+                        .and_then(serde_json::Value::as_str),
+                    object.get("score").and_then(serde_json::Value::as_f64),
+                )
+            }
+            _ => None,
+        };
+        let Some(tool) = parsed else {
+            continue;
+        };
+        if seen.insert((tool.server.clone(), tool.name.clone())) {
+            results.push(tool);
+        }
+    }
+    results
+}
+
+fn discovered_tool_from_name(
+    name: &str,
+    explicit_server: Option<&str>,
+    description: Option<&str>,
+    score: Option<f64>,
+) -> Option<DiscoveredTool> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let qualified = name.strip_prefix("mcp__").unwrap_or(name);
+    let server = explicit_server
+        .map(str::trim)
+        .filter(|server| !server.is_empty())
+        .or_else(|| qualified.split_once("__").map(|(server, _)| server))
+        .unwrap_or_default();
+    Some(DiscoveredTool {
+        name: qualified.to_string(),
+        server: server.to_string(),
+        description: description.unwrap_or_default().to_string(),
+        score: score.unwrap_or_default(),
+    })
+}
+
+/// Extract the direct WebSearch result shape:
+/// `results: [string | { tool_use_id, content: [{ title, url }] }]`.
+///
+/// A flat `{title,url,snippet?}` entry and a bare/content array remain accepted
+/// for compatible direct providers. Commentary strings are deliberately not
+/// parsed as results.
+fn structured_web_search_results(value: &serde_json::Value) -> Vec<WebSearchResult> {
+    let entries = value
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.get("content").and_then(serde_json::Value::as_array))
+        .or_else(|| value.as_array());
+
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::new();
+    let mut seen_urls = HashSet::new();
+    for entry in entries {
+        if results.len() >= MAX_STRUCTURED_WEB_SEARCH_RESULTS {
+            break;
+        }
+        let Some(object) = entry.as_object() else {
+            continue;
+        };
+        push_structured_web_search_result(object, &mut results, &mut seen_urls);
+        if let Some(hits) = object.get("content").and_then(serde_json::Value::as_array) {
+            for hit in hits {
+                if results.len() >= MAX_STRUCTURED_WEB_SEARCH_RESULTS {
+                    break;
+                }
+                if let Some(hit) = hit.as_object() {
+                    push_structured_web_search_result(hit, &mut results, &mut seen_urls);
+                }
+            }
+        }
+    }
+    results
+}
+
+fn push_structured_web_search_result(
+    object: &serde_json::Map<String, serde_json::Value>,
+    results: &mut Vec<WebSearchResult>,
+    seen_urls: &mut HashSet<String>,
+) {
+    let Some(title) = object
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    else {
+        return;
+    };
+    let Some(url) = object
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return;
+    };
+    let Ok(parsed_url) = url::Url::parse(url) else {
+        return;
+    };
+    if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host_str().is_none() {
+        return;
+    }
+    if !seen_urls.insert(url.to_string()) {
+        return;
+    }
+    let snippet = object
+        .get("snippet")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|snippet| !snippet.is_empty())
+        .map(str::to_string);
+    results.push(WebSearchResult {
+        title: title.to_string(),
+        url: url.to_string(),
+        snippet,
+    });
+}
+
+/// Preserve WebSearch's typed string results as display commentary. The direct
+/// tool uses these strings when its nested server-search calls return no
+/// structured hits; they are safer and more useful than the message-level
+/// output, which also contains an internal REMINDER suffix.
+fn structured_web_search_commentary(value: &serde_json::Value) -> Option<String> {
+    let entries = value
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())?;
+    let mut commentary = String::new();
+    for entry in entries {
+        let Some(text) = entry
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let separator_len = usize::from(!commentary.is_empty()) * 2;
+        let remaining = MAX_WEB_SEARCH_COMMENTARY_BYTES
+            .saturating_sub(commentary.len())
+            .saturating_sub(separator_len);
+        if remaining == 0 {
+            break;
+        }
+        if !commentary.is_empty() {
+            commentary.push_str("\n\n");
+        }
+        commentary.push_str(utf8_prefix_at_most(text, remaining));
+        if commentary.len() >= MAX_WEB_SEARCH_COMMENTARY_BYTES {
+            break;
+        }
+    }
+    (!commentary.is_empty()).then_some(commentary)
+}
+
+fn utf8_prefix_at_most(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 fn collect_urls(value: &serde_json::Value, urls: &mut Vec<String>) {
+    if urls.len() >= MAX_WEB_SEARCH_CITATIONS {
+        return;
+    }
     match value {
         serde_json::Value::String(value)
             if value.starts_with("https://") || value.starts_with("http://") =>
         {
-            urls.push(value.clone());
+            if !urls.contains(value) {
+                urls.push(value.clone());
+            }
         }
         serde_json::Value::Array(values) => {
             for value in values {
                 collect_urls(value, urls);
+                if urls.len() >= MAX_WEB_SEARCH_CITATIONS {
+                    break;
+                }
             }
         }
         serde_json::Value::Object(object) => {
             for value in object.values() {
                 collect_urls(value, urls);
+                if urls.len() >= MAX_WEB_SEARCH_CITATIONS {
+                    break;
+                }
             }
         }
         serde_json::Value::Null
@@ -2514,17 +2933,49 @@ fn collect_urls(value: &serde_json::Value, urls: &mut Vec<String>) {
     }
 }
 
-/// Route the one historical direct-TUI tool presentation whose typed input
-/// exactly matches a fixed Rust render block.
+#[derive(Debug, Clone)]
+struct ApplyPatchTarget {
+    path: String,
+    creating: bool,
+}
+
+fn first_apply_patch_target(patch: &str) -> Option<ApplyPatchTarget> {
+    for line in patch.lines() {
+        for (prefix, creating) in [
+            ("*** Update File: ", false),
+            ("*** Add File: ", true),
+            ("*** Delete File: ", false),
+        ] {
+            if let Some(path) = line.strip_prefix(prefix).map(str::trim)
+                && !path.is_empty()
+            {
+                return Some(ApplyPatchTarget {
+                    path: path.to_string(),
+                    creating,
+                });
+            }
+        }
+        if let Some(path) = line.strip_prefix("+++ b/").map(str::trim)
+            && !path.is_empty()
+            && path != "/dev/null"
+        {
+            return Some(ApplyPatchTarget {
+                path: path.to_string(),
+                creating: false,
+            });
+        }
+    }
+    None
+}
+
+/// Route a direct-TUI replacement input whose typed old/new strings exactly
+/// match a fixed Rust render block.
 ///
 /// This is deliberately a closed structural match. The renderer does not
 /// inspect the filesystem, infer aliases, parse display text, or accept
 /// partially streamed JSON. Any missing/wrongly typed field falls back to the
 /// lossless generic tool carrier.
-fn map_exact_file_edit_invocation(name: &str, input: &serde_json::Value) -> Option<RenderBlock> {
-    if name != "Edit" {
-        return None;
-    }
+fn map_exact_file_edit_invocation(input: &serde_json::Value) -> Option<RenderBlock> {
     let input = input.as_object()?;
     let path = input.get("file_path")?.as_str()?;
     let old_text = input.get("old_string")?.as_str()?;
@@ -3221,6 +3672,15 @@ fn map_direct_progress(item: &ProjectedItem) -> Result<RenderBlock, ProjectionSc
             ..
         } => {
             require_progress_kind(item)?;
+            if item.tool_use_id.as_deref() != Some(identity.parent_tool_use_id.as_str())
+                || !item.raw_sequences.contains(&identity.raw_sequence)
+            {
+                return inconsistent(
+                    item,
+                    "MCP progress identity correlated to its parent invocation and source row",
+                    "MCP progress parent tool or raw-sequence identity mismatch",
+                );
+            }
             (
                 "mcp_progress",
                 CrabCodeDirectProgressBlock::Mcp {
@@ -4065,8 +4525,8 @@ mod tests {
     use super::*;
     use crate::sdk_projection::{
         DirectAssistantPresentation, DirectAttachmentPresentation, DirectMessageIdentity,
-        DirectProgressIdentity, DirectSystemPresentation, DirectTaskType, DirectUserPresentation,
-        ProjectedPresentation, SystemPresentation, ThinkingPresentation,
+        DirectProgressIdentity, DirectRelevantMemory, DirectSystemPresentation, DirectTaskType,
+        DirectUserPresentation, ProjectedPresentation, SystemPresentation, ThinkingPresentation,
     };
 
     fn item(key: &str, kind: ProjectedKind, text: &str) -> ProjectedItem {
@@ -5181,6 +5641,125 @@ mod tests {
     }
 
     #[test]
+    fn render_only_retirement_preserves_selection_and_lifecycle_ownership() {
+        let mut adapter = ProjectionScrollbackAdapter::default();
+        let mut state = ScrollbackState::new();
+        let authoritative = vec![
+            item("a", ProjectedKind::User, "a"),
+            assistant("b", "b", false),
+            item("c", ProjectedKind::User, "c"),
+            assistant("d", "d", false),
+        ];
+        adapter
+            .advance_lifecycle_with_options_and_notices(
+                &mut state,
+                &authoritative,
+                &[],
+                SynchronizationOptions::default(),
+                &[],
+                Some("render-retirement-session"),
+                0,
+                false,
+                None,
+                1,
+            )
+            .unwrap();
+        let a_id = adapter.entry_id("a").unwrap();
+        let b_id = adapter.entry_id("b").unwrap();
+        let c_id = adapter.entry_id("c").unwrap();
+        let d_id = adapter.entry_id("d").unwrap();
+        state.set_selected(state.index_of_id(c_id));
+
+        let delta = adapter
+            .retire_rendered_keys(&mut state, &HashSet::from(["b".to_string()]))
+            .unwrap();
+
+        assert_eq!(
+            delta,
+            ProjectionScrollbackDelta {
+                removed: 1,
+                ..ProjectionScrollbackDelta::default()
+            }
+        );
+        assert_eq!(
+            authoritative.len(),
+            4,
+            "source projection remains untouched"
+        );
+        assert_eq!(adapter.entry_id("a"), Some(a_id));
+        assert_eq!(adapter.entry_id("b"), None);
+        assert_eq!(adapter.entry_id("c"), Some(c_id));
+        assert_eq!(adapter.entry_id("d"), Some(d_id));
+        assert!(state.get_by_id(b_id).is_none());
+        assert_eq!(
+            adapter.ordered_keys(),
+            &["a".to_string(), "c".to_string(), "d".to_string()]
+        );
+        assert_eq!(
+            state
+                .selected()
+                .and_then(|index| state.entry(index))
+                .map(|entry| entry.id),
+            Some(c_id)
+        );
+
+        let filtered = vec![
+            authoritative[0].clone(),
+            authoritative[2].clone(),
+            authoritative[3].clone(),
+        ];
+        adapter
+            .advance_lifecycle_with_options_and_notices(
+                &mut state,
+                &filtered,
+                &[],
+                SynchronizationOptions::default(),
+                &[],
+                Some("render-retirement-session"),
+                0,
+                false,
+                None,
+                1,
+            )
+            .expect("the next filtered lifecycle remains ownership-consistent");
+        assert_eq!(state.len(), 3);
+        assert_eq!(
+            state
+                .selected()
+                .and_then(|index| state.entry(index))
+                .map(|entry| entry.id),
+            Some(c_id)
+        );
+
+        adapter
+            .advance_lifecycle_with_options_and_notices(
+                &mut state,
+                &authoritative,
+                &[],
+                SynchronizationOptions {
+                    presentation_verbose: true,
+                    agent_transcript_mode: false,
+                },
+                &[],
+                Some("render-retirement-session"),
+                0,
+                false,
+                None,
+                1,
+            )
+            .expect("audit input can rematerialize a retired renderer row");
+        assert_eq!(state.len(), 4);
+        assert!(adapter.entry_id("b").is_some());
+        assert_eq!(
+            state
+                .selected()
+                .and_then(|index| state.entry(index))
+                .map(|entry| entry.id),
+            Some(c_id)
+        );
+    }
+
+    #[test]
     fn unclosed_specialized_consumer_is_atomic() {
         let mut adapter = ProjectionScrollbackAdapter::default();
         let mut state = ScrollbackState::new();
@@ -5250,6 +5829,244 @@ mod tests {
                     && block.content.as_deref() == Some("file contents")
         ));
         assert!(state.entry(0).is_some_and(|entry| !entry.is_running));
+    }
+
+    #[test]
+    fn streaming_progress_reopens_correlated_invocation_running_state() {
+        for kind in [ProjectedKind::Progress, ProjectedKind::TerminalOutput] {
+            let mut invocation = typed_tool(
+                "tool-use",
+                ProjectedKind::ToolUse,
+                Some("Bash"),
+                Some(serde_json::json!({"command": "sleep 1"})),
+                None,
+                None,
+            );
+            invocation.tool_use_id = Some("tool-1".to_string());
+            // Assistant stream finalization can close the ToolUse before the
+            // execution plane publishes its first progress event.
+            invocation.streaming = false;
+
+            let mut progress = typed_tool("progress", kind, Some("Bash"), None, None, None);
+            progress.text = "still running".to_string();
+            progress.tool_use_id = Some("tool-1".to_string());
+            progress.streaming = true;
+
+            let coalesced = coalesce_tool_lifecycles(&[invocation, progress]);
+            assert_eq!(coalesced.len(), 1, "kind: {kind:?}");
+            assert!(coalesced[0].streaming, "kind: {kind:?}");
+            assert_eq!(
+                coalesced[0]
+                    .presentation
+                    .tool
+                    .as_ref()
+                    .and_then(|tool| tool.lifecycle_output.as_deref()),
+                Some("still running"),
+                "kind: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn correlated_terminal_events_close_invocation_running_state() {
+        for kind in [ProjectedKind::ToolResult, ProjectedKind::TerminalOutput] {
+            let mut invocation = typed_tool(
+                "tool-use",
+                ProjectedKind::ToolUse,
+                Some("Bash"),
+                Some(serde_json::json!({"command": "true"})),
+                None,
+                None,
+            );
+            invocation.tool_use_id = Some("tool-1".to_string());
+            invocation.streaming = true;
+
+            let mut terminal = typed_tool("terminal", kind, Some("Bash"), None, None, None);
+            terminal.tool_use_id = Some("tool-1".to_string());
+            terminal.streaming = false;
+
+            let coalesced = coalesce_tool_lifecycles(&[invocation, terminal]);
+            assert_eq!(coalesced.len(), 1, "kind: {kind:?}");
+            assert!(!coalesced[0].streaming, "kind: {kind:?}");
+        }
+    }
+
+    #[test]
+    fn mcp_progress_requires_parent_and_source_identity_agreement() {
+        let mut progress = direct_progress(
+            "mcp",
+            ProjectedKind::Progress,
+            "Reading\n75%",
+            "mcp_progress",
+            DirectProgressPresentation::Mcp {
+                status: "progress".to_string(),
+                server_name: "filesystem".to_string(),
+                tool_name: "read_file".to_string(),
+                progress: Some(serde_json::Number::from(3)),
+                total: Some(serde_json::Number::from(4)),
+                elapsed_time_ms: Some(serde_json::Number::from(250)),
+                progress_message: Some("Reading".to_string()),
+                percentage: Some(75),
+            },
+        );
+        progress.raw_sequences = vec![2];
+        progress.tool_use_id = Some("mcp-parent-tool".to_string());
+
+        assert!(matches!(
+            render_block_for(&progress),
+            Ok(RenderBlock::CrabCodeProjection(CrabCodeProjectionBlock {
+                kind: CrabCodeProjectionKind::DirectProgress(
+                    CrabCodeDirectProgressBlock::Mcp {
+                        ref server_name,
+                        ref tool_name,
+                        percentage: Some(75),
+                        ..
+                    },
+                ),
+            })) if server_name == "filesystem" && tool_name == "read_file"
+        ));
+
+        progress.tool_use_id = Some("different-parent".to_string());
+        assert!(matches!(
+            render_block_for(&progress),
+            Err(ProjectionScrollbackError::InconsistentPresentation {
+                expected: "MCP progress identity correlated to its parent invocation and source row",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn failed_mcp_progress_marks_use_tool_failed_until_result_detail_arrives() {
+        let mut invocation = typed_tool(
+            "mcp-invocation",
+            ProjectedKind::ToolUse,
+            Some("mcp__filesystem__read_file"),
+            Some(serde_json::json!({"path":"README.md"})),
+            None,
+            None,
+        );
+        invocation.tool_use_id = Some("mcp-parent".to_string());
+        invocation.streaming = true;
+        invocation.presentation.assistant_block = Some(AssistantBlockType::McpToolUse);
+
+        let mut failed = direct_progress(
+            "mcp-failed",
+            ProjectedKind::Progress,
+            "Failed",
+            "mcp_progress",
+            DirectProgressPresentation::Mcp {
+                status: "failed".to_string(),
+                server_name: "filesystem".to_string(),
+                tool_name: "read_file".to_string(),
+                progress: None,
+                total: None,
+                elapsed_time_ms: Some(serde_json::Number::from(250)),
+                progress_message: None,
+                percentage: None,
+            },
+        );
+        failed.raw_sequences = vec![2];
+        failed.tool_use_id = Some("mcp-parent".to_string());
+        failed
+            .presentation
+            .direct_progress_identity
+            .as_mut()
+            .unwrap()
+            .parent_tool_use_id = "mcp-parent".to_string();
+
+        let mut adapter = ProjectionScrollbackAdapter::default();
+        let mut state = ScrollbackState::new();
+        adapter
+            .synchronize(&mut state, &[invocation.clone(), failed.clone()])
+            .unwrap();
+        let entry_id = state.entry(0).expect("coalesced MCP invocation").id;
+        assert!(!state.entry(0).unwrap().is_running);
+        assert!(matches!(
+            state.entry(0).map(|entry| &entry.block),
+            Some(RenderBlock::ToolCall(ToolCallBlock::UseTool(block)))
+                if block.output.is_none() && block.error.as_deref() == Some("Failed")
+        ));
+
+        let mut result = typed_tool(
+            "mcp-result",
+            ProjectedKind::ToolResult,
+            Some("mcp__filesystem__read_file"),
+            None,
+            Some(serde_json::json!("MCP connection closed")),
+            Some(true),
+        );
+        result.text = "MCP connection closed".to_string();
+        result.tool_use_id = Some("mcp-parent".to_string());
+        adapter
+            .synchronize(&mut state, &[invocation, failed, result])
+            .unwrap();
+
+        assert_eq!(state.entry(0).map(|entry| entry.id), Some(entry_id));
+        assert!(matches!(
+            state.entry(0).map(|entry| &entry.block),
+            Some(RenderBlock::ToolCall(ToolCallBlock::UseTool(block)))
+                if block.output.is_none()
+                    && block.error.as_deref() == Some("MCP connection closed")
+        ));
+    }
+
+    #[test]
+    fn relevant_memories_attachment_remains_visible_and_expandable() {
+        let memories = direct_attachment(
+            "relevant-memories",
+            ProjectedKind::System,
+            DirectAttachmentData::RelevantMemories {
+                memories: vec![
+                    DirectRelevantMemory {
+                        path: "/memory/project/one.md".to_string(),
+                        content: "first memory".to_string(),
+                        mtime_ms: serde_json::Number::from(1),
+                        header: None,
+                        limit: None,
+                    },
+                    DirectRelevantMemory {
+                        path: "/memory/global/two.md".to_string(),
+                        content: "second memory".to_string(),
+                        mtime_ms: serde_json::Number::from(2),
+                        header: None,
+                        limit: None,
+                    },
+                ],
+            },
+        );
+        let mut adapter = ProjectionScrollbackAdapter::default();
+        let mut state = ScrollbackState::new();
+        adapter.synchronize(&mut state, &[memories]).unwrap();
+
+        assert_eq!(state.len(), 1);
+        assert!(matches!(
+            state.entry(0).map(|entry| &entry.block),
+            Some(RenderBlock::CrabCodeProjection(CrabCodeProjectionBlock {
+                kind: CrabCodeProjectionKind::DirectAttachment(
+                    CrabCodeDirectAttachmentBlock::RelevantMemories { memories },
+                ),
+            })) if memories.len() == 2
+        ));
+        let output = state.entry(0).unwrap().block.output(&BlockContext {
+            mode: DisplayMode::Expanded,
+            is_running: false,
+            width: 80,
+            raw: false,
+            max_lines: None,
+            appearance: AppearanceConfig::default(),
+            is_selected: false,
+            cwd: None,
+        });
+        let rendered = output
+            .lines
+            .iter()
+            .flat_map(|line| line.content.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("one.md"), "{rendered}");
+        assert!(rendered.contains("two.md"), "{rendered}");
     }
 
     #[test]
@@ -5458,26 +6275,60 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_edit_shape_degrades_locally_to_native_other() {
-        let input = serde_json::json!({
-            "file_path": "src/lib.rs",
-            "old_string": "old"
-        });
+    fn edit_write_and_apply_patch_without_old_new_stay_typed() {
         let mut invocation = typed_tool(
             "edit-incomplete",
             ProjectedKind::ToolUse,
             Some("Edit"),
-            Some(input.clone()),
+            Some(serde_json::json!({
+                "file_path": "src/lib.rs",
+                "old_string": "old"
+            })),
             None,
             None,
         );
         invocation.presentation.assistant_block = Some(AssistantBlockType::ToolUse);
-        let expected_summary = input.to_string();
-
         assert!(matches!(
             render_block_for(&invocation),
-            Ok(RenderBlock::ToolCall(ToolCallBlock::Other(block)))
-                if block.name == "Edit" && block.summary == expected_summary
+            Ok(RenderBlock::ToolCall(ToolCallBlock::Edit(block)))
+                if block.path == "src/lib.rs" && block.hunks.is_empty()
+        ));
+
+        let write = typed_tool(
+            "write-content",
+            ProjectedKind::ToolUse,
+            Some("Write"),
+            Some(serde_json::json!({
+                "file_path": "src/new.rs",
+                "content": "fn main() {}\n"
+            })),
+            None,
+            None,
+        );
+        assert!(matches!(
+            render_block_for(&write),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::Edit(block)))
+                if block.path == "src/new.rs"
+                    && block.prefix == "Creating "
+                    && !block.hunks.is_empty()
+        ));
+
+        let patch = typed_tool(
+            "apply-patch",
+            ProjectedKind::ToolUse,
+            Some("apply_patch"),
+            Some(serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"
+            })),
+            None,
+            None,
+        );
+        assert!(matches!(
+            render_block_for(&patch),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::Edit(block)))
+                if block.path == "src/lib.rs"
+                    && block.summary_untrusted
+                    && block.hunks.is_empty()
         ));
     }
 
@@ -5599,7 +6450,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_error_preserves_block_content_in_native_other() {
+    fn direct_error_keeps_block_content_only_as_native_error() {
         let result = direct_tool_result(
             "direct-error",
             Some(serde_json::json!({"must_not_render":"success payload"})),
@@ -5610,13 +6461,13 @@ mod tests {
         assert!(matches!(
             render_block_for(&result),
             Ok(RenderBlock::ToolCall(ToolCallBlock::Other(block)))
-                if block.output.as_deref() == Some("exact error content")
+                if block.output.is_none()
                     && block.error.as_deref() == Some("exact error content")
         ));
     }
 
     #[test]
-    fn terminal_tool_result_preserves_text_error_in_native_other() {
+    fn terminal_tool_result_keeps_text_only_as_native_error() {
         let result = typed_tool(
             "terminal-result",
             ProjectedKind::TerminalOutput,
@@ -5630,7 +6481,7 @@ mod tests {
             render_block_for(&result),
             Ok(RenderBlock::ToolCall(ToolCallBlock::Other(block)))
                 if block.name == "Bash"
-                    && block.output.as_deref() == Some("exit 7")
+                    && block.output.is_none()
                     && block.error.as_deref() == Some("exit 7")
         ));
     }
@@ -5692,6 +6543,454 @@ mod tests {
             render_block_for(&invocation),
             Ok(RenderBlock::ToolCall(ToolCallBlock::Read(block)))
                 if block.path == "README.md"
+        ));
+    }
+
+    #[test]
+    fn sdk_web_fetch_maps_the_existing_structured_result_shape() {
+        let invocation = typed_tool(
+            "sdk-web-fetch",
+            ProjectedKind::ToolUse,
+            Some("WebFetch"),
+            Some(serde_json::json!({
+                "url": "https://example.com/article",
+                "prompt": "summarize"
+            })),
+            Some(serde_json::json!({
+                "bytes": 2048,
+                "code": 200,
+                "codeText": "OK",
+                "durationMs": 25,
+                "result": "Fetched summary\nSecond line",
+                "url": "https://example.com/article"
+            })),
+            Some(false),
+        );
+
+        assert!(matches!(
+            render_block_for(&invocation),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::WebFetch(block)))
+                if block.url == "https://example.com/article"
+                    && block.status_code == Some(200)
+                    && block.status_text.as_deref() == Some("OK")
+                    && block.bytes == Some(2048)
+                    && block.output.as_deref() == Some("Fetched summary\nSecond line")
+        ));
+    }
+
+    #[test]
+    fn real_memory_and_integration_search_lifecycles_keep_typed_cards() {
+        let mut memory_use = typed_tool(
+            "memory-use",
+            ProjectedKind::ToolUse,
+            Some("MemorySearch"),
+            Some(serde_json::json!({"query":"renderer state","top_k":5})),
+            None,
+            None,
+        );
+        memory_use.tool_use_id = Some("memory-1".to_string());
+        memory_use.streaming = true;
+        let mut memory_result = typed_tool(
+            "memory-result",
+            ProjectedKind::ToolResult,
+            Some("MemorySearch"),
+            None,
+            Some(serde_json::json!({
+                "available":true,
+                "results":[{
+                    "path":"/memory/project/MEMORY.md",
+                    "name":"Renderer state",
+                    "score":0.91,
+                    "snippet":"Keep typed lifecycle cards.",
+                    "scope":"project",
+                    "type":"convention"
+                }]
+            })),
+            Some(false),
+        );
+        memory_result.tool_use_id = Some("memory-1".to_string());
+
+        let mut integration_use = typed_tool(
+            "tool-search-use",
+            ProjectedKind::ToolUse,
+            Some("ToolSearch"),
+            Some(serde_json::json!({"query":"linear issue","max_results":4})),
+            None,
+            None,
+        );
+        integration_use.tool_use_id = Some("tool-search-1".to_string());
+        integration_use.streaming = true;
+        let mut integration_result = typed_tool(
+            "tool-search-result",
+            ProjectedKind::ToolResult,
+            Some("ToolSearch"),
+            None,
+            Some(serde_json::json!({
+                "matches":["mcp__linear__save_issue","Read"],
+                "query":"linear issue",
+                "total_deferred_tools":12
+            })),
+            Some(false),
+        );
+        integration_result.tool_use_id = Some("tool-search-1".to_string());
+
+        let mut adapter = ProjectionScrollbackAdapter::default();
+        let mut state = ScrollbackState::new();
+        adapter
+            .synchronize(
+                &mut state,
+                &[
+                    memory_use,
+                    memory_result,
+                    integration_use,
+                    integration_result,
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(state.len(), 2);
+        assert!(matches!(
+            state.entry(0).map(|entry| &entry.block),
+            Some(RenderBlock::ToolCall(ToolCallBlock::MemorySearch(block)))
+                if block.query == "renderer state"
+                    && block.results.len() == 1
+                    && block.results[0].path == "/memory/project/MEMORY.md"
+                    && block.results[0].name.as_deref() == Some("Renderer state")
+        ));
+        assert!(matches!(
+            state.entry(1).map(|entry| &entry.block),
+            Some(RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(block)))
+                if block.query == "linear issue"
+                    && block.limit == Some(4)
+                    && block.result_count == 2
+                    && block.results[0].name == "linear__save_issue"
+                    && block.results[0].server == "linear"
+                    && block.results[1].name == "Read"
+        ));
+    }
+
+    #[test]
+    fn unstructured_search_result_is_retained_for_expansion() {
+        let search = typed_tool(
+            "string-search",
+            ProjectedKind::ToolUse,
+            Some("Grep"),
+            Some(serde_json::json!({"pattern":"needle","path":"src"})),
+            Some(serde_json::json!("src/a.rs:1:needle\nsrc/b.rs:2:needle")),
+            Some(false),
+        );
+
+        assert!(matches!(
+            render_block_for(&search),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::Search(block)))
+                if block.match_count == 2
+                    && block.raw_output.as_deref()
+                        == Some("src/a.rs:1:needle\nsrc/b.rs:2:needle")
+        ));
+    }
+
+    #[test]
+    fn failed_native_tool_lifecycles_keep_payload_only_in_error_fields() {
+        const FAILURE: &str = "exact producer failure\nsecond line";
+
+        let other = typed_tool(
+            "failed-other",
+            ProjectedKind::ToolUse,
+            Some("RepoProbe"),
+            Some(serde_json::json!({"target":"repository"})),
+            Some(serde_json::json!(FAILURE)),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&other),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::Other(block)))
+                if block.output.is_none() && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let read = typed_tool(
+            "failed-read",
+            ProjectedKind::ToolUse,
+            Some("Read"),
+            Some(serde_json::json!({"file_path":"README.md"})),
+            Some(serde_json::json!(FAILURE)),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&read),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::Read(block)))
+                if block.content.is_none()
+                    && block.total_lines.is_none()
+                    && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let execute = typed_tool(
+            "failed-execute",
+            ProjectedKind::ToolUse,
+            Some("Execute"),
+            Some(serde_json::json!({"command":"false"})),
+            Some(serde_json::json!(FAILURE)),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&execute),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::Execute(block)))
+                if block.output.is_none() && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let search = typed_tool(
+            "failed-search",
+            ProjectedKind::ToolUse,
+            Some("Search"),
+            Some(serde_json::json!({"query":"needle"})),
+            Some(serde_json::json!(FAILURE)),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&search),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::Search(block)))
+                if block.match_count == 0
+                    && block.file_paths.is_empty()
+                    && block.raw_output.is_none()
+                    && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let skill = typed_tool(
+            "failed-skill",
+            ProjectedKind::ToolUse,
+            Some("Skill"),
+            Some(serde_json::json!({"skill":"review"})),
+            Some(serde_json::json!(FAILURE)),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&skill),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::Skill(block)))
+                if block.output.is_none() && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let use_tool = typed_tool(
+            "failed-use-tool",
+            ProjectedKind::ToolUse,
+            Some("mcp__github__search"),
+            Some(serde_json::json!({"query":"renderer"})),
+            Some(serde_json::json!(FAILURE)),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&use_tool),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::UseTool(block)))
+                if block.output.is_none() && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let list = typed_tool(
+            "failed-list",
+            ProjectedKind::ToolUse,
+            Some("ListDir"),
+            Some(serde_json::json!({"path":"src"})),
+            Some(serde_json::json!(FAILURE)),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&list),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::ListDir(block)))
+                if block.output.is_empty() && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let memory = typed_tool(
+            "failed-memory",
+            ProjectedKind::ToolUse,
+            Some("MemorySearch"),
+            Some(serde_json::json!({"query":"renderer"})),
+            Some(serde_json::json!({
+                "content": FAILURE,
+                "results": [{"path":"/memory/secret.md","score":1.0}]
+            })),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&memory),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::MemorySearch(block)))
+                if block.results.is_empty() && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let integration = typed_tool(
+            "failed-integration",
+            ProjectedKind::ToolUse,
+            Some("IntegrationSearch"),
+            Some(serde_json::json!({"query":"issues"})),
+            Some(serde_json::json!({
+                "content": FAILURE,
+                "matches": ["mcp__linear__save_issue"]
+            })),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&integration),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(block)))
+                if block.results.is_empty()
+                    && block.result_count == 0
+                    && block.content.is_none()
+                    && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let web_search = typed_tool(
+            "failed-web-search",
+            ProjectedKind::ToolUse,
+            Some("WebSearch"),
+            Some(serde_json::json!({"query":"renderer"})),
+            Some(serde_json::json!({
+                "content": FAILURE,
+                "results": [{
+                    "title":"must remain raw",
+                    "url":"https://example.invalid/private"
+                }]
+            })),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&web_search),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::WebSearch(block)))
+                if block.content.is_none()
+                    && block.results.is_empty()
+                    && block.citations.is_empty()
+                    && block.error.as_deref() == Some(FAILURE)
+        ));
+
+        let web_fetch = typed_tool(
+            "failed-web-fetch",
+            ProjectedKind::ToolUse,
+            Some("WebFetch"),
+            Some(serde_json::json!({"url":"https://example.invalid"})),
+            Some(serde_json::json!({
+                "code": 502,
+                "codeText": "Bad Gateway",
+                "bytes": 42,
+                "output": FAILURE
+            })),
+            Some(true),
+        );
+        assert!(matches!(
+            render_block_for(&web_fetch),
+            Ok(RenderBlock::ToolCall(ToolCallBlock::WebFetch(block)))
+                if block.output.is_none()
+                    && block.status_code == Some(502)
+                    && block.status_text.as_deref() == Some("Bad Gateway")
+                    && block.bytes == Some(42)
+                    && block.error.as_deref() == Some(FAILURE)
+        ));
+    }
+
+    #[test]
+    fn successful_native_tool_lifecycles_still_keep_their_result_fields() {
+        const OUTPUT: &str = "successful payload";
+        let cases = [
+            ("RepoProbe", serde_json::json!({"target":"repository"})),
+            ("Read", serde_json::json!({"file_path":"README.md"})),
+            ("Execute", serde_json::json!({"command":"true"})),
+            ("Search", serde_json::json!({"query":"needle"})),
+            ("Skill", serde_json::json!({"skill":"review"})),
+            (
+                "mcp__github__search",
+                serde_json::json!({"query":"renderer"}),
+            ),
+        ];
+        let blocks = cases.map(|(name, input)| {
+            render_block_for(&typed_tool(
+                name,
+                ProjectedKind::ToolUse,
+                Some(name),
+                Some(input),
+                Some(serde_json::json!(OUTPUT)),
+                Some(false),
+            ))
+            .expect("successful native tool maps")
+        });
+
+        assert!(matches!(
+            &blocks[0],
+            RenderBlock::ToolCall(ToolCallBlock::Other(block))
+                if block.output.as_deref() == Some(OUTPUT) && block.error.is_none()
+        ));
+        assert!(matches!(
+            &blocks[1],
+            RenderBlock::ToolCall(ToolCallBlock::Read(block))
+                if block.content.as_deref() == Some(OUTPUT) && block.error.is_none()
+        ));
+        assert!(matches!(
+            &blocks[2],
+            RenderBlock::ToolCall(ToolCallBlock::Execute(block))
+                if block.output.as_deref() == Some(OUTPUT) && block.error.is_none()
+        ));
+        assert!(matches!(
+            &blocks[3],
+            RenderBlock::ToolCall(ToolCallBlock::Search(block))
+                if block.raw_output.as_deref() == Some(OUTPUT) && block.error.is_none()
+        ));
+        assert!(matches!(
+            &blocks[4],
+            RenderBlock::ToolCall(ToolCallBlock::Skill(block))
+                if block.output.as_deref() == Some(OUTPUT) && block.error.is_none()
+        ));
+        assert!(matches!(
+            &blocks[5],
+            RenderBlock::ToolCall(ToolCallBlock::UseTool(block))
+                if block.output.as_deref() == Some(OUTPUT) && block.error.is_none()
+        ));
+    }
+
+    #[test]
+    fn named_result_mapping_failure_stays_visible_in_compatibility_mode() {
+        let mut malformed = typed_tool(
+            "named-malformed-result",
+            ProjectedKind::ToolResult,
+            Some("RepoProbe"),
+            Some(serde_json::json!({"unexpected":"result input"})),
+            Some(serde_json::json!("unsafe\u{1b}[31m result detail")),
+            Some(false),
+        );
+        malformed.text = String::new();
+
+        let mut adapter = ProjectionScrollbackAdapter::default();
+        let mut state = ScrollbackState::new();
+        adapter.synchronize(&mut state, &[malformed]).unwrap();
+
+        assert_eq!(state.len(), 1);
+        assert!(matches!(
+            state.entry(0).map(|entry| &entry.block),
+            Some(RenderBlock::ToolCall(ToolCallBlock::Other(block)))
+                if block.name == "RepoProbe"
+                    && block.summary == "结果格式暂不兼容"
+                    && block.output.as_deref().is_some_and(|output| {
+                        output.contains("已保留安全摘要")
+                            && output.contains("␛[31m")
+                            && !output.contains('\u{1b}')
+                    })
+        ));
+    }
+
+    #[test]
+    fn failed_named_result_mapping_keeps_payload_only_as_compatibility_error() {
+        let mut malformed = typed_tool(
+            "failed-named-malformed-result",
+            ProjectedKind::ToolResult,
+            Some("RepoProbe"),
+            Some(serde_json::json!({"unexpected":"result input"})),
+            Some(serde_json::json!("exact compatibility failure")),
+            Some(true),
+        );
+        malformed.text = String::new();
+
+        let mut adapter = ProjectionScrollbackAdapter::default();
+        let mut state = ScrollbackState::new();
+        adapter.synchronize(&mut state, &[malformed]).unwrap();
+
+        assert!(matches!(
+            state.entry(0).map(|entry| &entry.block),
+            Some(RenderBlock::ToolCall(ToolCallBlock::Other(block)))
+                if block.name == "RepoProbe"
+                    && block.summary == "结果格式暂不兼容"
+                    && block.output.is_none()
+                    && block.error.as_deref() == Some("exact compatibility failure")
         ));
     }
 
@@ -5853,7 +7152,13 @@ mod tests {
             None,
             Some(serde_json::json!({
                 "content": "search body",
-                "url": "https://example.invalid/source"
+                "results": [{
+                    "tool_use_id": "server-search-1",
+                    "content": [{
+                        "title": "Renderer source",
+                        "url": "https://example.invalid/source"
+                    }]
+                }]
             })),
             Some(false),
         );
@@ -5865,12 +7170,169 @@ mod tests {
         let mut state = ScrollbackState::new();
         adapter.synchronize(&mut state, &[search, result]).unwrap();
         assert_eq!(state.len(), 1);
+        assert_eq!(
+            state.entry(0).map(ScrollbackEntry::display_mode),
+            Some(DisplayMode::Truncated)
+        );
         assert!(matches!(
             state.entry(0).map(|entry| &entry.block),
             Some(RenderBlock::ToolCall(ToolCallBlock::WebSearch(block)))
                 if block.query == "CrabCode renderer"
                     && block.content.as_deref() == Some("search body")
                     && block.citations == ["https://example.invalid/source"]
+                    && block.results == [WebSearchResult {
+                        title: "Renderer source".to_string(),
+                        url: "https://example.invalid/source".to_string(),
+                        snippet: None,
+                    }]
+        ));
+    }
+
+    #[test]
+    fn structured_web_search_rows_require_readable_http_sources() {
+        let results = structured_web_search_results(&serde_json::json!({
+            "query": "renderer",
+            "results": [
+                {
+                    "tool_use_id": "server-search-1",
+                    "content": [
+                        {
+                            "title": " First source ",
+                            "url": "https://example.com/first"
+                        },
+                        {
+                            "title": "Second source",
+                            "url": "http://example.org/second"
+                        },
+                        {
+                            "title": "Unsafe source",
+                            "url": "javascript:alert(1)"
+                        },
+                        {
+                            "title": " ",
+                            "url": "https://example.net/empty-title"
+                        }
+                    ]
+                },
+                "Model commentary is not a structured source",
+                {
+                    "title": "Duplicate source",
+                    "url": "https://example.com/first",
+                    "snippet": "must be deduplicated by URL"
+                }
+            ]
+        }));
+
+        assert_eq!(
+            results,
+            vec![
+                WebSearchResult {
+                    title: "First source".to_string(),
+                    url: "https://example.com/first".to_string(),
+                    snippet: None,
+                },
+                WebSearchResult {
+                    title: "Second source".to_string(),
+                    url: "http://example.org/second".to_string(),
+                    snippet: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_search_results_and_web_citations_have_hard_limits() {
+        let memory_entries = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "path":format!("/memory/{index}.md"),
+                    "name":format!("memory {index}"),
+                    "score":0.5,
+                    "snippet":null,
+                    "scope":"project",
+                    "type":"note"
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            structured_memory_search_results(&serde_json::json!({"results":memory_entries})).len(),
+            MAX_STRUCTURED_MEMORY_SEARCH_RESULTS
+        );
+
+        let integration_entries = (0..100)
+            .map(|index| serde_json::Value::String(format!("mcp__server__tool_{index}")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            structured_integration_search_results(&serde_json::json!({
+                "matches":integration_entries
+            }))
+            .len(),
+            MAX_STRUCTURED_INTEGRATION_SEARCH_RESULTS
+        );
+
+        let web_entries = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "title":format!("source {index}"),
+                    "url":format!("https://example.com/{index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let web_value = serde_json::json!({"results":web_entries});
+        assert_eq!(
+            structured_web_search_results(&web_value).len(),
+            MAX_STRUCTURED_WEB_SEARCH_RESULTS
+        );
+        let mut citations = Vec::new();
+        collect_urls(&web_value, &mut citations);
+        assert_eq!(citations.len(), MAX_WEB_SEARCH_CITATIONS);
+        assert_eq!(
+            citations.iter().collect::<HashSet<_>>().len(),
+            citations.len()
+        );
+    }
+
+    #[test]
+    fn empty_nested_hits_use_typed_commentary_without_message_level_reminder() {
+        let mut search = typed_tool(
+            "web-search-use-commentary",
+            ProjectedKind::ToolUse,
+            Some("WebSearch"),
+            Some(serde_json::json!({"query": "Python 3.14 release notes"})),
+            None,
+            None,
+        );
+        search.tool_use_id = Some("web-commentary-1".to_string());
+        let mut result = typed_tool(
+            "web-search-result-commentary",
+            ProjectedKind::ToolResult,
+            Some("WebSearch"),
+            None,
+            Some(serde_json::json!({
+                "query": "Python 3.14 release notes",
+                "results": [
+                    {"tool_use_id":"nested-1","content":[]},
+                    "Here are the search results:\n\n- Python 3.14 release notes\n- Porting guide",
+                    {"tool_use_id":"nested-2","content":[]}
+                ],
+                "durationSeconds": 28.4
+            })),
+            Some(false),
+        );
+        result.text = "Web search results\n\nREMINDER: internal tool instructions".to_string();
+        result.tool_use_id = Some("web-commentary-1".to_string());
+
+        let mut adapter = ProjectionScrollbackAdapter::default();
+        let mut state = ScrollbackState::new();
+        adapter.synchronize(&mut state, &[search, result]).unwrap();
+        assert!(matches!(
+            state.entry(0).map(|entry| &entry.block),
+            Some(RenderBlock::ToolCall(ToolCallBlock::WebSearch(block)))
+                if block.results.is_empty()
+                    && block.content.as_deref().is_some_and(|content| {
+                        content.contains("Python 3.14 release notes")
+                            && !content.contains("REMINDER")
+                    })
         ));
     }
 
@@ -6536,6 +7998,18 @@ mod tests {
             DirectNestedMessageKind::Assistant,
             "",
         ));
+        items.push(nested_progress_item(
+            assistant(
+                "skill-group-4-second-block",
+                "second content block from the same Skill progress envelope",
+                false,
+            ),
+            4,
+            "skill_progress",
+            "skill-tool",
+            DirectNestedMessageKind::Assistant,
+            "",
+        ));
 
         let mut adapter = ProjectionScrollbackAdapter::default();
         let mut state = ScrollbackState::new();
@@ -6550,7 +8024,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(state.len(), 5, "all five child groups remain owned");
+        assert_eq!(
+            state.len(),
+            6,
+            "every child row remains owned, including sibling blocks from one envelope"
+        );
         assert!(matches!(
             state.entry(0).map(|entry| &entry.block),
             Some(RenderBlock::AgentMessage(_))
@@ -6574,6 +8052,13 @@ mod tests {
                 .as_deref(),
             Some("visible child output\n\nsecond row")
         );
+        assert_eq!(
+            state
+                .entry(5)
+                .and_then(|entry| entry.block.searchable_text())
+                .as_deref(),
+            Some("second content block from the same Skill progress envelope")
+        );
 
         adapter
             .synchronize_with_options(
@@ -6587,7 +8072,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             state.len(),
-            5,
+            6,
             "verbose does not rebuild or duplicate native child groups"
         );
     }

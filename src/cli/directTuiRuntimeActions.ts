@@ -2,6 +2,13 @@ import { z } from 'zod/v4'
 
 import { logForDebugging } from '../utils/debug.js'
 import {
+  DirectTuiBugReportActionSchema,
+  DirectTuiBugReportResultSchema,
+  handleDirectTuiBugReportAction,
+  type DirectTuiBugReportAction,
+  type DirectTuiBugReportDependencies,
+} from './directTuiBugReportRuntimeAction.js'
+import {
   directTuiModelManagementActionSchema,
   directTuiModelManagementResultSchema,
   handleDirectTuiModelManagementAction,
@@ -53,6 +60,7 @@ export const DirectTuiHealthSnapshotActionSchema = z
 
 export const DirectTuiRuntimeActionSchema = z.union([
   DirectTuiHealthSnapshotActionSchema,
+  DirectTuiBugReportActionSchema,
   directTuiModelManagementActionSchema,
   UsagePluginRuntimeActionSchema,
   DirectTuiRetainedCommandActionSchema,
@@ -74,6 +82,7 @@ export const DirectTuiRuntimeActionErrorSchema = z
 
 export const DirectTuiRuntimeResultSchema = z.union([
   DirectTuiHealthSnapshotResultSchema,
+  DirectTuiBugReportResultSchema,
   directTuiModelManagementResultSchema,
   UsagePluginRuntimeResultSchema,
   DirectTuiRetainedCommandResultSchema,
@@ -114,9 +123,16 @@ export type DirectTuiRuntimeActionResult = z.infer<
 export type DirectTuiRuntimeActionRoute = {
   handled: boolean
   response?: DirectTuiRuntimeActionResult
+  /**
+   * A process-private action whose authority settles independently of stdin.
+   * StructuredIO attaches this promise to its existing outbound FIFO instead
+   * of awaiting it in the sole input reader.
+   */
+  backgroundSettlement?: Promise<DirectTuiRuntimeActionRoute>
 }
 
 export type DirectTuiRuntimeActionDependencies = {
+  bugReportDependencies?: DirectTuiBugReportDependencies
   retainedCommandSurface?: DirectTuiRetainedCommandSurface
   retainedCommandDependencies?: DirectTuiRetainedCommandDependencies
 }
@@ -124,7 +140,25 @@ export type DirectTuiRuntimeActionDependencies = {
 export function createDirectTuiRuntimeActionRouter(
   dependencies: DirectTuiRuntimeActionDependencies,
 ): (value: unknown) => Promise<DirectTuiRuntimeActionRoute> {
-  return value => routeDirectTuiRuntimeAction(value, dependencies)
+  return async value => {
+    const parsed = DirectTuiRuntimeActionRequestSchema.safeParse(value)
+    if (
+      parsed.success &&
+      parsed.data.action.kind === 'bug_report_submit'
+    ) {
+      // Bug submission performs a real network request. Return ownership of
+      // the private line immediately, then settle the exact same correlated
+      // route in the background. This keeps StructuredIO's sole stdin reader
+      // available for input, control responses, and cancellation while the
+      // service is slow. The settled response still enters the one outbound
+      // FIFO; no second writer or transport is introduced.
+      return {
+        handled: true,
+        backgroundSettlement: routeDirectTuiRuntimeAction(value, dependencies),
+      }
+    }
+    return routeDirectTuiRuntimeAction(value, dependencies)
+  }
 }
 
 /**
@@ -204,6 +238,13 @@ async function handleDirectTuiRuntimeAction(
     return { kind: 'health_snapshot', status: 'ready' }
   }
 
+  if (isDirectTuiBugReportAction(action)) {
+    return handleDirectTuiBugReportAction(
+      action,
+      dependencies.bugReportDependencies,
+    )
+  }
+
   if (isDirectTuiModelManagementAction(action)) {
     return handleDirectTuiModelManagementAction(action)
   }
@@ -234,10 +275,17 @@ function observedUnknownAction(value: Record<string, unknown>): boolean {
     isRecord(value.action) &&
     typeof value.action.kind === 'string' &&
     value.action.kind !== 'health_snapshot' &&
+    value.action.kind !== 'bug_report_submit' &&
     !isDirectTuiModelManagementActionKind(value.action.kind) &&
     !isDirectTuiRetainedCommandActionKind(value.action.kind) &&
     !isUsagePluginRuntimeActionKind(value.action.kind)
   )
+}
+
+function isDirectTuiBugReportAction(
+  action: DirectTuiRuntimeAction,
+): action is DirectTuiBugReportAction {
+  return action.kind === 'bug_report_submit'
 }
 
 const DIRECT_TUI_MODEL_MANAGEMENT_ACTION_KINDS = {

@@ -5,7 +5,7 @@
   "migrationAuthority": "rustOwner identifies the native module that must reach behavioral parity before the TypeScript family can be removed",
   "typescriptVersion": "5.9.3",
   "tsconfig": "tsconfig.json",
-  "totalCapabilities": 374,
+  "totalCapabilities": 377,
   "families": [
     {
       "id": "query_message_type",
@@ -406,11 +406,12 @@
     {
       "id": "private_runtime_action_kind",
       "source": "src/cli/directTuiRuntimeActions.ts",
-      "sourceSha256": "8ec9041bad3637b590235d1f3d885e960f4bc3804706d2b0a505c6c3b781924b",
+      "sourceSha256": "a29a7c8b0e0cca9612ac4901da633b6e96f8d48156024c61ef81e19bfba6185d",
       "symbol": "DirectTuiRuntimeAction",
       "discriminator": "kind",
       "rustOwner": "crabcode-tui::sdk_runtime::validate_private_runtime_action",
       "values": [
+        "bug_report_submit",
         "health_snapshot",
         "model.account.consent",
         "model.account.login_cancel",
@@ -457,16 +458,18 @@
         "usage_read",
         "usage_set_five_hour_continue"
       ],
-      "count": 45
+      "count": 46
     },
     {
       "id": "private_runtime_result_kind",
       "source": "src/cli/directTuiRuntimeActions.ts",
-      "sourceSha256": "8ec9041bad3637b590235d1f3d885e960f4bc3804706d2b0a505c6c3b781924b",
+      "sourceSha256": "a29a7c8b0e0cca9612ac4901da633b6e96f8d48156024c61ef81e19bfba6185d",
       "symbol": "DirectTuiRuntimeResult",
       "discriminator": "kind",
       "rustOwner": "crabcode-tui::sdk_runtime private result classifier",
       "values": [
+        "bug_report_submitted",
+        "bug_report_unconfirmed",
         "health_snapshot",
         "model.account.consent",
         "model.account.login_cancel",
@@ -506,7 +509,7 @@
         "usage_plugin_error",
         "usage_snapshot"
       ],
-      "count": 38
+      "count": 40
     },
     {
       "id": "private_setup_request_route",
@@ -923,6 +926,7 @@
         "owner": "security-private-runtime",
         "default": "protocol-fatal",
         "values": {
+          "bug_report_submit": "protocol-fatal",
           "health_snapshot": "protocol-fatal",
           "model.account.consent": "protocol-fatal",
           "model.account.login_cancel": "protocol-fatal",
@@ -974,6 +978,8 @@
         "owner": "security-private-runtime",
         "default": "protocol-fatal",
         "values": {
+          "bug_report_submitted": "protocol-fatal",
+          "bug_report_unconfirmed": "protocol-fatal",
           "health_snapshot": "protocol-fatal",
           "model.account.consent": "protocol-fatal",
           "model.account.login_cancel": "protocol-fatal",
@@ -1095,6 +1101,6 @@
       }
     }
   },
-  "contractSha256": "4480d1743da79c94ceb714f77e19b61a4355d42320d2992b58ef3e8a4ccdc7fd",
+  "contractSha256": "01a6c36628f0f0a553ded6ab31a91bfcf09ca07a83e3aaf2be7fc6822656fead",
   "contractHashScope": "canonical JSON excluding contractSha256 and contractHashScope"
 }

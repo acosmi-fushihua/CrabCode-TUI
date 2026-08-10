@@ -1812,6 +1812,20 @@ pub(crate) struct UsagePluginManagementTabView {
     pub(crate) badge: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsagePluginDetailTone {
+    Section,
+    Metric,
+    Supporting,
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsagePluginDetailLine {
+    pub(crate) text: String,
+    pub(crate) tone: UsagePluginDetailTone,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UsagePluginManagementState {
     view: View,
@@ -2894,9 +2908,21 @@ impl UsagePluginManagementState {
 
     pub(crate) fn footer(&self, language: UiLanguage) -> &'static str {
         if self.pending.is_some() {
+            if matches!(self.view, View::Usage) {
+                return language.text(
+                    "Esc 只关闭面板 · 正在等候直连运行环境 · Ctrl-Q 退出程序",
+                    "Esc only closes this panel · waiting for direct runtime · Ctrl-Q quits",
+                );
+            }
             return language.text(
                 "正在等待直连运行环境；Esc 只关闭面板，Ctrl-Q 退出程序",
                 "Waiting for the direct runtime; Esc only closes this panel, Ctrl-Q quits",
+            );
+        }
+        if matches!(self.view, View::Usage) {
+            return language.text(
+                "R 刷新 · Enter 执行 · Esc 关闭 · ↑/↓ 选择 · Ctrl-Q 退出",
+                "R refresh · Enter run · Esc close · Up/Down select · Ctrl-Q quit",
             );
         }
         if matches!(self.view, View::MarketplaceAdd | View::Validate) {
@@ -2966,7 +2992,11 @@ impl UsagePluginManagementState {
 
     pub(crate) fn details(&self, language: UiLanguage) -> Vec<String> {
         match &self.view {
-            View::Usage => self.usage_details(language),
+            View::Usage => self
+                .usage_detail_lines(language, 90)
+                .into_iter()
+                .map(|line| line.text)
+                .collect(),
             View::Help => plugin_help_lines(language),
             View::Discover => {
                 let mut lines = vec![language
@@ -3119,6 +3149,32 @@ impl UsagePluginManagementState {
                 )
                 .to_string()],
             View::ValidationResult => self.validation_details(language),
+        }
+    }
+
+    pub(crate) fn detail_lines(
+        &self,
+        language: UiLanguage,
+        available_width: u16,
+    ) -> Vec<UsagePluginDetailLine> {
+        if matches!(self.view, View::Usage) {
+            self.usage_detail_lines(language, usize::from(available_width))
+        } else {
+            self.details(language)
+                .into_iter()
+                .map(|text| UsagePluginDetailLine {
+                    text,
+                    tone: UsagePluginDetailTone::Supporting,
+                })
+                .collect()
+        }
+    }
+
+    pub(crate) const fn detail_line_limit(&self) -> usize {
+        if matches!(self.view, View::Usage) {
+            12
+        } else {
+            6
         }
     }
 
@@ -4232,85 +4288,159 @@ impl UsagePluginManagementState {
         self.installed_actions(plugin_id)
     }
 
-    fn usage_details(&self, language: UiLanguage) -> Vec<String> {
+    fn usage_detail_lines(
+        &self,
+        language: UiLanguage,
+        available_width: usize,
+    ) -> Vec<UsagePluginDetailLine> {
         let Some(usage) = self.usage.as_ref() else {
-            return vec![
-                language
-                    .text("正在读取用量与额度…", "Loading usage and limits…")
-                    .to_string(),
-            ];
+            return vec![detail_line(
+                language.text("正在读取用量与额度…", "Loading usage and limits…"),
+                UsagePluginDetailTone::Metric,
+            )];
         };
-        let mut lines = Vec::new();
+        let narrow = available_width < 76;
+        let mut core = Vec::new();
+        let mut backend_values = Vec::new();
+
         if let Some(balance) = usage.entitlement_balance.as_ref() {
-            lines.push(match language {
-                UiLanguage::ZhCn => format!(
-                    "Token：已用 {} / 总额 {} · 剩余 {}",
-                    format_number(balance.total_token_used),
-                    format_number(balance.total_token_quota),
-                    format_number(balance.total_token_remaining)
-                ),
-                UiLanguage::EnUs => format!(
-                    "Tokens: {} used / {} total · {} remaining",
-                    format_number(balance.total_token_used),
-                    format_number(balance.total_token_quota),
-                    format_number(balance.total_token_remaining)
-                ),
-            });
-            if balance.total_call_quota > 0.0 {
-                lines.push(match language {
+            core.push(detail_line(
+                match language {
                     UiLanguage::ZhCn => format!(
-                        "调用：已用 {} / 总额 {} · 剩余 {}",
-                        format_number(balance.total_call_used),
-                        format_number(balance.total_call_quota),
-                        format_number(balance.total_call_remaining)
+                        "额度余额 · 有效额度 {} 项",
+                        format_u64(balance.active_entitlements)
                     ),
                     UiLanguage::EnUs => format!(
-                        "Calls: {} used / {} total · {} remaining",
-                        format_number(balance.total_call_used),
-                        format_number(balance.total_call_quota),
-                        format_number(balance.total_call_remaining)
+                        "Entitlement balance · {} active entitlement{}",
+                        format_u64(balance.active_entitlements),
+                        if balance.active_entitlements == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
                     ),
-                });
+                },
+                UsagePluginDetailTone::Section,
+            ));
+
+            let token = balance_metric_detail(
+                "Token",
+                balance.total_token_used,
+                balance.total_token_quota,
+                balance.total_token_remaining,
+                language,
+                narrow,
+            );
+            core.push(token.summary);
+            if let Some(raw) = token.backend_value {
+                backend_values.push(raw);
             }
-            if balance.active_entitlements > 0 {
-                lines.push(match language {
-                    UiLanguage::ZhCn => format!("有效额度项：{}", balance.active_entitlements),
-                    UiLanguage::EnUs => {
-                        format!("Active entitlements: {}", balance.active_entitlements)
-                    }
-                });
+
+            if balance.total_call_quota < 0.0 || balance.total_call_remaining < 0.0 {
+                core.push(detail_line(
+                    language.text(
+                        "调用 · 后端未提供独立调用额度",
+                        "Calls · separate call quota not reported",
+                    ),
+                    UsagePluginDetailTone::Supporting,
+                ));
+            } else {
+                let calls = balance_metric_detail(
+                    language.text("调用", "Calls"),
+                    balance.total_call_used,
+                    balance.total_call_quota,
+                    balance.total_call_remaining,
+                    language,
+                    narrow,
+                );
+                core.push(calls.summary);
+                if let Some(raw) = calls.backend_value {
+                    backend_values.push(raw);
+                }
             }
+        } else {
+            core.push(detail_line(
+                language.text("额度余额", "Entitlement balance"),
+                UsagePluginDetailTone::Section,
+            ));
+            core.push(detail_line(
+                language.text(
+                    "运行环境未返回 Token、调用或有效额度数据。",
+                    "The runtime returned no token, call, or entitlement balance.",
+                ),
+                UsagePluginDetailTone::Supporting,
+            ));
         }
+
+        core.push(detail_line(
+            language.text("时间窗口", "Usage windows"),
+            UsagePluginDetailTone::Section,
+        ));
         if let Some(utilization) = usage.utilization.as_ref() {
             if let Some(limit) = utilization.five_hour.0.as_ref() {
-                lines.push(rate_limit_line(
-                    language.text("当前会话（五小时）", "Current session (five hours)"),
+                core.extend(rate_limit_lines(
+                    language.text("当前会话", "Current session"),
+                    language.text("5 小时窗口", "5-hour window"),
                     limit,
                     language,
+                    narrow,
+                ));
+            } else {
+                core.push(detail_line(
+                    language.text(
+                        "当前会话 · 5 小时窗口未提供",
+                        "Current session · 5-hour window not reported",
+                    ),
+                    UsagePluginDetailTone::Supporting,
                 ));
             }
             if let Some(limit) = utilization.seven_day.0.as_ref() {
-                lines.push(rate_limit_line(
-                    language.text("当前周（七天）", "Current week (seven days)"),
+                core.extend(rate_limit_lines(
+                    language.text("七天用量", "Seven-day usage"),
+                    language.text("滚动窗口", "rolling window"),
                     limit,
                     language,
+                    narrow,
+                ));
+            } else {
+                core.push(detail_line(
+                    language.text(
+                        "七天用量 · 滚动窗口未提供",
+                        "Seven-day usage · rolling window not reported",
+                    ),
+                    UsagePluginDetailTone::Supporting,
                 ));
             }
             if let Some(extra) = utilization.extra_usage.0.as_ref() {
-                lines.extend(extra_usage_lines(extra, language));
+                let extra_lines = extra_usage_detail_lines(extra, language, narrow);
+                core.extend(extra_lines.core);
+                backend_values.extend(extra_lines.backend_values);
             }
+        } else {
+            core.push(detail_line(
+                language.text(
+                    "当前会话与七天用量均未由运行环境返回。",
+                    "Current-session and seven-day usage were not returned by the runtime.",
+                ),
+                UsagePluginDetailTone::Supporting,
+            ));
         }
-        if lines.is_empty() {
-            lines.push(
-                language
-                    .text(
-                        "运行环境未返回可显示的用量或额度字段。",
-                        "The runtime returned no displayable usage or entitlement fields.",
-                    )
-                    .to_string(),
-            );
+
+        const MAX_USAGE_DETAIL_LINES: usize = 12;
+        let remaining = MAX_USAGE_DETAIL_LINES.saturating_sub(core.len());
+        if backend_values.len() <= remaining {
+            core.extend(backend_values);
+        } else if remaining > 0 {
+            core.extend(backend_values.into_iter().take(remaining.saturating_sub(1)));
+            core.push(detail_line(
+                language.text(
+                    "部分后端原值因面板高度省略；紧凑值以 ≈ 标记，快照未改写。",
+                    "Some backend values are omitted for height; ≈ marks compact values and the snapshot is unchanged.",
+                ),
+                UsagePluginDetailTone::Supporting,
+            ));
         }
-        lines
+        core
     }
 
     fn validation_details(&self, language: UiLanguage) -> Vec<String> {
@@ -4701,84 +4831,443 @@ fn plugin_help_lines(language: UiLanguage) -> Vec<String> {
     descriptions.into_iter().map(str::to_string).collect()
 }
 
-fn rate_limit_line(label: &str, limit: &RateLimitSnapshot, language: UiLanguage) -> String {
-    let utilization = limit
-        .utilization
-        .0
-        .map_or_else(|| "—".to_string(), |value| format!("{value:.1}%"));
-    let reset = limit.resets_at.0.as_deref().map_or_else(
+fn detail_line(text: impl Into<String>, tone: UsagePluginDetailTone) -> UsagePluginDetailLine {
+    UsagePluginDetailLine {
+        text: text.into(),
+        tone,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AmountDisplay {
+    compact: String,
+    backend_value: Option<String>,
+    unusually_large: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BalanceMetricDetail {
+    summary: UsagePluginDetailLine,
+    backend_value: Option<UsagePluginDetailLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtraUsageDetailLines {
+    core: Vec<UsagePluginDetailLine>,
+    backend_values: Vec<UsagePluginDetailLine>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BalanceMetricStatus {
+    UsedPercentage(f64),
+    Empty,
+    Inconsistent,
+    UnusuallyLarge,
+}
+
+fn balance_metric_detail(
+    label: &str,
+    used: f64,
+    quota: f64,
+    remaining: f64,
+    language: UiLanguage,
+    narrow: bool,
+) -> BalanceMetricDetail {
+    let used_display = format_amount(used);
+    let quota_display = format_amount(quota);
+    let remaining_display = format_amount(remaining);
+    let status = balance_metric_status(used, quota, remaining);
+    let status_text = match (status, language) {
+        (BalanceMetricStatus::UsedPercentage(value), UiLanguage::ZhCn) => {
+            format!("{} 已用", format_percentage(value))
+        }
+        (BalanceMetricStatus::UsedPercentage(value), UiLanguage::EnUs) => {
+            format!("{} used", format_percentage(value))
+        }
+        (BalanceMetricStatus::Empty, UiLanguage::ZhCn) => "未分配额度".to_string(),
+        (BalanceMetricStatus::Empty, UiLanguage::EnUs) => "no quota allocated".to_string(),
+        (BalanceMetricStatus::Inconsistent, UiLanguage::ZhCn) => {
+            "⚠ 后端数值不一致，未计算比例".to_string()
+        }
+        (BalanceMetricStatus::Inconsistent, UiLanguage::EnUs) => {
+            "⚠ inconsistent backend values; percentage not calculated".to_string()
+        }
+        (BalanceMetricStatus::UnusuallyLarge, UiLanguage::ZhCn) => {
+            "⚠ 后端值异常大，未计算比例".to_string()
+        }
+        (BalanceMetricStatus::UnusuallyLarge, UiLanguage::EnUs) => {
+            "⚠ unusually large backend value; percentage not calculated".to_string()
+        }
+    };
+    let summary = match (language, narrow) {
+        (UiLanguage::ZhCn, true) => format!(
+            "{label} · {status_text} · {}/{} · 可用 {}",
+            used_display.compact, quota_display.compact, remaining_display.compact
+        ),
+        (UiLanguage::ZhCn, false) => format!(
+            "{label} · 已用 {} / 总额 {} · 可用 {} · {status_text}",
+            used_display.compact, quota_display.compact, remaining_display.compact
+        ),
+        (UiLanguage::EnUs, true) => format!(
+            "{label} · {status_text} · {}/{} · {} left",
+            used_display.compact, quota_display.compact, remaining_display.compact
+        ),
+        (UiLanguage::EnUs, false) => format!(
+            "{label} · {} used / {} total · {} left · {status_text}",
+            used_display.compact, quota_display.compact, remaining_display.compact
+        ),
+    };
+    let tone = if matches!(
+        status,
+        BalanceMetricStatus::Inconsistent | BalanceMetricStatus::UnusuallyLarge
+    ) {
+        UsagePluginDetailTone::Warning
+    } else {
+        UsagePluginDetailTone::Metric
+    };
+    let backend_value = if used_display.backend_value.is_some()
+        || quota_display.backend_value.is_some()
+        || remaining_display.backend_value.is_some()
+    {
+        let used = used_display
+            .backend_value
+            .clone()
+            .unwrap_or_else(|| used_display.compact.clone());
+        let quota = quota_display
+            .backend_value
+            .clone()
+            .unwrap_or_else(|| quota_display.compact.clone());
+        let remaining = remaining_display
+            .backend_value
+            .clone()
+            .unwrap_or_else(|| remaining_display.compact.clone());
+        Some(detail_line(
+            match language {
+                UiLanguage::ZhCn => {
+                    format!("{label} 后端原值 · 已用 {used} / 总额 {quota} / 可用 {remaining}")
+                }
+                UiLanguage::EnUs => format!(
+                    "{label} backend values · {used} used / {quota} total / {remaining} left"
+                ),
+            },
+            UsagePluginDetailTone::Supporting,
+        ))
+    } else {
+        None
+    };
+
+    BalanceMetricDetail {
+        summary: detail_line(summary, tone),
+        backend_value,
+    }
+}
+
+fn balance_metric_status(used: f64, quota: f64, remaining: f64) -> BalanceMetricStatus {
+    if [used, quota, remaining]
+        .into_iter()
+        .any(|value| value.abs() >= 1.0e15)
+    {
+        return BalanceMetricStatus::UnusuallyLarge;
+    }
+    if quota == 0.0 && used == 0.0 && remaining == 0.0 {
+        return BalanceMetricStatus::Empty;
+    }
+    if quota <= 0.0 {
+        return BalanceMetricStatus::Inconsistent;
+    }
+    let tolerance = (quota.abs() * 0.005).max(1.0);
+    if used > quota + tolerance
+        || remaining > quota + tolerance
+        || (used + remaining - quota).abs() > tolerance
+    {
+        BalanceMetricStatus::Inconsistent
+    } else {
+        BalanceMetricStatus::UsedPercentage(used / quota * 100.0)
+    }
+}
+
+fn rate_limit_lines(
+    label: &str,
+    window: &str,
+    limit: &RateLimitSnapshot,
+    language: UiLanguage,
+    narrow: bool,
+) -> Vec<UsagePluginDetailLine> {
+    let usage = limit.utilization.0.map_or_else(
         || {
             language
-                .text("重置时间未提供", "reset time unavailable")
+                .text("用量未提供", "usage not reported")
                 .to_string()
         },
         |value| match language {
-            UiLanguage::ZhCn => format!("重置 {value}"),
-            UiLanguage::EnUs => format!("resets {value}"),
+            UiLanguage::ZhCn => format!(
+                "{} 已用 · {} 可用",
+                format_percentage(value),
+                format_percentage(100.0 - value)
+            ),
+            UiLanguage::EnUs => format!(
+                "{} used · {} available",
+                format_percentage(value),
+                format_percentage(100.0 - value)
+            ),
         },
     );
-    let overridable = limit.overridable.0.map(|overridable| match language {
-        UiLanguage::ZhCn => {
-            if overridable {
-                " · 可覆盖"
-            } else {
-                " · 不可覆盖"
-            }
-        }
-        UiLanguage::EnUs => {
-            if overridable {
-                " · overridable"
-            } else {
-                " · not overridable"
-            }
-        }
-    });
-    match language {
-        UiLanguage::ZhCn => format!(
-            "{label}：{utilization} · {reset}{}",
-            overridable.unwrap_or_default()
-        ),
-        UiLanguage::EnUs => format!(
-            "{label}: {utilization} · {reset}{}",
-            overridable.unwrap_or_default()
-        ),
-    }
-}
-
-fn extra_usage_lines(extra: &ExtraUsageSnapshot, language: UiLanguage) -> Vec<String> {
-    if !extra.is_enabled {
-        return vec![
+    let reset = limit.resets_at.0.as_deref().map_or_else(
+        || {
             language
-                .text("额外用量：未启用", "Extra usage: disabled")
-                .to_string(),
-        ];
-    }
-    let limit = extra.monthly_limit.0.map_or_else(
-        || language.text("不限额", "unlimited").to_string(),
-        format_number,
+                .text("重置时间未提供", "reset time not reported")
+                .to_string()
+        },
+        |value| match language {
+            UiLanguage::ZhCn => format!("重置 {}", format_reset_time(value)),
+            UiLanguage::EnUs => format!("resets {}", format_reset_time(value)),
+        },
     );
-    let used = extra
-        .used_credits
+    let policy = limit
+        .overridable
         .0
-        .map_or_else(|| "—".to_string(), format_number);
-    let utilization = extra
-        .utilization
-        .0
-        .map_or_else(|| "—".to_string(), |value| format!("{value:.1}%"));
-    vec![match language {
-        UiLanguage::ZhCn => format!("额外用量：已用 {used} · 月限额 {limit} · {utilization}"),
-        UiLanguage::EnUs => {
-            format!("Extra usage: {used} used · monthly limit {limit} · {utilization}")
-        }
-    }]
+        .map(|overridable| match (language, overridable) {
+            (UiLanguage::ZhCn, true) => "耗尽后可继续",
+            (UiLanguage::ZhCn, false) => "耗尽后需等待重置",
+            (UiLanguage::EnUs, true) => "can continue at limit",
+            (UiLanguage::EnUs, false) => "must wait at limit",
+        });
+    let metric = format!("{label} · {window} · {usage}");
+    let reset_and_policy = policy.map_or(reset.clone(), |policy| format!("{reset} · {policy}"));
+    if narrow {
+        vec![
+            detail_line(metric, UsagePluginDetailTone::Metric),
+            detail_line(
+                format!("  {reset_and_policy}"),
+                UsagePluginDetailTone::Supporting,
+            ),
+        ]
+    } else {
+        vec![detail_line(
+            format!("{metric} · {reset_and_policy}"),
+            UsagePluginDetailTone::Metric,
+        )]
+    }
 }
 
-fn format_number(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.2}")
+fn extra_usage_detail_lines(
+    extra: &ExtraUsageSnapshot,
+    language: UiLanguage,
+    narrow: bool,
+) -> ExtraUsageDetailLines {
+    if !extra.is_enabled {
+        return ExtraUsageDetailLines {
+            core: vec![detail_line(
+                language.text("额外用量 · 未启用", "Extra usage · disabled"),
+                UsagePluginDetailTone::Supporting,
+            )],
+            backend_values: Vec::new(),
+        };
     }
+
+    let used = extra.used_credits.0.map(format_amount);
+    let limit = extra.monthly_limit.0.map(format_amount);
+    let used_compact = used
+        .as_ref()
+        .map_or_else(|| "—".to_string(), |value| value.compact.clone());
+    let limit_compact = limit.as_ref().map_or_else(
+        || language.text("不限额", "unlimited").to_string(),
+        |value| value.compact.clone(),
+    );
+    let utilization = extra.utilization.0.map_or_else(
+        || {
+            language
+                .text("比例未提供", "percentage not reported")
+                .to_string()
+        },
+        |value| match language {
+            UiLanguage::ZhCn => format!("{} 已用", format_percentage(value)),
+            UiLanguage::EnUs => format!("{} used", format_percentage(value)),
+        },
+    );
+    let unusually_large = used.as_ref().is_some_and(|value| value.unusually_large)
+        || limit.as_ref().is_some_and(|value| value.unusually_large);
+    let warning = if unusually_large {
+        language.text(" · ⚠ 后端值异常大", " · ⚠ unusually large backend value")
+    } else {
+        ""
+    };
+    let tone = if unusually_large {
+        UsagePluginDetailTone::Warning
+    } else {
+        UsagePluginDetailTone::Metric
+    };
+    let core = if narrow {
+        vec![
+            detail_line(
+                match language {
+                    UiLanguage::ZhCn => {
+                        format!("额外用量 · 已用 {used_compact} · {utilization}{warning}")
+                    }
+                    UiLanguage::EnUs => {
+                        format!("Extra usage · {used_compact} used · {utilization}{warning}")
+                    }
+                },
+                tone,
+            ),
+            detail_line(
+                match language {
+                    UiLanguage::ZhCn => format!("  月限额 {limit_compact}"),
+                    UiLanguage::EnUs => format!("  Monthly limit {limit_compact}"),
+                },
+                UsagePluginDetailTone::Supporting,
+            ),
+        ]
+    } else {
+        vec![detail_line(
+            match language {
+                UiLanguage::ZhCn => format!(
+                    "额外用量 · 已用 {used_compact} · 月限额 {limit_compact} · {utilization}{warning}"
+                ),
+                UiLanguage::EnUs => format!(
+                    "Extra usage · {used_compact} used · {limit_compact} monthly limit · {utilization}{warning}"
+                ),
+            },
+            tone,
+        )]
+    };
+    let mut backend_values = Vec::new();
+    if used
+        .as_ref()
+        .is_some_and(|value| value.backend_value.is_some())
+        || limit
+            .as_ref()
+            .is_some_and(|value| value.backend_value.is_some())
+    {
+        let used = used
+            .as_ref()
+            .and_then(|value| value.backend_value.as_ref())
+            .cloned()
+            .unwrap_or(used_compact);
+        let limit = limit
+            .as_ref()
+            .and_then(|value| value.backend_value.as_ref())
+            .cloned()
+            .unwrap_or(limit_compact);
+        backend_values.push(detail_line(
+            match language {
+                UiLanguage::ZhCn => {
+                    format!("额外用量后端原值 · 已用 {used} / 月限额 {limit}")
+                }
+                UiLanguage::EnUs => {
+                    format!("Extra-usage backend values · {used} used / {limit} monthly limit")
+                }
+            },
+            UsagePluginDetailTone::Supporting,
+        ));
+    }
+
+    ExtraUsageDetailLines {
+        core,
+        backend_values,
+    }
+}
+
+fn format_amount(value: f64) -> AmountDisplay {
+    let absolute = value.abs();
+    let backend_value = format_backend_number(value);
+    let (scaled, suffix) = if absolute >= 1_000_000_000_000.0 {
+        (value / 1_000_000_000_000.0, "T")
+    } else if absolute >= 1_000_000_000.0 {
+        (value / 1_000_000_000.0, "B")
+    } else if absolute >= 1_000_000.0 {
+        (value / 1_000_000.0, "M")
+    } else if absolute >= 100_000.0 {
+        (value / 1_000.0, "K")
+    } else {
+        return AmountDisplay {
+            compact: backend_value,
+            backend_value: None,
+            unusually_large: false,
+        };
+    };
+    let compact = if absolute >= 1.0e15 {
+        format!("≈{value:.2e}")
+    } else {
+        format!("≈{}{suffix}", format_scaled_number(scaled))
+    };
+    AmountDisplay {
+        compact,
+        backend_value: Some(backend_value),
+        unusually_large: absolute >= 1.0e15,
+    }
+}
+
+fn format_scaled_number(value: f64) -> String {
+    let precision = if value.abs() >= 100.0 {
+        0
+    } else if value.abs() >= 10.0 {
+        1
+    } else {
+        2
+    };
+    trim_decimal_zeros(format!("{value:.precision$}"))
+}
+
+fn format_backend_number(value: f64) -> String {
+    let absolute = value.abs();
+    if absolute >= 1.0e15 || (absolute > 0.0 && absolute < 0.000_001) {
+        return format!("{value:.17e}");
+    }
+    let plain = trim_decimal_zeros(format!("{value:.6}"));
+    let (integer, fraction) = plain
+        .split_once('.')
+        .map_or((plain.as_str(), None), |(integer, fraction)| {
+            (integer, Some(fraction))
+        });
+    let grouped = group_integer_digits(integer);
+    fraction.map_or(grouped.clone(), |fraction| format!("{grouped}.{fraction}"))
+}
+
+fn format_u64(value: u64) -> String {
+    group_integer_digits(&value.to_string())
+}
+
+fn group_integer_digits(value: &str) -> String {
+    let (sign, digits) = value
+        .strip_prefix('-')
+        .map_or(("", value), |digits| ("-", digits));
+    let mut grouped = String::with_capacity(value.len() + value.len() / 3);
+    grouped.push_str(sign);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    grouped
+}
+
+fn trim_decimal_zeros(mut value: String) -> String {
+    if value.contains('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+    }
+    value
+}
+
+fn format_percentage(value: f64) -> String {
+    format!("{value:.1}%")
+}
+
+fn format_reset_time(value: &str) -> String {
+    value
+        .strip_suffix('Z')
+        .and_then(|value| value.split_once('T'))
+        .filter(|(date, time)| date.len() == 10 && !time.is_empty())
+        .map_or_else(
+            || value.to_string(),
+            |(date, time)| format!("{date} {time} UTC"),
+        )
 }
 
 fn validation_diagnostic_line(
@@ -5111,7 +5600,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_accepts_backend_negative_call_sentinels_and_omits_the_call_row() {
+    fn usage_accepts_backend_negative_call_sentinels_and_labels_calls_as_unreported() {
         let (mut state, effect) = UsagePluginManagementState::open_usage();
         let (token, _) = private(&effect);
         let mut snapshot = usage_snapshot(Value::Null);
@@ -5124,9 +5613,124 @@ mod tests {
                 .is_empty()
         );
         let details = state.details(UiLanguage::ZhCn);
-        assert!(details.iter().any(|line| line.starts_with("Token：")));
-        assert!(!details.iter().any(|line| line.starts_with("调用：")));
+        assert!(details.iter().any(|line| line.starts_with("Token ·")));
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "调用 · 后端未提供独立调用额度")
+        );
         assert!(state.notice().is_none());
+    }
+
+    #[test]
+    fn usage_information_architecture_formats_units_percentages_windows_and_backend_values() {
+        let (mut state, effect) = UsagePluginManagementState::open_usage();
+        let (token, _) = private(&effect);
+        let mut snapshot = usage_snapshot(json!(true));
+        snapshot["entitlement_balance"]["total_token_quota"] = json!(987_654_321_000.0);
+        snapshot["entitlement_balance"]["total_token_used"] = json!(123_456_789_000.0);
+        snapshot["entitlement_balance"]["total_token_remaining"] = json!(864_197_532_000.0);
+        snapshot["entitlement_balance"]["active_entitlements"] = json!(12_345_u64);
+        snapshot["utilization"]["seven_day"]["utilization"] = json!(62.5);
+        snapshot["utilization"]["seven_day"]["resets_at"] = json!("2030-01-07T08:30:00Z");
+
+        state.apply_result(token, snapshot, UiLanguage::ZhCn);
+        let chinese = state.detail_lines(UiLanguage::ZhCn, 90);
+        let chinese_text = chinese
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(chinese_text.contains("额度余额 · 有效额度 12,345 项"));
+        assert!(chinese_text.contains("Token · 已用 ≈123B / 总额 ≈988B"));
+        assert!(chinese_text.contains("12.5% 已用"));
+        assert!(chinese_text.contains("Token 后端原值"));
+        assert!(chinese_text.contains("123,456,789,000"));
+        assert!(chinese_text.contains("当前会话 · 5 小时窗口"));
+        assert!(chinese_text.contains("七天用量 · 滚动窗口"));
+        assert!(chinese_text.contains("2030-01-07 08:30:00 UTC"));
+        assert!(chinese_text.contains("额外用量"));
+        assert!(chinese.len() <= 12);
+
+        let english = state.detail_lines(UiLanguage::EnUs, 52);
+        let english_text = english
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(english_text.contains("Entitlement balance"));
+        assert!(english_text.contains("Calls"));
+        assert!(english_text.contains("Current session"));
+        assert!(english_text.contains("Seven-day usage"));
+        assert!(english_text.contains("resets 2030-01-07 08:30:00 UTC"));
+        assert!(english.len() <= 12);
+    }
+
+    #[test]
+    fn usage_does_not_invent_a_percentage_for_inconsistent_backend_balances() {
+        let (mut state, effect) = UsagePluginManagementState::open_usage();
+        let (token, _) = private(&effect);
+        let mut snapshot = usage_snapshot(Value::Null);
+        snapshot["entitlement_balance"]["total_token_quota"] = json!(100.0);
+        snapshot["entitlement_balance"]["total_token_used"] = json!(90.0);
+        snapshot["entitlement_balance"]["total_token_remaining"] = json!(90.0);
+
+        state.apply_result(token, snapshot, UiLanguage::ZhCn);
+        let token_line = state
+            .detail_lines(UiLanguage::ZhCn, 90)
+            .into_iter()
+            .find(|line| line.text.starts_with("Token ·"))
+            .expect("token line");
+        assert_eq!(token_line.tone, UsagePluginDetailTone::Warning);
+        assert!(token_line.text.contains("后端数值不一致"));
+        assert!(!token_line.text.contains('%'));
+        assert!(token_line.text.contains("90"));
+        assert!(token_line.text.contains("100"));
+    }
+
+    #[test]
+    fn usage_number_formatting_is_bounded_and_transparent_for_extreme_finite_values() {
+        let extreme = format_amount(f64::MAX);
+        assert!(extreme.compact.starts_with("≈1.80e308"), "{extreme:?}");
+        assert!(extreme.unusually_large);
+        assert!(
+            extreme
+                .backend_value
+                .as_deref()
+                .is_some_and(|value| value.contains("e308"))
+        );
+        assert!(extreme.compact.len() < 32);
+        assert!(format_backend_number(12_345.25).contains("12,345.25"));
+        assert_eq!(
+            format_reset_time("2030-01-01T00:00:00Z"),
+            "2030-01-01 00:00:00 UTC"
+        );
+    }
+
+    #[test]
+    fn usage_flags_huge_backend_sentinels_instead_of_presenting_them_as_real_quota() {
+        let (mut state, effect) = UsagePluginManagementState::open_usage();
+        let (token, _) = private(&effect);
+        let mut snapshot = usage_snapshot(Value::Null);
+        snapshot["entitlement_balance"]["total_token_quota"] = json!(1.0e18);
+        snapshot["entitlement_balance"]["total_token_used"] = json!(5.0e17);
+        snapshot["entitlement_balance"]["total_token_remaining"] = json!(5.0e17);
+
+        state.apply_result(token, snapshot, UiLanguage::ZhCn);
+        let details = state.detail_lines(UiLanguage::ZhCn, 90);
+        let token_line = details
+            .iter()
+            .find(|line| line.text.starts_with("Token ·"))
+            .expect("token line");
+        assert_eq!(token_line.tone, UsagePluginDetailTone::Warning);
+        assert!(token_line.text.contains("后端值异常大"));
+        assert!(!token_line.text.contains('%'));
+        assert!(
+            details
+                .iter()
+                .any(|line| line.text.contains("1.00000000000000000e18")),
+            "decoded backend fact must remain inspectable: {details:?}"
+        );
     }
 
     #[test]

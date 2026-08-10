@@ -2,7 +2,7 @@
 // Do not edit by hand. Regenerate from the current TypeScript unions.
 
 pub(crate) const GENERATED_RENDERER_CAPABILITY_CONTRACT_SHA256: &str =
-    "4480d1743da79c94ceb714f77e19b61a4355d42320d2992b58ef3e8a4ccdc7fd";
+    "01a6c36628f0f0a553ded6ab31a91bfcf09ca07a83e3aaf2be7fc6822656fead";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +322,7 @@ pub(crate) const GENERATED_STDIN_MESSAGE_TYPES: &[&str] = &[
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) const GENERATED_PRIVATE_RUNTIME_ACTION_KINDS: &[&str] = &[
+    "bug_report_submit",
     "health_snapshot",
     "model.account.consent",
     "model.account.login_cancel",
@@ -372,6 +373,8 @@ pub(crate) const GENERATED_PRIVATE_RUNTIME_ACTION_KINDS: &[&str] = &[
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) const GENERATED_PRIVATE_RUNTIME_RESULT_KINDS: &[&str] = &[
+    "bug_report_submitted",
+    "bug_report_unconfirmed",
     "health_snapshot",
     "model.account.consent",
     "model.account.login_cancel",

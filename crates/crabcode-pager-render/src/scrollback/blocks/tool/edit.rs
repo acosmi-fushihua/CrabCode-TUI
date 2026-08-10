@@ -33,7 +33,7 @@ use similar::ChangeTag;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Style as SyntectStyle;
 
-use super::TOOL_HEADER_RANGE;
+use super::{TOOL_HEADER_RANGE, failure::failure_lines};
 use crate::appearance::RendererLanguage;
 use crate::diff::{DiffHunk, diff_hunks_to_patch};
 use crate::scrollback::block::BlockContent;
@@ -1305,16 +1305,23 @@ impl EditToolCallBlock {
                 } else {
                     line.spans.len()
                 };
-                RenderedBlockOutput::from(BlockOutput {
-                    lines: vec![BlockLine {
-                        selectable: Selectable::Spans(1..path_end),
-                        selection_range: Some(TOOL_HEADER_RANGE),
-                        // Copy the painted path span (basename when collapsed).
-                        content: line,
-                        link_target,
-                        ..Default::default()
-                    }],
-                })
+                let mut lines = vec![BlockLine {
+                    selectable: Selectable::Spans(1..path_end),
+                    selection_range: Some(TOOL_HEADER_RANGE),
+                    // Copy the painted path span (basename when collapsed).
+                    content: line,
+                    link_target,
+                    ..Default::default()
+                }];
+                if let Some(error) = &self.error {
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
+                RenderedBlockOutput::from(BlockOutput { lines })
             }
             DisplayMode::Truncated | DisplayMode::Expanded => {
                 // Convert appearance config to render config
@@ -1371,14 +1378,14 @@ impl EditToolCallBlock {
                 }
 
                 // Error message (non-selectable decoration)
-                if let Some(err) = &self.error {
+                if let Some(error) = &self.error {
                     lines.push(BlockLine::separator(Line::from("")));
-                    for line in err.lines() {
-                        lines.push(BlockLine::separator(Line::from(Span::styled(
-                            line.to_string(),
-                            theme.muted(),
-                        ))));
-                    }
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
                 }
 
                 // Diff content with syntax highlighting and full-width backgrounds
@@ -1491,11 +1498,9 @@ impl BlockContent for EditToolCallBlock {
     }
 
     fn finished_display_mode(&self) -> Option<DisplayMode> {
-        if self.error.is_some() {
-            Some(DisplayMode::Collapsed)
-        } else {
-            None // keep current mode (the config-aware default, or a user fold)
-        }
+        // Materialization chooses the compact failure default. Completion
+        // itself must preserve a later user fold/expand gesture.
+        None
     }
 
     fn next_fold_mode(&self, current: DisplayMode, _is_running: bool) -> DisplayMode {
@@ -1516,7 +1521,7 @@ impl BlockContent for EditToolCallBlock {
             .blocks
             .edit
             .effective_line_summary(crate::appearance::cache::load_collapsed_edit_blocks());
-        Some(Text::from(self.header_line_for_language(
+        let mut lines = vec![self.header_line_for_language(
             &theme,
             false,
             show_summary,
@@ -1525,7 +1530,21 @@ impl BlockContent for EditToolCallBlock {
             ctx.cwd.as_deref(),
             None,
             ctx.appearance.language,
-        )))
+        )];
+        if let Some(error) = &self.error {
+            lines.push(Line::from(""));
+            lines.extend(
+                failure_lines(
+                    error,
+                    DisplayMode::Expanded,
+                    ctx.content_width(),
+                    theme.fg(theme.accent_error),
+                )
+                .into_iter()
+                .map(|line| line.content),
+            );
+        }
+        Some(Text::from(lines))
     }
 }
 

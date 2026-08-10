@@ -9,7 +9,10 @@ use crate::scrollback::types::{
 };
 use crate::theme::Theme;
 
-use super::TOOL_HEADER_RANGE;
+use super::{
+    TOOL_HEADER_RANGE,
+    failure::{failure_lines, plain_text_result_lines},
+};
 
 /// A single line match from search results.
 #[derive(Debug, Clone)]
@@ -82,6 +85,9 @@ pub struct SearchToolCallBlock {
     /// File paths only (for `files_with_matches` output mode).
     /// Used when `file_matches` is empty but results exist.
     pub file_paths: Vec<String>,
+    /// Unstructured string result retained when the runtime does not provide
+    /// typed file matches or paths.
+    pub raw_output: Option<String>,
     /// Error message if the tool call failed (None = success).
     pub error: Option<String>,
     /// Extra metadata from the search input (path, glob, mode, etc.).
@@ -104,6 +110,7 @@ impl SearchToolCallBlock {
             match_count: 0,
             file_matches: Vec::new(),
             file_paths: Vec::new(),
+            raw_output: None,
             error: None,
             meta: SearchInputMeta::default(),
             started_at: None,
@@ -166,6 +173,17 @@ impl SearchToolCallBlock {
     pub fn set_file_matches(&mut self, match_count: usize, file_matches: Vec<SearchFileMatch>) {
         self.match_count = match_count;
         self.file_matches = file_matches;
+    }
+
+    /// Set the unstructured string result for safe expanded rendering.
+    pub fn set_raw_output(&mut self, output: impl Into<String>) {
+        self.raw_output = Some(output.into());
+    }
+
+    /// Set the unstructured string result (builder form).
+    pub fn with_raw_output(mut self, output: impl Into<String>) -> Self {
+        self.set_raw_output(output);
+        self
     }
 
     /// Build the match summary string, adapted by output mode.
@@ -404,14 +422,23 @@ impl BlockContent for SearchToolCallBlock {
         let dim_details = tool_cfg.dim_details;
 
         match ctx.mode {
-            DisplayMode::Collapsed => BlockOutput {
-                lines: vec![self.header_block_line(self.header_line(
+            DisplayMode::Collapsed => {
+                let mut lines = vec![self.header_block_line(self.header_line(
                     &theme,
                     muted_collapsed,
                     dim_details,
                     Some(ctx.content_width()),
-                ))],
-            },
+                ))];
+                if let Some(error) = &self.error {
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
+                BlockOutput { lines }
+            }
             DisplayMode::Truncated | DisplayMode::Expanded => {
                 let mut lines: Vec<BlockLine> = vec![self.header_block_line(self.header_line(
                     &theme,
@@ -425,12 +452,27 @@ impl BlockContent for SearchToolCallBlock {
                 lines.push(BlockLine::separator(Line::from("")));
                 lines.push(BlockLine::separator(self.metadata_line(&theme)));
 
-                let has_results = !self.file_matches.is_empty() || !self.file_paths.is_empty();
+                if let Some(error) = &self.error {
+                    lines.push(BlockLine::separator(Line::from("")));
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
+
+                let has_results = !self.file_matches.is_empty()
+                    || !self.file_paths.is_empty()
+                    || self
+                        .raw_output
+                        .as_ref()
+                        .is_some_and(|output| !output.is_empty());
 
                 if has_results {
                     // Blank line before results
                     lines.push(Line::from("").into());
-                } else if self.match_count == 0 {
+                } else if self.match_count == 0 && self.error.is_none() {
                     // No results — show a hint
                     lines.push(Line::from("").into());
                     lines.push(
@@ -511,6 +553,17 @@ impl BlockContent for SearchToolCallBlock {
 
                         lines.push(BlockLine::from(line).with_panel_background(theme.bg_dark));
                     }
+                } else if let Some(output) = self.raw_output.as_deref() {
+                    lines.extend(
+                        plain_text_result_lines(
+                            output,
+                            ctx.mode,
+                            ctx.content_width(),
+                            theme.primary(),
+                        )
+                        .into_iter()
+                        .map(|line| line.with_panel_background(theme.bg_dark)),
+                    );
                 }
 
                 BlockOutput { lines }
@@ -546,7 +599,7 @@ impl BlockContent for SearchToolCallBlock {
     fn is_foldable(&self) -> bool {
         // Always foldable (even with no results — expand shows metadata
         // and/or "(no results)" for consistency).
-        self.error.is_none()
+        true
     }
 
     fn default_display_mode(&self) -> DisplayMode {

@@ -3,13 +3,22 @@
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-use super::TOOL_HEADER_RANGE;
-use crate::render::line_utils::truncate_str;
+use super::{
+    TOOL_HEADER_RANGE,
+    failure::{cap_block_lines, failure_lines, safe_field_preview, safe_single_line},
+};
 use crate::scrollback::block::BlockContent;
 use crate::scrollback::types::{
     AccentStyle, BlockBackground, BlockContext, BlockLine, BlockOutput, DisplayMode, Selectable,
 };
 use crate::theme::Theme;
+
+const MAX_HEADER_FIELD_WIDTH: usize = 512;
+const TRUNCATED_RESULTS: usize = 3;
+const EXPANDED_RESULTS: usize = 40;
+const SNIPPET_LINES_PER_RESULT: usize = 3;
+const TRUNCATED_BLOCK_LINES: usize = 32;
+const EXPANDED_BLOCK_LINES: usize = 260;
 
 /// A single memory search result parsed from the tool output.
 #[derive(Debug, Clone)]
@@ -101,7 +110,7 @@ impl MemorySearchToolCallBlock {
                 let query_budget = w
                     .saturating_sub(prefix.len())
                     .saturating_sub(effective_suffix.len());
-                let display_query = truncate_str(&self.query, query_budget);
+                let display_query = safe_single_line(&self.query, query_budget);
 
                 let mut spans = vec![
                     Span::styled(prefix, bold_style),
@@ -114,7 +123,10 @@ impl MemorySearchToolCallBlock {
             }
             None => Line::from(vec![
                 Span::styled(prefix, bold_style),
-                Span::styled(self.query.clone(), query_style),
+                Span::styled(
+                    safe_single_line(&self.query, MAX_HEADER_FIELD_WIDTH),
+                    query_style,
+                ),
                 Span::styled(suffix, theme.dim()),
             ]),
         }
@@ -140,13 +152,22 @@ impl BlockContent for MemorySearchToolCallBlock {
             ctx.mute_when_collapsed(ctx.appearance.scrollback.blocks.tool.muted_collapsed);
 
         match ctx.mode {
-            DisplayMode::Collapsed => BlockOutput {
-                lines: vec![self.header_block_line(self.header_line(
+            DisplayMode::Collapsed => {
+                let mut lines = vec![self.header_block_line(self.header_line(
                     &theme,
                     muted_collapsed,
                     Some(ctx.content_width()),
-                ))],
-            },
+                ))];
+                if let Some(error) = &self.error {
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
+                BlockOutput { lines }
+            }
             DisplayMode::Truncated | DisplayMode::Expanded => {
                 let header = self.header_line(&theme, false, None);
                 let wrapped = crate::render::wrapping::wrap_header_flush(
@@ -181,6 +202,16 @@ impl BlockContent for MemorySearchToolCallBlock {
                     })
                     .collect();
 
+                if let Some(error) = &self.error {
+                    lines.push(Line::from("").into());
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
+
                 if self.results.is_empty() && self.error.is_none() {
                     lines.push(BlockLine::separator(Line::from("")));
                     lines.push(BlockLine::separator(Line::from(Span::styled(
@@ -189,26 +220,36 @@ impl BlockContent for MemorySearchToolCallBlock {
                     ))));
                 }
 
-                for (i, r) in self.results.iter().enumerate() {
+                let max_results = if ctx.mode == DisplayMode::Truncated {
+                    TRUNCATED_RESULTS
+                } else {
+                    EXPANDED_RESULTS
+                };
+                for (i, r) in self.results.iter().take(max_results).enumerate() {
                     lines.push(Line::from("").into());
 
                     // Preserve every display field already emitted by the
                     // CrabCode MemorySearchTool result. No missing upstream
                     // line range/source field is synthesized.
                     let idx_span = Span::styled(format!("  {}. ", i + 1), theme.muted());
-                    let path_display = shorten_path(&r.path);
-                    let path_span = Span::styled(
-                        path_display.to_string(),
-                        theme.primary().add_modifier(Modifier::BOLD),
+                    let path_display = safe_single_line(
+                        shorten_path(&r.path),
+                        ctx.content_width().saturating_sub(8).max(1),
                     );
+                    let path_span =
+                        Span::styled(path_display, theme.primary().add_modifier(Modifier::BOLD));
                     let mut result_spans = vec![idx_span, path_span];
                     if let Some(name) = r.name.as_deref().filter(|name| !name.is_empty()) {
-                        result_spans.push(Span::styled(format!(" — {name}"), theme.muted()));
+                        let name =
+                            safe_single_line(name, ctx.content_width().saturating_sub(12).max(1));
+                        if !name.is_empty() {
+                            result_spans.push(Span::styled(format!(" — {name}"), theme.muted()));
+                        }
                     }
                     let mut metadata = format!("  (score: {:.2}", r.score);
                     if let Some(scope) = r.scope.as_deref().filter(|scope| !scope.is_empty()) {
                         metadata.push_str(", scope: ");
-                        metadata.push_str(scope);
+                        metadata.push_str(&safe_single_line(scope, 64));
                     }
                     if let Some(memory_type) = r
                         .memory_type
@@ -216,7 +257,7 @@ impl BlockContent for MemorySearchToolCallBlock {
                         .filter(|memory_type| !memory_type.is_empty())
                     {
                         metadata.push_str(", type: ");
-                        metadata.push_str(memory_type);
+                        metadata.push_str(&safe_single_line(memory_type, 64));
                     }
                     metadata.push(')');
                     result_spans.push(Span::styled(metadata, theme.dim()));
@@ -224,15 +265,12 @@ impl BlockContent for MemorySearchToolCallBlock {
 
                     // Snippet preview (first 3 non-empty lines, with bg_dark)
                     if let Some(snippet) = &r.snippet {
-                        let snippet_lines: Vec<&str> = snippet
-                            .lines()
-                            .filter(|line| !line.trim().is_empty())
-                            .take(3)
-                            .collect();
-                        for snippet_line in &snippet_lines {
-                            let trimmed = snippet_line.trim();
-                            let display =
-                                truncate_str(trimmed, ctx.content_width().saturating_sub(4));
+                        let (snippet_lines, omitted) = safe_field_preview(
+                            snippet,
+                            SNIPPET_LINES_PER_RESULT,
+                            ctx.content_width().saturating_sub(4).max(1),
+                        );
+                        for display in snippet_lines {
                             lines.push(
                                 BlockLine::from(Line::from(Span::styled(
                                     format!("    {display}"),
@@ -241,19 +279,35 @@ impl BlockContent for MemorySearchToolCallBlock {
                                 .with_panel_background(theme.bg_dark),
                             );
                         }
+                        if omitted > 0 {
+                            lines.push(
+                                BlockLine::from(Line::from(Span::styled(
+                                    format!("    … ({omitted} snippet line(s) omitted)"),
+                                    theme.dim(),
+                                )))
+                                .with_panel_background(theme.bg_dark),
+                            );
+                        }
                     }
                 }
 
-                if let Some(ref err) = self.error {
+                let omitted_results = self.results.len().saturating_sub(max_results);
+                if omitted_results > 0 {
                     lines.push(Line::from("").into());
-                    lines.push(
-                        Line::from(Span::styled(
-                            format!("  {err}"),
-                            theme.fg(theme.accent_error),
-                        ))
-                        .into(),
-                    );
+                    lines.push(BlockLine::styled(Line::from(Span::styled(
+                        format!(
+                            "  … ({omitted_results} more result(s); expand or copy to inspect)"
+                        ),
+                        theme.dim(),
+                    ))));
                 }
+
+                let max_lines = if ctx.mode == DisplayMode::Truncated {
+                    TRUNCATED_BLOCK_LINES
+                } else {
+                    EXPANDED_BLOCK_LINES
+                };
+                cap_block_lines(&mut lines, max_lines, theme.dim());
 
                 BlockOutput { lines }
             }
@@ -298,7 +352,7 @@ impl BlockContent for MemorySearchToolCallBlock {
     }
 
     fn is_foldable(&self) -> bool {
-        self.error.is_none() && !self.results.is_empty()
+        !self.results.is_empty() || self.error.is_some()
     }
 
     fn default_display_mode(&self) -> DisplayMode {
@@ -431,6 +485,22 @@ mod tests {
         }
     }
 
+    fn rendered_text(block: &MemorySearchToolCallBlock, mode: DisplayMode) -> String {
+        block
+            .output(&ctx(mode))
+            .lines
+            .iter()
+            .map(|line| {
+                line.content
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn expanded_output_preserves_backend_result_fields() {
         let mut block = MemorySearchToolCallBlock::new("project conventions");
@@ -470,5 +540,78 @@ mod tests {
                 "missing {expected:?}: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn dynamic_memory_fields_are_terminal_safe_at_paint_time() {
+        let query = "query\u{1b}[31m\u{202e}".to_string();
+        let path = "/memory/secret\u{1b}]52;c;payload\u{7}.md".to_string();
+        let name = "name\u{202e}".to_string();
+        let snippet = "snippet\u{1b}[2J\nsecond\u{2066}line".to_string();
+        let scope = "private\u{1b}[0m".to_string();
+        let memory_type = "project\u{200f}".to_string();
+        let mut block = MemorySearchToolCallBlock::new(query.clone());
+        block.results.push(MemoryResult {
+            score: 0.9,
+            path: path.clone(),
+            name: Some(name.clone()),
+            snippet: Some(snippet.clone()),
+            scope: Some(scope.clone()),
+            memory_type: Some(memory_type.clone()),
+        });
+
+        let rendered = rendered_text(&block, DisplayMode::Expanded);
+        for control in ['\u{1b}', '\u{7}', '\u{202e}', '\u{2066}', '\u{200f}'] {
+            assert!(
+                !rendered.contains(control),
+                "unsafe {control:?}: {rendered:?}"
+            );
+        }
+        for visible in ["␛[31m", "␛]52;c;payload", "⟪U+202E⟫", "⟪U+2066⟫"] {
+            assert!(
+                rendered.contains(visible),
+                "missing {visible:?}: {rendered:?}"
+            );
+        }
+        assert_eq!(block.query, query);
+        assert_eq!(block.results[0].path, path);
+        assert_eq!(block.results[0].name.as_deref(), Some(name.as_str()));
+        assert_eq!(block.results[0].snippet.as_deref(), Some(snippet.as_str()));
+        assert_eq!(block.results[0].scope.as_deref(), Some(scope.as_str()));
+        assert_eq!(
+            block.results[0].memory_type.as_deref(),
+            Some(memory_type.as_str())
+        );
+    }
+
+    #[test]
+    fn memory_result_entries_and_output_rows_are_bounded_by_mode() {
+        let mut block = MemorySearchToolCallBlock::new("q".repeat(20_000));
+        block.results = (0..500)
+            .map(|index| MemoryResult {
+                score: 0.5,
+                path: format!("/memory/result-{index}.md"),
+                name: Some("name".repeat(2_000)),
+                snippet: Some(
+                    (0..100)
+                        .map(|line| format!("snippet {index}:{line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                scope: Some("private".repeat(500)),
+                memory_type: Some("project".repeat(500)),
+            })
+            .collect();
+
+        let truncated = block.output(&ctx(DisplayMode::Truncated));
+        assert!(truncated.lines.len() <= TRUNCATED_BLOCK_LINES);
+        let truncated_text = rendered_text(&block, DisplayMode::Truncated);
+        assert!(truncated_text.contains("more result"), "{truncated_text:?}");
+
+        let expanded = block.output(&ctx(DisplayMode::Expanded));
+        assert!(expanded.lines.len() <= EXPANDED_BLOCK_LINES);
+        let expanded_text = rendered_text(&block, DisplayMode::Expanded);
+        assert!(expanded_text.contains("more result"), "{expanded_text:?}");
+        assert!(!expanded_text.contains("result-499.md"));
     }
 }

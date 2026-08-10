@@ -121,15 +121,14 @@ pub(crate) struct RunScan {
 }
 
 impl RunScan {
-    /// Whether the run folds into a verb-group header row. One member is
-    /// enough — the compact label beats the member's own row, and the header
-    /// appearing with the first streaming call avoids a fold-in jump when the
-    /// second arrives. Members-only: thought members claim into runs but
+    /// Whether the run folds into a verb-group header row. A single member
+    /// keeps its own semantic row; aggregation starts only when there is a
+    /// real run to compact. Members-only: thought members claim into runs but
     /// never count, so a pure-thought run (whose label would be empty) never
     /// folds. The single predicate shared by the layout fold and
     /// `verb_group_range_of` so the two can't drift.
     pub(crate) fn folds(&self) -> bool {
-        self.members >= 1
+        self.members >= 2
     }
 }
 
@@ -476,6 +475,19 @@ mod tests {
     }
 
     #[test]
+    fn aggregation_requires_at_least_two_semantic_members() {
+        let one = vec![read("a.rs")];
+        let one_scan = scan_run_forward(|index| one.get(index), 0, true).expect("one-member run");
+        assert_eq!(one_scan.members, 1);
+        assert!(!one_scan.folds());
+
+        let two = vec![read("a.rs"), read("b.rs")];
+        let two_scan = scan_run_forward(|index| two.get(index), 0, true).expect("two-member run");
+        assert_eq!(two_scan.members, 2);
+        assert!(two_scan.folds());
+    }
+
+    #[test]
     fn buckets_in_first_appearance_order_with_plurality() {
         let entries = vec![
             read("a.rs"),
@@ -501,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_members_append_suffix_and_flag() {
+    fn failed_members_split_eager_runs_so_their_summaries_stay_visible() {
         let entries = vec![
             read("a.rs"),
             entry(ToolCallBlock::Read(
@@ -511,9 +523,16 @@ mod tests {
                 ReadToolCallBlock::new("also-gone.rs").with_error("no such file"),
             )),
         ];
-        let l = label(&entries);
-        assert_eq!(l.text, "Read 3 files · 2 failed");
-        assert!(l.failed);
+        let scan = scan_run_forward(|index| entries.get(index), 0, true).expect("successful read");
+        assert_eq!(scan.members, 1);
+        assert_eq!(scan.end, 1);
+        assert_eq!(scan.stop, 1);
+        assert!(
+            !scan.folds(),
+            "the success before a failure stays standalone"
+        );
+        assert!(matches!(run_step(&entries[1], true), RunStep::Break));
+        assert!(matches!(run_step(&entries[2], true), RunStep::Break));
     }
 
     #[test]
@@ -534,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn web_search_counts_distinct_sources_with_call_fallback() {
+    fn web_search_stays_out_of_eager_runs_but_labels_truncated_sources() {
         let searched = |query: &str, citations: &[&str]| {
             let mut b = WebSearchToolCallBlock::new(query);
             b.citations = citations.iter().map(|s| s.to_string()).collect();
@@ -546,15 +565,21 @@ mod tests {
             searched("renderer", &["https://a.com", "https://b.com"]),
             searched("pager", &["https://b.com", "https://c.com"]),
         ];
-        let l = label(&entries);
+        assert!(matches!(run_step(&entries[0], true), RunStep::Break));
+        let refs = entries.iter().collect::<Vec<_>>();
+        let l = truncation_header_label(&refs, 0..refs.len(), None, true, &Theme::current())
+            .expect("web searches retain their truncation label");
         assert_eq!(l.text, "Searched 3 websites");
 
-        // No citations yet (still running / no results): fall back to call count.
+        // No citations yet (still running / no results): truncation labels
+        // fall back to call count without enrolling the cards in eager runs.
         let entries = vec![
             entry(ToolCallBlock::WebSearch(WebSearchToolCallBlock::new("a"))),
             entry(ToolCallBlock::WebSearch(WebSearchToolCallBlock::new("b"))),
         ];
-        let l = label(&entries);
+        let refs = entries.iter().collect::<Vec<_>>();
+        let l = truncation_header_label(&refs, 0..refs.len(), None, true, &Theme::current())
+            .expect("web searches retain their truncation label");
         assert_eq!(l.text, "Searched 2 websites");
     }
 

@@ -2,12 +2,18 @@
 
 use ratatui::text::{Line, Span};
 
-use crate::render::wrapping::word_wrap_lines;
 use crate::scrollback::block::BlockContent;
 use crate::scrollback::types::{
     AccentStyle, BlockBackground, BlockContext, BlockLine, BlockOutput, DisplayMode,
 };
 use crate::theme::Theme;
+
+use super::failure::{failure_lines, plain_text_result_lines, safe_single_line};
+use crate::text_safety::sanitize_bounded_terminal_text;
+
+const MAX_HEADER_FIELD_WIDTH: usize = 512;
+const TRUNCATED_QA_PAIRS: usize = 8;
+const EXPANDED_QA_PAIRS: usize = 40;
 
 /// Other/unknown tool call.
 #[derive(Debug, Clone)]
@@ -149,28 +155,31 @@ impl OtherToolCallBlock {
         };
         let bold_style = text_style.add_modifier(ratatui::style::Modifier::BOLD);
 
-        let mut spans = if let Some((label, content)) = self.name.split_once(": ") {
+        let field_width = width.unwrap_or(MAX_HEADER_FIELD_WIDTH).max(1);
+        let name = safe_single_line(&self.name, field_width);
+        let summary = safe_single_line(&self.summary, field_width);
+        let mut spans = if let Some((label, content)) = name.split_once(": ") {
             vec![
                 Span::styled(format!("{label} "), bold_style),
                 Span::styled(content.to_string(), text_style),
             ]
         } else {
-            vec![Span::styled(self.name.clone(), bold_style)]
+            vec![Span::styled(name, bold_style)]
         };
 
-        if !self.summary.is_empty() {
+        if !summary.is_empty() {
             if let Some(w) = width {
                 // Only include summary if there's room.
                 let used: usize = spans
                     .iter()
                     .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                     .sum();
-                let summary = format!("  {}", self.summary);
-                if used + summary.len() <= w {
+                let summary = format!("  {summary}");
+                if used + unicode_width::UnicodeWidthStr::width(summary.as_str()) <= w {
                     spans.push(Span::styled(summary, theme.muted()));
                 }
             } else {
-                spans.push(Span::styled(format!("  {}", self.summary), theme.muted()));
+                spans.push(Span::styled(format!("  {summary}"), theme.muted()));
             }
         }
 
@@ -186,7 +195,6 @@ impl OtherToolCallBlock {
 impl BlockContent for OtherToolCallBlock {
     fn output(&self, ctx: &BlockContext) -> BlockOutput {
         let theme = Theme::current();
-        let width = ctx.width as usize;
         let muted_collapsed =
             ctx.mute_when_collapsed(ctx.appearance.scrollback.blocks.tool.muted_collapsed);
 
@@ -201,22 +209,24 @@ impl BlockContent for OtherToolCallBlock {
             let path_str = urlencoding::decode(&raw_path)
                 .map(|s| s.into_owned())
                 .unwrap_or(raw_path);
-            // Char-boundary middle-ellipsis (decoded paths may be multibyte).
-            let path_display = if path_str.chars().count() > max_w {
-                let keep = max_w.saturating_sub(3) / 2;
-                let end_keep = max_w.saturating_sub(3) - keep;
-                let chars: Vec<char> = path_str.chars().collect();
-                let head: String = chars[..keep].iter().collect();
-                let tail: String = chars[chars.len() - end_keep..].iter().collect();
-                format!("{head}...{tail}")
-            } else {
-                path_str
-            };
+            // A local filename may itself contain terminal controls or hard
+            // line breaks. Keep the PathBuf unchanged for open/copy while the
+            // painted path uses the shared width-aware safety boundary.
+            let path_display = safe_single_line(&path_str, max_w);
             let path_line = Line::from(Span::styled(
                 path_display,
                 ratatui::style::Style::default().fg(theme.gray_dim),
             ));
             let mut lines: Vec<BlockLine> = vec![header.into(), path_line.into()];
+
+            if let Some(error) = &self.error {
+                lines.extend(failure_lines(
+                    error,
+                    ctx.mode,
+                    ctx.content_width(),
+                    theme.fg(theme.accent_error),
+                ));
+            }
 
             // No inline graphics: centered "[Open]" button between blank
             // spacers (its click target is registered in render.rs).
@@ -244,25 +254,60 @@ impl BlockContent for OtherToolCallBlock {
         }
 
         match ctx.mode {
-            DisplayMode::Collapsed => BlockOutput {
-                lines: vec![
+            DisplayMode::Collapsed => {
+                let mut lines = vec![
                     self.collapsed_line(&theme, muted_collapsed, Some(ctx.content_width()))
                         .into(),
-                ],
-            },
+                ];
+                if let Some(error) = &self.error {
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
+                BlockOutput { lines }
+            }
             DisplayMode::Truncated | DisplayMode::Expanded => {
                 let mut lines: Vec<BlockLine> =
                     vec![self.collapsed_line(&theme, false, None).into()];
 
+                if let Some(error) = &self.error {
+                    lines.push(Line::from("").into());
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
+
                 if let Some(output) = &self.output {
                     // Try to render as structured Q&A (AskUserQuestion output).
-                    let qa_lines = parse_ask_user_qa_pairs(output);
+                    // Parse the same sanitized/bounded projection that may be
+                    // painted. The model keeps the original output for
+                    // copy/search.
+                    let safe_output = sanitize_bounded_terminal_text(output);
+                    let qa_lines = parse_ask_user_qa_pairs(&safe_output);
                     if !qa_lines.is_empty() {
-                        for (i, (question, answer)) in qa_lines.iter().enumerate() {
+                        let max_pairs = if ctx.mode == DisplayMode::Truncated {
+                            TRUNCATED_QA_PAIRS
+                        } else {
+                            EXPANDED_QA_PAIRS
+                        };
+                        for (i, (question, answer)) in qa_lines.iter().take(max_pairs).enumerate() {
                             // "  1. question text"
+                            let prefix = format!("  {}. ", i + 1);
+                            let question_width = ctx.content_width().saturating_sub(
+                                unicode_width::UnicodeWidthStr::width(prefix.as_str()),
+                            );
                             let q_line = Line::from(vec![
-                                Span::styled(format!("  {}. ", i + 1), theme.muted()),
-                                Span::styled(question.clone(), theme.primary()),
+                                Span::styled(prefix, theme.muted()),
+                                Span::styled(
+                                    safe_single_line(question, question_width),
+                                    theme.primary(),
+                                ),
                             ]);
                             lines.push(BlockLine::styled(q_line));
 
@@ -278,26 +323,35 @@ impl BlockContent for OtherToolCallBlock {
                                         "     \u{2192} ".to_string(),
                                         theme.fg(theme.accent_user),
                                     ),
-                                    Span::styled(answer.clone(), theme.fg(theme.accent_user)),
+                                    Span::styled(
+                                        safe_single_line(
+                                            answer,
+                                            ctx.content_width().saturating_sub(7),
+                                        ),
+                                        theme.fg(theme.accent_user),
+                                    ),
                                 ])
                             };
                             lines.push(BlockLine::styled(a_line));
                         }
+                        if qa_lines.len() > max_pairs {
+                            lines.push(BlockLine::styled(Line::from(Span::styled(
+                                format!(
+                                    "  … ({} question(s) omitted; full output retained)",
+                                    qa_lines.len() - max_pairs
+                                ),
+                                theme.dim(),
+                            ))));
+                        }
                     } else {
                         // Generic output rendering (non-Q&A tools).
                         lines.push(Line::from("").into());
-
-                        let styled_lines: Vec<Line<'static>> = output
-                            .lines()
-                            .map(|line| Line::from(Span::styled(line.to_string(), theme.muted())))
-                            .collect();
-
-                        let wrapped =
-                            word_wrap_lines(styled_lines, width.saturating_sub(2).max(20));
-
-                        for wrapped_line in wrapped {
-                            lines.push(BlockLine::styled(wrapped_line));
-                        }
+                        lines.extend(plain_text_result_lines(
+                            output,
+                            ctx.mode,
+                            ctx.content_width(),
+                            theme.muted(),
+                        ));
                     }
                 }
 
@@ -346,11 +400,7 @@ impl BlockContent for OtherToolCallBlock {
     }
 
     fn is_foldable(&self) -> bool {
-        // Not foldable if failed
-        if self.error.is_some() {
-            return false;
-        }
-        self.output.is_some()
+        self.output.is_some() || self.error.is_some()
     }
 
     fn default_display_mode(&self) -> DisplayMode {
@@ -540,4 +590,145 @@ fn parse_ask_user_qa_pairs(output: &str) -> Vec<(String, String)> {
     }
 
     vec![]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expanded_ctx() -> BlockContext {
+        BlockContext {
+            width: 80,
+            mode: DisplayMode::Expanded,
+            is_running: false,
+            raw: false,
+            max_lines: None,
+            appearance: Default::default(),
+            is_selected: false,
+            cwd: None,
+        }
+    }
+
+    fn block_text(output: &BlockOutput) -> String {
+        output
+            .lines
+            .iter()
+            .map(|line| {
+                line.content
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn dynamic_other_header_fields_are_single_line_terminal_safe_and_bounded() {
+        let name = format!(
+            "FutureTool\nforged\u{1b}]52;c;payload\u{7}\u{202e}{}",
+            "x".repeat(20_000)
+        );
+        let summary = format!("summary\nforged\u{1b}[31m\u{2066}{}", "y".repeat(20_000));
+        let block = OtherToolCallBlock::new(name.clone(), summary.clone());
+        let rendered = block
+            .collapsed_line(&Theme::current(), false, None)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        for control in ['\n', '\r', '\u{1b}', '\u{7}', '\u{202e}', '\u{2066}'] {
+            assert!(
+                !rendered.contains(control),
+                "unsafe {control:?}: {rendered:?}"
+            );
+        }
+        assert!(rendered.contains("␛]52;c;payload"), "{rendered:?}");
+        assert!(rendered.contains("⟪U+202E⟫"), "{rendered:?}");
+        assert!(
+            rendered.len() < 1_200,
+            "header was not bounded: {rendered:?}"
+        );
+        assert_eq!(block.name, name);
+        assert_eq!(block.summary, summary);
+    }
+
+    #[test]
+    fn expanded_failure_with_generic_output_is_terminal_safe_and_bounded() {
+        let output = (0..400)
+            .map(|index| format!("row {index} \u{1b}]52;c;payload\u{7}\u{0000}\u{2066}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = "failed\n\u{1b}[31mboom\u{1b}[0m\u{202e}".to_string();
+        let block = OtherToolCallBlock::new("FutureTool", "target")
+            .with_output(output.clone())
+            .with_error(error.clone());
+
+        let rendered = block.output(&expanded_ctx());
+        let text = block_text(&rendered);
+        assert!(
+            rendered.lines.len() <= 205,
+            "unbounded card: {}",
+            rendered.lines.len()
+        );
+        for control in ['\r', '\u{1b}', '\u{7}', '\u{0000}', '\u{202e}', '\u{2066}'] {
+            assert!(!text.contains(control), "unsafe {control:?}: {text:?}");
+        }
+        assert!(text.contains("failed"), "{text:?}");
+        assert!(text.contains("row 0"), "{text:?}");
+        assert!(text.contains("render limit reached"), "{text:?}");
+        assert!(rendered.lines.iter().all(|line| {
+            line.content
+                .spans
+                .iter()
+                .all(|span| !span.content.contains('\n'))
+        }));
+
+        assert_eq!(block.output.as_deref(), Some(output.as_str()));
+        assert_eq!(block.error.as_deref(), Some(error.as_str()));
+        let searchable = crate::scrollback::blocks::tool::ToolCallBlock::Other(block.clone())
+            .searchable_text()
+            .expect("raw Other source remains searchable");
+        assert!(searchable.contains("row 399"));
+        assert!(searchable.contains("\u{1b}]52;c;payload"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_media_path_is_terminal_safe_without_changing_open_target() {
+        use crate::terminal::image::{GraphicsProtocol, set_protocol_for_test};
+
+        let _protocol = set_protocol_for_test(GraphicsProtocol::None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("clip\nforged\u{1b}]52;c;payload\u{7}\u{202e}.mp4");
+        std::fs::write(&path, b"video-placeholder").unwrap();
+        let block = OtherToolCallBlock::new("video_gen", "saved")
+            .with_media_ref(&path, true)
+            .with_error("encode failed");
+
+        let mut ctx = expanded_ctx();
+        ctx.width = 240;
+        let rendered = block.output(&ctx);
+        let text = block_text(&rendered);
+        for control in ['\n', '\r', '\u{1b}', '\u{7}', '\u{202e}'] {
+            // Newlines between BlockLines are added only by block_text; no
+            // individual painted span may carry a forged hard break.
+            if control != '\n' {
+                assert!(!text.contains(control), "unsafe {control:?}: {text:?}");
+            }
+        }
+        assert!(rendered.lines.iter().all(|line| {
+            line.content
+                .spans
+                .iter()
+                .all(|span| !span.content.contains('\n'))
+        }));
+        assert!(text.contains("␛]52;c;payload"), "{text:?}");
+        assert!(text.contains("⟪U+202E⟫"), "{text:?}");
+        assert_eq!(block.media_ref_path().as_deref(), Some(path.as_path()));
+    }
 }

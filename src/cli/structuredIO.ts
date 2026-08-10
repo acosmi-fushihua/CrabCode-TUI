@@ -361,6 +361,11 @@ export class StructuredIO {
         const routed = await this.directTuiRuntimeActionRouter(parsedValue)
         if (routed.handled) {
           if (routed.response) this.outbound.enqueue(routed.response)
+          if (routed.backgroundSettlement) {
+            void this.enqueueBackgroundPrivateRuntimeSettlement(
+              routed.backgroundSettlement,
+            )
+          }
           return undefined
         }
       }
@@ -483,6 +488,29 @@ export class StructuredIO {
       console.error(`Error parsing streaming input line: ${line}: ${error}`)
       // eslint-disable-next-line custom-rules/no-process-exit
       process.exit(1)
+    }
+  }
+
+  private async enqueueBackgroundPrivateRuntimeSettlement(
+    settlement: Promise<DirectTuiRuntimeActionRoute>,
+  ): Promise<void> {
+    try {
+      const settled = await settlement
+      if (settled.response) this.outbound.enqueue(settled.response)
+    } catch (error) {
+      // The closed runtime router normally converts handler errors into a
+      // correlated action_failed result. Keep an explicit rejection observer
+      // at this async boundary so an unexpected implementation failure
+      // (including after stdin closes) cannot become an unhandled rejection
+      // or terminate input. Diagnostics are deliberately best-effort too.
+      try {
+        logForDebugging(
+          `[StructuredIO] background private runtime action failed: ${error instanceof Error ? error.name : 'unknown'}`,
+          { level: 'warn' },
+        )
+      } catch {
+        // Never allow diagnostic infrastructure to reopen the rejection.
+      }
     }
   }
 

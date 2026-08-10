@@ -36,6 +36,7 @@ pub mod sdk_runtime;
 mod selection_surface;
 pub mod session_picker;
 mod status_surface;
+mod task_panel;
 mod terminal;
 mod terminal_capabilities;
 mod terminal_fault;

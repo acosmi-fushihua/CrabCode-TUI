@@ -5,18 +5,27 @@ use std::path::Path;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
-use super::{LineRange, TOOL_HEADER_RANGE};
+use super::{
+    LineRange, TOOL_HEADER_RANGE,
+    failure::{cap_block_lines, failure_lines},
+};
 use crate::prompt_images::ScrollbackImageRef;
+use crate::render::line_utils::truncate_str;
 use crate::render::wrapping::word_wrap_lines_with_joiners;
 use crate::scrollback::block::BlockContent;
 use crate::scrollback::types::{
     AccentStyle, BlockBackground, BlockContext, BlockLine, BlockOutput, DisplayMode, Selectable,
 };
 use crate::syntax::get_syntect;
+use crate::text_safety::sanitize_bounded_terminal_text;
 use crate::theme::Theme;
 
 const FIRST_LINES: usize = 5;
 const LAST_LINES: usize = 3;
+const EXPANDED_SOURCE_LINES: usize = 200;
+const MAX_WRAPS_PER_SOURCE_LINE: usize = 4;
+const TRUNCATED_RENDER_LINES: usize = 40;
+const EXPANDED_RENDER_LINES: usize = 240;
 
 /// Extract the skill name from a path if it points to a `SKILL.md` file.
 ///
@@ -263,7 +272,8 @@ impl ReadToolCallBlock {
 
     /// Render content lines with absolute line numbers in the gutter.
     ///
-    /// Wraps all lines first, then applies truncation -- matching ExecuteToolCallBlock.
+    /// The stored file stays untouched for copy/search. Paint-time content is
+    /// terminal-safe and bounded before it reaches syntect or ratatui.
     fn render_content_lines(
         &self,
         theme: &Theme,
@@ -274,11 +284,15 @@ impl ReadToolCallBlock {
             return Vec::new();
         };
 
+        let safe_content = sanitize_bounded_terminal_text(content);
+        let raw_lines: Vec<&str> = safe_content.lines().collect();
         let base_line = self.line_range.map_or(1, |r| r.start);
-        let raw_lines: Vec<&str> = content.lines().collect();
 
         let gutter_width = digit_count(base_line + raw_lines.len().saturating_sub(1));
         let content_width = width.saturating_sub(gutter_width + 2).max(20);
+        let max_source_width = content_width
+            .saturating_mul(MAX_WRAPS_PER_SOURCE_LINE)
+            .min(2_048);
 
         // Use Theme::dim/primary so terminal-native (minimal) maps grays to
         // SGR dim / default fg instead of raw gray_dim slots.
@@ -287,67 +301,88 @@ impl ReadToolCallBlock {
 
         let syntect = get_syntect();
         let mut highlighter = syntect.highlight_lines_by_file_path(Path::new(&self.path));
-
-        let styled_lines: Vec<Line<'static>> = raw_lines
-            .iter()
-            .enumerate()
-            .map(|(i, text)| {
-                let gutter = format!("{:>w$}  ", base_line + i, w = gutter_width);
-                let mut spans = vec![Span::styled(gutter, gutter_style)];
-                spans.extend(crate::syntax::highlight_line(
-                    text,
-                    &mut highlighter,
-                    syntect,
-                    text_style,
-                ));
-                Line::from(spans)
-            })
-            .collect();
-
-        let (wrapped, joiners) = word_wrap_lines_with_joiners(styled_lines, content_width);
-        let total = wrapped.len();
-
         let mut lines = Vec::new();
 
-        if let Some((first, last)) = truncate {
-            let threshold = first + last;
-            if total > threshold {
-                for (wrapped_line, joiner) in wrapped.iter().zip(joiners.iter()).take(first) {
-                    lines.push(
-                        BlockLine::styled(wrapped_line.clone())
-                            .with_panel_background(theme.bg_dark)
-                            .with_joiner(joiner.clone()),
-                    );
-                }
-                lines.push(
-                    BlockLine::separator(Line::from(Span::styled("\u{2026}", theme.muted())))
-                        .with_panel_background(theme.bg_dark),
-                );
-                for (wrapped_line, joiner) in wrapped.iter().zip(joiners.iter()).skip(total - last)
-                {
-                    lines.push(
-                        BlockLine::styled(wrapped_line.clone())
-                            .with_panel_background(theme.bg_dark)
-                            .with_joiner(joiner.clone()),
-                    );
-                }
-            } else {
-                for (wrapped_line, joiner) in wrapped.into_iter().zip(joiners) {
-                    lines.push(
-                        BlockLine::styled(wrapped_line)
-                            .with_panel_background(theme.bg_dark)
-                            .with_joiner(joiner),
-                    );
-                }
-            }
+        let (selected, omission_after, omitted) = if let Some((first, last)) = truncate
+            && raw_lines.len() > first.saturating_add(last)
+        {
+            let mut selected = raw_lines
+                .iter()
+                .take(first)
+                .enumerate()
+                .map(|(index, line)| (index, *line))
+                .collect::<Vec<_>>();
+            let tail_start = raw_lines.len().saturating_sub(last);
+            selected.extend(
+                raw_lines
+                    .iter()
+                    .enumerate()
+                    .skip(tail_start)
+                    .map(|(index, line)| (index, *line)),
+            );
+            (
+                selected,
+                Some(first),
+                raw_lines.len().saturating_sub(first).saturating_sub(last),
+            )
         } else {
-            for (wrapped_line, joiner) in wrapped.into_iter().zip(joiners) {
-                lines.push(
-                    BlockLine::styled(wrapped_line)
-                        .with_panel_background(theme.bg_dark)
-                        .with_joiner(joiner),
-                );
+            let limit = if truncate.is_some() {
+                raw_lines.len()
+            } else {
+                EXPANDED_SOURCE_LINES
+            };
+            let selected = raw_lines
+                .iter()
+                .take(limit)
+                .enumerate()
+                .map(|(index, line)| (index, *line))
+                .collect::<Vec<_>>();
+            let omitted = raw_lines.len().saturating_sub(selected.len());
+            let omission_after = (omitted > 0).then_some(selected.len());
+            (selected, omission_after, omitted)
+        };
+
+        for (selected_index, (source_index, text)) in selected.iter().enumerate() {
+            if omission_after == Some(selected_index) {
+                lines.push(BlockLine::separator(Line::from(Span::styled(
+                    format!("… ({omitted} source line(s) omitted; full value retained)"),
+                    theme.muted(),
+                ))));
             }
+
+            let text = truncate_str(text, max_source_width);
+            let gutter = format!("{:>w$}  ", base_line + *source_index, w = gutter_width);
+            let mut spans = vec![Span::styled(gutter, gutter_style)];
+            spans.extend(crate::syntax::highlight_line(
+                &text,
+                &mut highlighter,
+                syntect,
+                text_style,
+            ));
+            let (wrapped, joiners) =
+                word_wrap_lines_with_joiners(vec![Line::from(spans)], content_width);
+            for (wrapped_line, joiner) in wrapped.into_iter().zip(joiners) {
+                lines.push(BlockLine::styled(wrapped_line).with_joiner(joiner));
+            }
+        }
+        if omission_after == Some(selected.len()) {
+            lines.push(BlockLine::separator(Line::from(Span::styled(
+                format!("… ({omitted} source line(s) omitted; full value retained)"),
+                theme.muted(),
+            ))));
+        }
+
+        cap_block_lines(
+            &mut lines,
+            if truncate.is_some() {
+                TRUNCATED_RENDER_LINES
+            } else {
+                EXPANDED_RENDER_LINES
+            },
+            theme.muted(),
+        );
+        for line in &mut lines {
+            *line = std::mem::take(line).with_panel_background(theme.bg_dark);
         }
 
         lines
@@ -367,8 +402,8 @@ impl BlockContent for ReadToolCallBlock {
 
         let cwd = ctx.cwd.as_deref();
         match ctx.mode {
-            DisplayMode::Collapsed => BlockOutput {
-                lines: vec![self.header_block_line(
+            DisplayMode::Collapsed => {
+                let mut lines = vec![self.header_block_line(
                     self.collapsed_line(
                         &theme,
                         muted_collapsed,
@@ -378,8 +413,17 @@ impl BlockContent for ReadToolCallBlock {
                         Some(ctx.content_width()),
                     ),
                     cwd,
-                )],
-            },
+                )];
+                if let Some(error) = &self.error {
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
+                BlockOutput { lines }
+            }
             DisplayMode::Truncated | DisplayMode::Expanded => {
                 let truncate = if ctx.mode == DisplayMode::Truncated {
                     Some((FIRST_LINES, LAST_LINES))
@@ -398,15 +442,15 @@ impl BlockContent for ReadToolCallBlock {
                 if self.has_content() {
                     lines.push(BlockLine::separator(Line::from("")));
                     lines.extend(self.render_content_lines(&theme, ctx.width as usize, truncate));
-                } else if let Some(err) = &self.error {
+                }
+                if let Some(error) = &self.error {
                     lines.push(BlockLine::separator(Line::from("")));
-                    let error_style = Style::default().fg(theme.accent_error);
-                    for line in err.lines() {
-                        lines.push(BlockLine::separator(Line::from(Span::styled(
-                            line.to_string(),
-                            error_style,
-                        ))));
-                    }
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        Style::default().fg(theme.accent_error),
+                    ));
                 }
                 BlockOutput { lines }
             }
@@ -439,7 +483,7 @@ impl BlockContent for ReadToolCallBlock {
     }
 
     fn is_foldable(&self) -> bool {
-        self.has_content()
+        self.has_content() || self.error.is_some()
     }
 
     fn default_display_mode(&self) -> DisplayMode {
@@ -447,7 +491,7 @@ impl BlockContent for ReadToolCallBlock {
     }
 
     fn finished_display_mode(&self) -> Option<DisplayMode> {
-        Some(DisplayMode::Collapsed)
+        self.error.is_none().then_some(DisplayMode::Collapsed)
     }
 
     fn next_fold_mode(&self, current: DisplayMode, _is_running: bool) -> DisplayMode {
@@ -772,5 +816,66 @@ mod tests {
             .join("\n");
         assert!(all_text.contains("50"), "should show line 50");
         assert!(all_text.contains("52"), "should show line 52");
+    }
+
+    #[test]
+    fn expanded_failure_with_content_is_sanitized_before_syntax_and_bounded() {
+        let content = (0..400)
+            .map(|index| {
+                format!(
+                    "let row_{index} = \"\u{1b}]52;c;payload\u{7}\u{0000}\u{2066}{}\";",
+                    "x".repeat(4_000)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = "read failed\n\u{1b}[31mpermission denied\u{1b}[0m\u{202e}".to_string();
+        let block = ReadToolCallBlock::new("unsafe.rs")
+            .with_content(content.clone(), 400)
+            .with_error(error.clone());
+        let mut ctx = make_ctx();
+        ctx.mode = DisplayMode::Expanded;
+
+        let rendered = block.output(&ctx);
+        let text = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.content
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.lines.len() <= EXPANDED_RENDER_LINES + 5,
+            "unbounded read card: {}",
+            rendered.lines.len()
+        );
+        for control in ['\r', '\u{1b}', '\u{7}', '\u{0000}', '\u{202e}', '\u{2066}'] {
+            assert!(!text.contains(control), "unsafe {control:?}: {text:?}");
+        }
+        assert!(text.contains("␛]52;c;payload"), "{text:?}");
+        assert!(text.contains("read failed"), "{text:?}");
+        assert!(
+            text.contains("full source retained") || text.contains("full value retained"),
+            "bounded preview must disclose render-only omission"
+        );
+        assert!(rendered.lines.iter().all(|line| {
+            line.content
+                .spans
+                .iter()
+                .all(|span| !span.content.contains('\n'))
+        }));
+
+        assert_eq!(block.content.as_deref(), Some(content.as_str()));
+        assert_eq!(block.error.as_deref(), Some(error.as_str()));
+        let searchable = crate::scrollback::blocks::tool::ToolCallBlock::Read(block.clone())
+            .searchable_text()
+            .expect("raw Read source remains searchable");
+        assert!(searchable.contains("row_399"));
+        assert!(searchable.contains("\u{1b}]52;c;payload"));
     }
 }

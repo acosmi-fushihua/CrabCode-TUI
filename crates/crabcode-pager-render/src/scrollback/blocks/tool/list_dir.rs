@@ -9,7 +9,7 @@ use crate::scrollback::types::{
 };
 use crate::theme::Theme;
 
-use super::TOOL_HEADER_RANGE;
+use super::{TOOL_HEADER_RANGE, failure::failure_lines};
 
 /// List directory tool call.
 #[derive(Debug, Clone)]
@@ -160,16 +160,35 @@ impl BlockContent for ListDirToolCallBlock {
         let terminal_bg = ctx.appearance.scrollback.blocks.list_dir.terminal_bg;
 
         match ctx.mode {
-            DisplayMode::Collapsed => BlockOutput {
-                lines: vec![self.header_block_line(self.collapsed_line(
+            DisplayMode::Collapsed => {
+                let mut lines = vec![self.header_block_line(self.collapsed_line(
                     &theme,
                     muted_collapsed,
                     Some(ctx.content_width()),
-                ))],
-            },
+                ))];
+                if let Some(error) = &self.error {
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
+                BlockOutput { lines }
+            }
             DisplayMode::Truncated | DisplayMode::Expanded => {
                 let mut lines: Vec<BlockLine> =
                     vec![self.header_block_line(self.collapsed_line(&theme, false, None))];
+
+                if let Some(error) = &self.error {
+                    lines.push(BlockLine::separator(Line::from("")));
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        ctx.content_width(),
+                        theme.fg(theme.accent_error),
+                    ));
+                }
 
                 if !self.output.is_empty() {
                     lines.push(BlockLine::separator(Line::from("")));
@@ -220,11 +239,7 @@ impl BlockContent for ListDirToolCallBlock {
     }
 
     fn is_foldable(&self) -> bool {
-        // Not foldable if failed
-        if self.error.is_some() {
-            return false;
-        }
-        !self.output.is_empty()
+        !self.output.is_empty() || self.error.is_some()
     }
 
     fn default_display_mode(&self) -> DisplayMode {

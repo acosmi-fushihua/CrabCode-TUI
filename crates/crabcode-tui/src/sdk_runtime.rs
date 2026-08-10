@@ -882,6 +882,7 @@ fn known_control_request_subtype(value: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivateRuntimeResultFamily {
     Health,
+    BugReport,
     Model,
     UsagePlugin,
     RetainedCommand,
@@ -933,9 +934,14 @@ const PRIVATE_RETAINED_RESULT_KINDS: &[&str] = &[
     "retained_command_error",
 ];
 
+const PRIVATE_BUG_REPORT_RESULT_KINDS: &[&str] =
+    &["bug_report_submitted", "bug_report_unconfirmed"];
+
 fn private_runtime_result_family(kind: &str) -> Option<PrivateRuntimeResultFamily> {
     if kind == "health_snapshot" {
         Some(PrivateRuntimeResultFamily::Health)
+    } else if PRIVATE_BUG_REPORT_RESULT_KINDS.contains(&kind) {
+        Some(PrivateRuntimeResultFamily::BugReport)
     } else if kind == "runtime_action_error" {
         Some(PrivateRuntimeResultFamily::RuntimeActionError)
     } else if PRIVATE_MODEL_RESULT_KINDS.contains(&kind) {
@@ -993,6 +999,11 @@ fn classify_private_runtime_result(object: &serde_json::Map<String, Value>) -> E
                     return Some("private health snapshot result is malformed");
                 }
             }
+            Some(PrivateRuntimeResultFamily::BugReport) => {
+                if !valid_private_bug_report_result(kind, result) {
+                    return Some("private bug-report result is malformed");
+                }
+            }
             Some(PrivateRuntimeResultFamily::RuntimeActionError) => {
                 let valid_code = matches!(
                     result.get("code").and_then(Value::as_str),
@@ -1036,6 +1047,37 @@ fn valid_private_runtime_request_id(value: &str) -> bool {
         && !value
             .chars()
             .any(|character| character.is_control() || character == '\u{7f}')
+}
+
+fn valid_private_bug_report_feedback_id(value: &str) -> bool {
+    let utf16_len = value.encode_utf16().count();
+    (1..=160).contains(&utf16_len)
+        && !value.chars().any(|character| {
+            character <= '\u{001f}'
+                || ('\u{007f}'..='\u{009f}').contains(&character)
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
+}
+
+fn valid_private_bug_report_result(kind: &str, result: &serde_json::Map<String, Value>) -> bool {
+    match kind {
+        "bug_report_submitted" => {
+            object_has_exact_fields(result, &["kind", "feedback_id"], &[])
+                && result
+                    .get("feedback_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(valid_private_bug_report_feedback_id)
+        }
+        "bug_report_unconfirmed" => object_has_exact_fields(result, &["kind"], &[]),
+        _ => false,
+    }
 }
 
 fn object_has_exact_fields(
@@ -1534,6 +1576,29 @@ fn validate_private_runtime_action(request_id: &str, action: &Value) -> Result<S
         SendError::InvalidEnvelope("private runtime action omitted a string kind".to_string())
     })?;
     match kind {
+        "bug_report_submit" => {
+            private_action_fields(object, kind, &["kind", "description"], &[])?;
+            let description =
+                object
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .filter(|description| {
+                        !description.is_empty()
+                            && description.len() <= 8_000
+                            && !description.chars().any(|character| {
+                                (character <= '\u{001f}'
+                                    && !matches!(character, '\t' | '\n' | '\r'))
+                                    || character == '\u{007f}'
+                            })
+                    });
+            if description.is_none() {
+                return Err(SendError::InvalidEnvelope(
+                    "private runtime action `bug_report_submit` has an invalid description"
+                        .to_string(),
+                ));
+            }
+            Ok(kind.to_string())
+        }
         "health_snapshot"
         | "retained.identity.snapshot"
         | "retained.vim.toggle"
@@ -4600,6 +4665,7 @@ mod internal_tests {
         });
         let actions = [
             json!({"kind":"health_snapshot"}),
+            json!({"kind":"bug_report_submit","description":"terminal layout is broken"}),
             json!({"kind":"retained.identity.snapshot"}),
             json!({"kind":"retained.color.apply","argument":"blue"}),
             json!({"kind":"retained.rename.apply","argument":"权威名称"}),
@@ -4675,6 +4741,18 @@ mod internal_tests {
             validate_private_runtime_action("private-1", &json!({"kind":"model.future.action"}))
                 .is_err()
         );
+        for malformed_bug_report in [
+            json!({"kind":"bug_report_submit"}),
+            json!({"kind":"bug_report_submit","description":""}),
+            json!({"kind":"bug_report_submit","description":"unsafe\u{0000}text"}),
+            json!({"kind":"bug_report_submit","description":"x".repeat(8_001)}),
+            json!({"kind":"bug_report_submit","description":"valid","unexpected":true}),
+        ] {
+            assert!(
+                validate_private_runtime_action("private-bug", &malformed_bug_report).is_err(),
+                "bug-report private actions must reject missing, extra, unsafe, and oversized descriptions"
+            );
+        }
         for malformed_retained in [
             json!({"kind":"retained.identity.snapshot","unexpected":true}),
             json!({"kind":"retained.color.apply"}),
@@ -4719,6 +4797,104 @@ mod internal_tests {
         assert!(receipt_debug.contains("redacted private runtime payload"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bug_report_private_action_crosses_the_writer_and_result_classifier() {
+        let directory = tempfile::tempdir().expect("private runtime fixture directory");
+        let script = directory.path().join("bug-report-runtime.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+IFS= read -r line
+printf '%s\n' "$line" > received.json
+IFS= read -r release
+printf '%s\n' '{"type":"crabcode_tui_runtime_result","protocol_version":1,"request_id":"bug-real","result":{"kind":"bug_report_submitted","feedback_id":"feedback-real"}}'
+"#,
+        )
+        .expect("private runtime fixture script");
+        let mut limits = TransportLimits::default();
+        limits.outbound_send_timeout = Duration::from_secs(2);
+        limits.shutdown_timeout = Duration::from_secs(2);
+        let runtime = SdkRuntime::spawn(RuntimeConfig {
+            program: PathBuf::from("/bin/sh"),
+            script,
+            cwd: directory.path().to_path_buf(),
+            runtime_args: Vec::new(),
+            removed_environment: Vec::new(),
+            environment: Vec::new(),
+            limits,
+        })
+        .expect("spawn private runtime fixture");
+
+        let delivery_id = runtime
+            .submit_private_runtime_action(
+                "bug-real",
+                json!({
+                    "kind":"bug_report_submit",
+                    "description":"real writer path"
+                }),
+            )
+            .expect("submit bug report through the real nonblocking writer");
+        let completion_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(completion) = runtime.try_recv_outbound_completion() {
+                assert_eq!(completion.id, delivery_id);
+                completion
+                    .result
+                    .expect("bug-report writer acknowledgement");
+                break;
+            }
+            assert!(
+                Instant::now() < completion_deadline,
+                "bug-report writer completion timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        runtime
+            .send_raw(json!({"type":"keep_alive"}))
+            .expect("release fixture response after correlation admission");
+
+        let event = runtime
+            .recv_event_timeout(Duration::from_secs(2))
+            .expect("classified bug-report result");
+        assert!(matches!(
+            event,
+            RuntimeEvent::Envelope(RawEnvelope {
+                classification: EnvelopeClass::PrivateRuntimeResult {
+                    request_id: Some(request_id),
+                    result_kind: Some(result_kind),
+                    validation_error: None,
+                },
+                correlation: Some(RequestCorrelation::PrivateRuntimeResultMatched {
+                    request_id: correlation_id,
+                    action_kind,
+                }),
+                ..
+            }) if request_id == "bug-real"
+                && result_kind == "bug_report_submitted"
+                && correlation_id == "bug-real"
+                && action_kind == "bug_report_submit"
+        ));
+        let received: Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("received.json"))
+                .expect("captured private action"),
+        )
+        .expect("captured private action JSON");
+        assert_eq!(
+            received,
+            json!({
+                "type":PRIVATE_RUNTIME_ACTION_TYPE,
+                "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
+                "request_id":"bug-real",
+                "action":{
+                    "kind":"bug_report_submit",
+                    "description":"real writer path"
+                }
+            })
+        );
+    }
+
     #[test]
     fn malformed_private_results_are_request_local_classifications() {
         let ready = classify_envelope(&json!({
@@ -4736,6 +4912,38 @@ mod internal_tests {
                 validation_error: None,
             }
         );
+
+        for (request_id, result, expected_kind) in [
+            (
+                "private-bug-submitted",
+                json!({
+                    "kind":"bug_report_submitted",
+                    "feedback_id":"feedback-123"
+                }),
+                "bug_report_submitted",
+            ),
+            (
+                "private-bug-unconfirmed",
+                json!({"kind":"bug_report_unconfirmed"}),
+                "bug_report_unconfirmed",
+            ),
+        ] {
+            let classified = classify_envelope(&json!({
+                "type":PRIVATE_RUNTIME_RESULT_TYPE,
+                "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
+                "request_id":request_id,
+                "result":result,
+            }))
+            .expect("valid bug-report private result");
+            assert!(matches!(
+                classified,
+                EnvelopeClass::PrivateRuntimeResult {
+                    request_id: Some(actual_request_id),
+                    result_kind: Some(kind),
+                    validation_error: None,
+                } if actual_request_id == request_id && kind == expected_kind
+            ));
+        }
 
         let model = classify_envelope(&json!({
             "type":PRIVATE_RUNTIME_RESULT_TYPE,
@@ -4855,6 +5063,48 @@ mod internal_tests {
             json!({
                 "type":PRIVATE_RUNTIME_RESULT_TYPE,
                 "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
+                "request_id":"private-bug-missing-id",
+                "result":{"kind":"bug_report_submitted"}
+            }),
+            json!({
+                "type":PRIVATE_RUNTIME_RESULT_TYPE,
+                "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
+                "request_id":"private-bug-extra",
+                "result":{
+                    "kind":"bug_report_unconfirmed",
+                    "unexpected":true
+                }
+            }),
+            json!({
+                "type":PRIVATE_RUNTIME_RESULT_TYPE,
+                "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
+                "request_id":"private-bug-c1",
+                "result":{
+                    "kind":"bug_report_submitted",
+                    "feedback_id":"feedback-\u{009b}unsafe"
+                }
+            }),
+            json!({
+                "type":PRIVATE_RUNTIME_RESULT_TYPE,
+                "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
+                "request_id":"private-bug-bidi",
+                "result":{
+                    "kind":"bug_report_submitted",
+                    "feedback_id":"feedback-\u{061c}unsafe"
+                }
+            }),
+            json!({
+                "type":PRIVATE_RUNTIME_RESULT_TYPE,
+                "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
+                "request_id":"private-bug-long-id",
+                "result":{
+                    "kind":"bug_report_submitted",
+                    "feedback_id":"x".repeat(161)
+                }
+            }),
+            json!({
+                "type":PRIVATE_RUNTIME_RESULT_TYPE,
+                "protocol_version":PRIVATE_RUNTIME_PROTOCOL_VERSION,
                 "request_id":"private-marketplace-missing-empty-reason",
                 "result":{
                     "kind":"plugin_marketplace_inventory_snapshot",
@@ -4957,6 +5207,7 @@ mod internal_tests {
         assert_eq!(KNOWN_CONTROL_REQUEST_SUBTYPES.len(), 21);
         assert!(KNOWN_CONTROL_REQUEST_SUBTYPES.contains(&"elicitation"));
         let mut owned_private_result_kinds = vec!["health_snapshot", "runtime_action_error"];
+        owned_private_result_kinds.extend_from_slice(PRIVATE_BUG_REPORT_RESULT_KINDS);
         owned_private_result_kinds.extend_from_slice(PRIVATE_MODEL_RESULT_KINDS);
         owned_private_result_kinds.extend_from_slice(PRIVATE_USAGE_PLUGIN_RESULT_KINDS);
         owned_private_result_kinds.extend_from_slice(PRIVATE_RETAINED_RESULT_KINDS);

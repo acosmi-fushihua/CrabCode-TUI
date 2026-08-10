@@ -2,6 +2,7 @@
 
 mod edit;
 mod execute;
+mod failure;
 pub(crate) mod hook;
 mod lifecycle;
 pub mod list_dir;
@@ -34,7 +35,7 @@ pub use search_tool::{
 };
 pub use use_tool::UseToolCallBlock;
 pub use web_fetch::WebFetchToolCallBlock;
-pub use web_search::WebSearchToolCallBlock;
+pub use web_search::{WebSearchResult, WebSearchToolCallBlock};
 
 use crate::scrollback::block::{BlockContent, join_searchable};
 use crate::scrollback::types::{
@@ -526,6 +527,7 @@ impl ToolCallBlock {
                     b.meta.path.clone(),
                     b.meta.glob.clone(),
                     b.meta.file_type.clone(),
+                    b.raw_output.clone(),
                     file_paths,
                     file_matches,
                     b.error.clone(),
@@ -536,9 +538,17 @@ impl ToolCallBlock {
             }
             ToolCallBlock::WebSearch(b) => {
                 let citations = join_searchable(b.citations.iter().cloned().map(Some));
+                let results = join_searchable(b.results.iter().flat_map(|result| {
+                    [
+                        Some(result.title.clone()),
+                        Some(result.url.clone()),
+                        result.snippet.clone(),
+                    ]
+                }));
                 join_searchable([
                     Some(b.query.clone()),
                     b.content.clone(),
+                    results,
                     citations,
                     b.label.clone(),
                     b.error.clone(),
@@ -576,6 +586,12 @@ impl ToolCallBlock {
     /// Verb-group kind; `None` renders standalone and splits verb-group runs
     /// (still dense-packs via `is_groupable`).
     pub fn verb_group_kind(&self) -> Option<VerbGroupKind> {
+        // A compact aggregate must never replace a failed tool's visible
+        // summary row. The block remains dense-groupable for ordinary
+        // scrollback truncation, whose header has an explicit reveal path.
+        if !self.is_success() {
+            return None;
+        }
         match self {
             ToolCallBlock::Read(b) => Some(if b.is_skill_read() {
                 VerbGroupKind::Skill
@@ -584,14 +600,14 @@ impl ToolCallBlock {
             }),
             ToolCallBlock::ListDir(_) => Some(VerbGroupKind::Dir),
             ToolCallBlock::Search(_) => Some(VerbGroupKind::Search),
-            ToolCallBlock::WebFetch(_) => Some(VerbGroupKind::WebFetch),
-            ToolCallBlock::WebSearch(_) => Some(VerbGroupKind::WebSearch),
-            ToolCallBlock::IntegrationSearch(_) => Some(VerbGroupKind::IntegrationSearch),
-            ToolCallBlock::MemorySearch(_) => Some(VerbGroupKind::MemorySearch),
             ToolCallBlock::Skill(_) => Some(VerbGroupKind::Skill),
             ToolCallBlock::Execute(_)
             | ToolCallBlock::Edit(_)
+            | ToolCallBlock::WebFetch(_)
+            | ToolCallBlock::WebSearch(_)
+            | ToolCallBlock::IntegrationSearch(_)
             | ToolCallBlock::UseTool(_)
+            | ToolCallBlock::MemorySearch(_)
             | ToolCallBlock::Other(_)
             | ToolCallBlock::Lifecycle(_) => None,
         }
@@ -607,16 +623,20 @@ impl ToolCallBlock {
         match self {
             ToolCallBlock::Execute(_) => Some(VerbGroupKind::Command),
             ToolCallBlock::Edit(_) => Some(VerbGroupKind::EditFile),
+            // Result-bearing cards must remain standalone so their identity
+            // and result count/content are not replaced by an eager verb
+            // header. Truncation summaries can still name them when an entire
+            // older section is hidden.
+            ToolCallBlock::WebFetch(_) => Some(VerbGroupKind::WebFetch),
+            ToolCallBlock::WebSearch(_) => Some(VerbGroupKind::WebSearch),
+            ToolCallBlock::IntegrationSearch(_) => Some(VerbGroupKind::IntegrationSearch),
+            ToolCallBlock::MemorySearch(_) => Some(VerbGroupKind::MemorySearch),
             ToolCallBlock::UseTool(_) => Some(VerbGroupKind::McpCall),
             ToolCallBlock::Other(_) => Some(VerbGroupKind::OtherTool),
             ToolCallBlock::Lifecycle(_) => None,
             ToolCallBlock::Read(_)
             | ToolCallBlock::ListDir(_)
             | ToolCallBlock::Search(_)
-            | ToolCallBlock::WebFetch(_)
-            | ToolCallBlock::WebSearch(_)
-            | ToolCallBlock::IntegrationSearch(_)
-            | ToolCallBlock::MemorySearch(_)
             | ToolCallBlock::Skill(_) => self.verb_group_kind(),
         }
     }
@@ -625,6 +645,35 @@ impl ToolCallBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx(mode: DisplayMode) -> BlockContext {
+        BlockContext {
+            width: 80,
+            mode,
+            is_running: false,
+            raw: false,
+            max_lines: None,
+            appearance: Default::default(),
+            is_selected: false,
+            cwd: None,
+        }
+    }
+
+    fn output_text(block: &ToolCallBlock, mode: DisplayMode) -> String {
+        block
+            .output(&ctx(mode))
+            .lines
+            .iter()
+            .map(|line| {
+                line.content
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn verb_is_tense_aware() {
@@ -701,18 +750,44 @@ mod tests {
                 ToolCallBlock::Read(_) => Some(VerbGroupKind::File),
                 ToolCallBlock::ListDir(_) => Some(VerbGroupKind::Dir),
                 ToolCallBlock::Search(_) => Some(VerbGroupKind::Search),
-                ToolCallBlock::WebFetch(_) => Some(VerbGroupKind::WebFetch),
-                ToolCallBlock::WebSearch(_) => Some(VerbGroupKind::WebSearch),
-                ToolCallBlock::IntegrationSearch(_) => Some(VerbGroupKind::IntegrationSearch),
-                ToolCallBlock::MemorySearch(_) => Some(VerbGroupKind::MemorySearch),
                 ToolCallBlock::Skill(_) => Some(VerbGroupKind::Skill),
                 ToolCallBlock::Execute(_)
                 | ToolCallBlock::Edit(_)
+                | ToolCallBlock::WebFetch(_)
+                | ToolCallBlock::WebSearch(_)
+                | ToolCallBlock::IntegrationSearch(_)
                 | ToolCallBlock::UseTool(_)
+                | ToolCallBlock::MemorySearch(_)
                 | ToolCallBlock::Other(_)
                 | ToolCallBlock::Lifecycle(_) => None,
             };
             assert_eq!(block.verb_group_kind(), expected, "block: {block:?}");
+        }
+    }
+
+    #[test]
+    fn result_bearing_tools_stay_standalone_but_keep_truncation_labels() {
+        let blocks = [
+            (
+                ToolCallBlock::WebFetch(WebFetchToolCallBlock::new("https://example.com")),
+                VerbGroupKind::WebFetch,
+            ),
+            (
+                ToolCallBlock::WebSearch(WebSearchToolCallBlock::new("renderer")),
+                VerbGroupKind::WebSearch,
+            ),
+            (
+                ToolCallBlock::IntegrationSearch(IntegrationSearchToolCallBlock::new("linear")),
+                VerbGroupKind::IntegrationSearch,
+            ),
+            (
+                ToolCallBlock::MemorySearch(MemorySearchToolCallBlock::new("auth")),
+                VerbGroupKind::MemorySearch,
+            ),
+        ];
+        for (block, expected_label) in blocks {
+            assert_eq!(block.verb_group_kind(), None, "block: {block:?}");
+            assert_eq!(block.label_kind(), Some(expected_label), "block: {block:?}");
         }
     }
 
@@ -775,5 +850,128 @@ mod tests {
             unreachable!("constructed as MemorySearch");
         };
         assert_eq!(replacement.started_at, Some(started_at));
+    }
+
+    #[test]
+    fn failed_tool_matrix_keeps_safe_details_visible_and_expandable() {
+        let error = "\u{1b}[31mpermission denied\u{1b}[0m\nsecond detail";
+        let mut memory = MemorySearchToolCallBlock::new("private notes");
+        memory.set_error(Some(error.to_string()));
+        let failures = [
+            ToolCallBlock::Read(ReadToolCallBlock::new("secret.txt").with_error(error)),
+            ToolCallBlock::ListDir(ListDirToolCallBlock::new("private").with_error(error)),
+            ToolCallBlock::Search(SearchToolCallBlock::new("token").with_error(error)),
+            ToolCallBlock::MemorySearch(memory),
+            ToolCallBlock::IntegrationSearch(
+                IntegrationSearchToolCallBlock::new("calendar").with_error(error),
+            ),
+            ToolCallBlock::Other(OtherToolCallBlock::new("Unknown", "target").with_error(error)),
+            ToolCallBlock::Execute(ExecuteToolCallBlock::new("false").with_error(error)),
+            ToolCallBlock::Edit(EditToolCallBlock::new("src/lib.rs", Vec::new()).with_error(error)),
+            ToolCallBlock::UseTool(UseToolCallBlock::new("linear__list_issues").with_error(error)),
+            ToolCallBlock::WebFetch(
+                WebFetchToolCallBlock::new("https://example.com").with_error(error),
+            ),
+            ToolCallBlock::WebSearch(WebSearchToolCallBlock::new("renderer").with_error(error)),
+        ];
+
+        for block in failures {
+            assert!(block.is_foldable(), "failed block must expand: {block:?}");
+            assert_eq!(
+                block.verb_group_kind(),
+                None,
+                "failed block must not disappear into an eager verb aggregate: {block:?}"
+            );
+            assert_eq!(
+                block.collapse_mode(false),
+                DisplayMode::Collapsed,
+                "manual collapse must remain available: {block:?}"
+            );
+            assert_ne!(
+                block.next_fold_mode(DisplayMode::Collapsed, false),
+                DisplayMode::Collapsed,
+                "failed block must open from its compact state: {block:?}"
+            );
+
+            let collapsed = output_text(&block, DisplayMode::Collapsed);
+            assert!(
+                collapsed.contains("␛[31mpermission denied␛[0m"),
+                "collapsed failure summary missing: {block:?}\n{collapsed:?}"
+            );
+            assert!(!collapsed.contains('\u{1b}'), "unsafe ESC: {collapsed:?}");
+            assert!(
+                !collapsed.contains("second detail"),
+                "collapsed failure must stay a one-row summary: {collapsed:?}"
+            );
+
+            let expanded = output_text(&block, DisplayMode::Expanded);
+            assert!(
+                expanded.contains("second detail"),
+                "expanded failure detail missing: {block:?}\n{expanded:?}"
+            );
+            assert!(!expanded.contains('\u{1b}'), "unsafe ESC: {expanded:?}");
+        }
+    }
+
+    #[test]
+    fn unstructured_search_result_is_safe_visible_and_bounded_when_expanded() {
+        let mut search = SearchToolCallBlock::new("needle");
+        search.match_count = 2;
+        search.set_raw_output("first hit\n\u{1b}]52;c;payload\u{7}second hit");
+        let block = ToolCallBlock::Search(search);
+
+        let collapsed = output_text(&block, DisplayMode::Collapsed);
+        assert!(!collapsed.contains("first hit"));
+
+        let expanded = output_text(&block, DisplayMode::Expanded);
+        assert!(expanded.contains("first hit"), "{expanded:?}");
+        assert!(expanded.contains("second hit"), "{expanded:?}");
+        assert!(expanded.contains("␛]52;c;payload"), "{expanded:?}");
+        assert!(!expanded.contains('\u{1b}'));
+        assert!(!expanded.contains('\u{7}'));
+
+        let huge = (0..500)
+            .map(|index| format!("result {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut search = SearchToolCallBlock::new("many");
+        search.match_count = 500;
+        search.set_raw_output(huge);
+        let output = search.output(&ctx(DisplayMode::Expanded));
+        assert!(
+            output.lines.len() <= 205,
+            "expanded plain search output must keep a bounded frame: {} lines",
+            output.lines.len()
+        );
+    }
+
+    #[test]
+    fn failed_bash_completion_preserves_manual_collapsed_mode() {
+        use crate::scrollback::{RenderBlock, ScrollbackState};
+
+        let mut execute = ExecuteToolCallBlock::new("cargo test").with_error("exit 1");
+        execute.bash_mode = true;
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::ToolCall(ToolCallBlock::Execute(execute)));
+        state.set_entry_running(id, true);
+        state
+            .get_by_id_mut(id)
+            .expect("failed bash entry")
+            .set_display_mode(DisplayMode::Collapsed);
+
+        state.finish_running(id);
+
+        assert_eq!(
+            state
+                .get_by_id(id)
+                .expect("failed bash entry")
+                .display_mode(),
+            DisplayMode::Collapsed
+        );
+        let RenderBlock::ToolCall(block) = &state.get_by_id(id).unwrap().block else {
+            panic!("expected tool call");
+        };
+        let collapsed = output_text(block, DisplayMode::Collapsed);
+        assert!(collapsed.contains("exit 1"), "{collapsed:?}");
     }
 }

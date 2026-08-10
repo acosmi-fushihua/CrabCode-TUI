@@ -21,6 +21,7 @@ use std::sync::Once;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+#[cfg(test)]
 use crabcode_pager_render::audited_theme::CrabCodeThemeKind;
 use crabcode_ratatui_inline::{LinkSpan, Terminal};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -3260,28 +3261,18 @@ pub(crate) fn active_mode_is_minimal() -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MinimalWelcomeCard {
-    title: &'static str,
-    hint: &'static str,
+    language: UiLanguage,
+    preparing: bool,
     height: u16,
-    wordmark: bool,
 }
 
-fn minimal_welcome_card(width: u16, language: crate::tui_app::UiLanguage) -> MinimalWelcomeCard {
-    let wordmark = usize::from(width.saturating_sub(2)) >= crate::tui_ui::CRAB_WORDMARK_WIDTH;
+fn minimal_welcome_card(language: UiLanguage, preparing: bool) -> MinimalWelcomeCard {
     MinimalWelcomeCard {
-        // These are the existing CrabCode empty-transcript strings. The
-        // renderer lifecycle moves them into native scrollback; it does not
-        // invent product metadata or require a backend field.
-        title: language.text("CrabCode 已就绪。", "CrabCode is ready."),
-        hint: language.text(
-            "请在下方输入提示词。使用 /help 查看 TUI 操作说明。",
-            "Type a prompt below. /help shows TUI controls.",
-        ),
-        // Rounded card (2) + vertical padding (2) + text content (2), plus
-        // the fixed three-row wordmark and its one-row margin when the exact
-        // 48-column banner fits, then one native-scrollback gap.
-        height: if wordmark { 11 } else { 7 },
-        wordmark,
+        language,
+        preparing,
+        // Rounded card (2) + six compact content rows, then one native
+        // scrollback gap. This height is stable at every supported width.
+        height: 9,
     }
 }
 
@@ -3289,7 +3280,6 @@ fn render_minimal_welcome_card(
     buffer: &mut Buffer,
     card: MinimalWelcomeCard,
     theme: CrabCodeTheme,
-    theme_kind: CrabCodeThemeKind,
 ) {
     let card_area = Rect {
         height: buffer.area.height.saturating_sub(1),
@@ -3303,44 +3293,97 @@ fn render_minimal_welcome_card(
 
     let x = card_area.x.saturating_add(2);
     let width = card_area.width.saturating_sub(4);
-    let mut title_y = card_area.y.saturating_add(2);
-    if card.wordmark {
-        let mark_x = card_area.x.saturating_add(1);
-        let mark_width = card_area.width.saturating_sub(2);
-        for (row, line) in crate::tui_ui::crab_wordmark_lines(
-            crate::tui_ui::CrabWordmarkLayout::Single,
-            theme_kind,
-        )
-        .into_iter()
-        .enumerate()
-        {
-            buffer.set_line(
-                mark_x,
-                card_area
-                    .y
-                    .saturating_add(1)
-                    .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
-                &line,
-                mark_width,
-            );
-        }
-        title_y = title_y.saturating_add(4);
-    }
+    let first_row = card_area.y.saturating_add(1);
     buffer.set_line(
         x,
-        title_y,
+        first_row,
+        &Line::from(vec![
+            Span::styled(
+                "CrabCode",
+                Style::default()
+                    .fg(theme.accent_assistant)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                card.language.text("  原生 Rust TUI", "  native Rust TUI"),
+                Style::default().fg(theme.gray),
+            ),
+        ]),
+        width,
+    );
+    buffer.set_line(
+        x,
+        first_row.saturating_add(1),
+        &Line::from(vec![
+            Span::styled(
+                "● ",
+                Style::default().fg(if card.preparing {
+                    theme.accent_running
+                } else {
+                    theme.accent_success
+                }),
+            ),
+            Span::styled(
+                match (card.language, card.preparing) {
+                    (UiLanguage::ZhCn, true) => "正在准备会话…",
+                    (UiLanguage::ZhCn, false) => "已就绪，可以开始",
+                    (UiLanguage::EnUs, true) => "Preparing the session…",
+                    (UiLanguage::EnUs, false) => "Ready to start",
+                },
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        width,
+    );
+    buffer.set_line(
+        x,
+        first_row.saturating_add(3),
         &Line::from(Span::styled(
-            card.title,
+            card.language.text("快速开始", "Quick start"),
             Style::default()
                 .fg(theme.text_primary)
                 .add_modifier(Modifier::BOLD),
         )),
         width,
     );
+    let primary_action = match (card.language, width < 68) {
+        (UiLanguage::ZhCn, _) => "› 直接描述目标，或粘贴错误信息与日志",
+        (UiLanguage::EnUs, true) => "› Describe a goal or paste an error",
+        (UiLanguage::EnUs, false) => "› Describe a goal, paste an error, or inspect this workspace",
+    };
     buffer.set_line(
         x,
-        title_y.saturating_add(1),
-        &Line::from(Span::styled(card.hint, Style::default().fg(theme.gray))),
+        first_row.saturating_add(4),
+        &Line::from(Span::styled(
+            primary_action,
+            Style::default().fg(theme.text_secondary),
+        )),
+        width,
+    );
+    buffer.set_line(
+        x,
+        first_row.saturating_add(5),
+        &Line::from(vec![
+            Span::styled("Enter", Style::default().fg(theme.accent_system)),
+            Span::styled(
+                card.language.text(" 发送", " send"),
+                Style::default().fg(theme.gray),
+            ),
+            Span::styled("  ·  ", Style::default().fg(theme.gray_dim)),
+            Span::styled("/help", Style::default().fg(theme.accent_system)),
+            Span::styled(
+                card.language.text(" 操作说明", " controls"),
+                Style::default().fg(theme.gray),
+            ),
+            Span::styled("  ·  ", Style::default().fg(theme.gray_dim)),
+            Span::styled("/model", Style::default().fg(theme.accent_system)),
+            Span::styled(
+                card.language.text(" 选择模型", " choose model"),
+                Style::default().fg(theme.gray),
+            ),
+        ]),
         width,
     );
 }
@@ -3356,7 +3399,12 @@ fn commit_minimal_welcome_with(
     {
         return Ok(false);
     }
-    let card = minimal_welcome_card(width, app.ui_language());
+    let preparing = app.busy()
+        || matches!(
+            app.projection.session_state(),
+            Some("initializing" | "running")
+        );
+    let card = minimal_welcome_card(app.ui_language(), preparing);
     emit(card)?;
     // Clear only after the native insertion succeeds. If terminal output
     // fails, the same fresh-session card remains retryable next frame.
@@ -3370,10 +3418,9 @@ fn commit_minimal_welcome<B: ratatui::backend::Backend>(
 ) -> io::Result<bool> {
     let width = terminal.viewport_area().width;
     let theme = app.renderer_theme();
-    let theme_kind = app.renderer_theme_kind();
     commit_minimal_welcome_with(app, width, |card| {
         terminal.insert_before(card.height, move |buffer| {
-            render_minimal_welcome_card(buffer, card, theme, theme_kind);
+            render_minimal_welcome_card(buffer, card, theme);
         })
     })
 }
@@ -6157,35 +6204,95 @@ mod tests {
     }
 
     #[test]
-    fn minimal_welcome_and_print_once_history_consume_the_concrete_palette() {
-        let card = minimal_welcome_card(80, crate::tui_app::UiLanguage::ZhCn);
-        assert!(card.wordmark);
-        assert_eq!(card.height, 11);
+    fn minimal_welcome_is_compact_responsive_and_has_no_pixel_wordmark() {
+        let card = minimal_welcome_card(crate::tui_app::UiLanguage::ZhCn, false);
+        assert_eq!(card.height, 9);
+
+        for width in [120_u16, 80, 60] {
+            let area = Rect::new(0, 0, width, card.height);
+            let mut buffer = Buffer::empty(area);
+            render_minimal_welcome_card(&mut buffer, card, CrabCodeTheme::dark());
+            let rows = (0..card.height)
+                .map(|row| {
+                    (0..width)
+                        .map(|column| buffer[(column, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let compact = rows
+                .iter()
+                .map(|row| row.replace(' ', ""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let diagnostic = format!("{width}x{}: {rows:#?}", card.height);
+
+            assert!(compact.contains("CrabCode原生RustTUI"), "{diagnostic}");
+            assert!(compact.contains("已就绪，可以开始"), "{diagnostic}");
+            assert!(compact.contains("快速开始"), "{diagnostic}");
+            assert!(compact.contains("Enter发送"), "{diagnostic}");
+            assert!(compact.contains("/help操作说明"), "{diagnostic}");
+            assert!(compact.contains("/model选择模型"), "{diagnostic}");
+            assert!(
+                !rows.iter().any(|row| row.contains(['▀', '▄', '█'])),
+                "minimal welcome must not paint a pixel wordmark: {diagnostic}"
+            );
+            assert!(rows[0].starts_with('╭'), "{diagnostic}");
+            assert!(
+                rows[card.height as usize - 2].starts_with('╰'),
+                "{diagnostic}"
+            );
+            for row in 0..card.height {
+                for column in 0..width {
+                    let symbol_width =
+                        unicode_width::UnicodeWidthStr::width(buffer[(column, row)].symbol());
+                    assert!(
+                        symbol_width <= usize::from(width - column),
+                        "wide glyph outside remaining cells at ({column},{row}): {diagnostic}"
+                    );
+                }
+            }
+        }
+
         let area = Rect::new(0, 0, 80, card.height);
         let mut dark_buffer = Buffer::empty(area);
         let mut light_buffer = Buffer::empty(area);
-        render_minimal_welcome_card(
-            &mut dark_buffer,
-            card,
-            CrabCodeTheme::dark(),
-            CrabCodeThemeKind::Dark,
-        );
-        render_minimal_welcome_card(
-            &mut light_buffer,
-            card,
-            CrabCodeTheme::light(),
-            CrabCodeThemeKind::Light,
-        );
-        assert_eq!(dark_buffer[(2, 6)].fg, CrabCodeTheme::dark().text_primary);
-        assert_eq!(light_buffer[(2, 6)].fg, CrabCodeTheme::light().text_primary);
-        assert_ne!(dark_buffer[(2, 6)].fg, light_buffer[(2, 6)].fg);
-        assert_eq!(dark_buffer[(1, 1)].fg, Color::Rgb(255, 80, 80));
-        assert_eq!(light_buffer[(1, 1)].fg, Color::Rgb(220, 38, 38));
+        render_minimal_welcome_card(&mut dark_buffer, card, CrabCodeTheme::dark());
+        render_minimal_welcome_card(&mut light_buffer, card, CrabCodeTheme::light());
         assert_eq!(
-            minimal_welcome_card(49, crate::tui_app::UiLanguage::ZhCn).height,
-            7
+            dark_buffer[(2, 1)].fg,
+            CrabCodeTheme::dark().accent_assistant
         );
+        assert_eq!(
+            light_buffer[(2, 1)].fg,
+            CrabCodeTheme::light().accent_assistant
+        );
+        assert_eq!(dark_buffer[(4, 2)].fg, CrabCodeTheme::dark().text_primary);
+        assert_eq!(light_buffer[(4, 2)].fg, CrabCodeTheme::light().text_primary);
+        assert_ne!(dark_buffer[(4, 2)].fg, light_buffer[(4, 2)].fg);
+        assert_eq!(dark_buffer[(2, 2)].fg, CrabCodeTheme::dark().accent_success);
 
+        let preparing = minimal_welcome_card(crate::tui_app::UiLanguage::ZhCn, true);
+        let mut preparing_buffer = Buffer::empty(area);
+        render_minimal_welcome_card(&mut preparing_buffer, preparing, CrabCodeTheme::dark());
+        let preparing_rows = (0..preparing.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| preparing_buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+        assert!(
+            preparing_rows.replace(' ', "").contains("正在准备会话…"),
+            "{preparing_rows:?}"
+        );
+        assert_eq!(
+            preparing_buffer[(2, 2)].fg,
+            CrabCodeTheme::dark().accent_running
+        );
+    }
+
+    #[test]
+    fn print_once_history_consumes_the_concrete_palette() {
         let item = projected(
             "theme-history",
             "```rust\nfn main() { let value = 1; }\n```",

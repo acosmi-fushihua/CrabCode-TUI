@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,7 @@ use crate::sdk_runtime::{
 };
 use crate::selection_surface::filter_indices;
 use crate::session_picker::{SessionPickerAction, SessionPickerComponent, SessionPickerEntry};
+use crate::task_panel::{TaskPanelProjectionCache, TaskPanelProjectionState};
 use crate::terminal_notifications::TerminalNotificationRequest;
 use crate::text_safety::{sanitize_bounded_terminal_text, sanitize_terminal_text};
 use crate::transcript_search::{
@@ -79,6 +81,7 @@ use crate::workspace_search::{
 
 const MAX_STDERR_NOTICES: usize = 64;
 const MAX_OVERLAY_BYTES: usize = 512 * 1024;
+const MAX_BUG_REPORT_DESCRIPTION_BYTES: usize = 8_000;
 pub(crate) const MAX_COMPOSER_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMPOSER_HISTORY_ENTRIES: usize = 200;
 const MAX_COMPOSER_HISTORY_BYTES: usize = 16 * 1024 * 1024;
@@ -228,8 +231,6 @@ const UNAVAILABLE_LOCAL_COMMAND_TOKENS: &[&str] = &[
     "status",
     "tag",
     "theme",
-    "feedback",
-    "bug",
     "ultrareview",
     "rewind",
     "checkpoint",
@@ -298,6 +299,8 @@ const FIXED_LOCAL_COMMAND_COMPLETIONS: &[(&str, &str, &str)] = &[
     ("color", "Set the current session color", "<color|default>"),
     ("rename", "Rename the current session", "[name]"),
     ("usage", "Show usage, limits, and balances", ""),
+    ("bug", "Submit a bug report", "<description>"),
+    ("feedback", "Submit product feedback", "<description>"),
     (
         "plugin",
         "Discover and manage plugins and marketplaces",
@@ -343,6 +346,13 @@ fn fixed_local_completion_contains(slash_name: &str) -> bool {
         .any(|(fixed, _, _)| *fixed == name)
 }
 
+fn reserved_private_local_command(slash_name: &str) -> bool {
+    matches!(
+        slash_name.strip_prefix('/').unwrap_or(slash_name),
+        "bug" | "feedback"
+    )
+}
+
 fn fixed_local_command_description(
     ui_language: UiLanguage,
     name: &str,
@@ -356,6 +366,8 @@ fn fixed_local_command_description(
         "color" => "设置当前会话颜色",
         "rename" => "重命名当前会话",
         "usage" => "查看用量、额度与余额",
+        "bug" => "提交错误报告",
+        "feedback" => "提交产品反馈",
         "plugin" | "plugins" => "发现并管理插件与插件市场",
         "marketplace" => "管理插件市场",
         "login" => "登录 Acosmi 账户",
@@ -560,6 +572,7 @@ pub enum OutboundPurpose {
         server_name: String,
     },
     ContextUsage,
+    ContextUsageRefresh,
     ReloadPlugins,
     SideQuestion {
         question: String,
@@ -572,6 +585,7 @@ pub enum OutboundPurpose {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrivateRuntimePurpose {
     HealthSnapshot,
+    BugReportSubmit,
     RetainedIdentitySnapshot,
     RetainedColorApply,
     RetainedRenameApply,
@@ -673,6 +687,7 @@ impl PrivateRuntimePurpose {
             | Self::MarketplaceAutoUpdateWrite { token }
             | Self::PluginValidate { token } => Some(*token),
             Self::HealthSnapshot
+            | Self::BugReportSubmit
             | Self::RetainedIdentitySnapshot
             | Self::RetainedColorApply
             | Self::RetainedRenameApply
@@ -2173,6 +2188,16 @@ pub(crate) enum TranscriptSelectionDirection {
     Up,
 }
 
+/// Latest exact context-window snapshot returned by the existing direct SDK
+/// `get_context_usage` control. This is renderer state only; it does not add a
+/// second usage authority or a new wire field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveContextUsage {
+    pub(crate) total_tokens: u64,
+    pub(crate) max_tokens: u64,
+    pub(crate) percentage: u64,
+}
+
 pub struct TuiApp {
     pub projection: Projection,
     pub composer: TextArea,
@@ -2216,6 +2241,10 @@ pub struct TuiApp {
     slash_commands_enabled: bool,
     pub mcp_servers: Vec<McpServerState>,
     pub active_tasks: HashMap<String, String>,
+    live_context_usage: Option<LiveContextUsage>,
+    context_usage_refresh_pending: bool,
+    context_usage_refresh_dirty: bool,
+    task_panel_projection_cache: RefCell<TaskPanelProjectionCache>,
     active_goal: Option<ActiveGoalState>,
     goal_tasks: HashMap<String, GoalTaskObservation>,
     processed_goal_report_results: HashSet<String>,
@@ -2231,6 +2260,7 @@ pub struct TuiApp {
     pending_dialogs: VecDeque<String>,
     pending_outbound: HashMap<String, OutboundPurpose>,
     pending_private_runtime: HashMap<String, PendingPrivateRuntimeRequest>,
+    bug_report_inflight_request_id: Option<String>,
     next_private_runtime_request_id: u64,
     private_runtime_health_ready: bool,
     stderr_notices: VecDeque<String>,
@@ -2440,6 +2470,10 @@ impl TuiApp {
             slash_commands_enabled: true,
             mcp_servers: Vec::new(),
             active_tasks: HashMap::new(),
+            live_context_usage: None,
+            context_usage_refresh_pending: false,
+            context_usage_refresh_dirty: false,
+            task_panel_projection_cache: RefCell::new(TaskPanelProjectionCache::default()),
             active_goal: None,
             goal_tasks: HashMap::new(),
             processed_goal_report_results: HashSet::new(),
@@ -2455,6 +2489,7 @@ impl TuiApp {
             pending_dialogs: VecDeque::new(),
             pending_outbound: HashMap::new(),
             pending_private_runtime: HashMap::new(),
+            bug_report_inflight_request_id: None,
             next_private_runtime_request_id: 1,
             private_runtime_health_ready: false,
             stderr_notices: VecDeque::new(),
@@ -2657,6 +2692,78 @@ impl TuiApp {
 
     pub(crate) const fn ui_language(&self) -> UiLanguage {
         self.renderer_ui_language
+    }
+
+    pub(crate) const fn live_context_usage(&self) -> Option<LiveContextUsage> {
+        self.live_context_usage
+    }
+
+    pub(crate) const fn context_usage_refresh_pending(&self) -> bool {
+        self.context_usage_refresh_pending
+    }
+
+    pub(crate) fn task_panel_projection_state(&self) -> TaskPanelProjectionState {
+        self.task_panel_projection_cache.borrow_mut().project(
+            self.projection.raw_envelope_count(),
+            self.projection.items(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_panel_projection_rebuild_count(&self) -> usize {
+        self.task_panel_projection_cache.borrow().rebuild_count()
+    }
+
+    fn live_context_usage_refresh_action(&mut self) -> Option<HostAction> {
+        if self.context_usage_refresh_pending {
+            self.context_usage_refresh_dirty = true;
+            return None;
+        }
+        if self.startup_barrier_pending {
+            self.context_usage_refresh_dirty = true;
+            return None;
+        }
+        self.context_usage_refresh_pending = true;
+        self.context_usage_refresh_dirty = false;
+        Some(HostAction::SendControl {
+            request: json!({"subtype": "get_context_usage"}),
+            purpose: OutboundPurpose::ContextUsageRefresh,
+        })
+    }
+
+    fn cache_context_usage(&mut self, visualization: &ContextVisualization) {
+        self.live_context_usage = Some(LiveContextUsage {
+            total_tokens: visualization.total_tokens(),
+            max_tokens: visualization.raw_max_tokens(),
+            percentage: visualization.percentage().min(100),
+        });
+    }
+
+    fn complete_live_context_usage_refresh(&mut self) -> Vec<HostAction> {
+        self.context_usage_refresh_pending = false;
+        if std::mem::take(&mut self.context_usage_refresh_dirty) {
+            self.live_context_usage_refresh_action()
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_live_context_usage_for_test(
+        &mut self,
+        total_tokens: u64,
+        max_tokens: u64,
+        percentage: u64,
+    ) {
+        self.context_usage_refresh_pending = false;
+        self.context_usage_refresh_dirty = false;
+        self.live_context_usage = Some(LiveContextUsage {
+            total_tokens,
+            max_tokens,
+            percentage: percentage.min(100),
+        });
     }
 
     pub(crate) const fn setup_surface_exclusive(&self) -> bool {
@@ -4338,6 +4445,13 @@ impl TuiApp {
         );
         self.next_private_runtime_request_id =
             self.next_private_runtime_request_id.saturating_add(1);
+        if purpose == PrivateRuntimePurpose::BugReportSubmit {
+            debug_assert!(
+                self.bug_report_inflight_request_id.is_none(),
+                "the renderer must admit at most one bug report at a time"
+            );
+            self.bug_report_inflight_request_id = Some(request_id.clone());
+        }
         HostAction::SendPrivateRuntimeAction {
             request_id,
             action,
@@ -4528,6 +4642,13 @@ impl TuiApp {
         request_id: String,
         purpose: PrivateRuntimePurpose,
     ) {
+        if purpose == PrivateRuntimePurpose::BugReportSubmit {
+            debug_assert_eq!(
+                self.bug_report_inflight_request_id.as_deref(),
+                Some(request_id.as_str()),
+                "bug-report writer admission must retain exact renderer correlation"
+            );
+        }
         self.pending_private_runtime.insert(
             request_id,
             PendingPrivateRuntimeRequest {
@@ -4586,9 +4707,34 @@ impl TuiApp {
             return Vec::new();
         }
         let purpose = pending.map(|request| request.purpose);
+        if purpose.as_ref() == Some(&PrivateRuntimePurpose::BugReportSubmit) {
+            if self.bug_report_inflight_request_id.as_deref() != Some(request_id.as_str()) {
+                self.status = self
+                    .renderer_ui_language
+                    .text(
+                        "已忽略与当前错误报告不匹配的过期结果",
+                        "Ignored a stale result that did not match the active bug report",
+                    )
+                    .to_string();
+                return Vec::new();
+            }
+            // Every terminal correlated result closes the one-shot in-flight
+            // lifecycle, including invalid, unconfirmed, and action-error
+            // results. A later explicit command may then create a fresh id.
+            self.bug_report_inflight_request_id = None;
+        }
         if let Some(validation_error) = validation_error {
             if let Some(purpose) = purpose.as_ref() {
-                if let Some(token) = purpose.usage_plugin_token() {
+                if purpose == &PrivateRuntimePurpose::BugReportSubmit {
+                    self.status = self
+                        .renderer_ui_language
+                        .text(
+                            "错误报告返回了无效结果；无法确认是否提交成功",
+                            "The bug report returned an invalid result; submission could not be confirmed",
+                        )
+                        .to_string();
+                    return Vec::new();
+                } else if let Some(token) = purpose.usage_plugin_token() {
                     if let Some(management) = self.usage_plugin_management.as_mut() {
                         management.apply_protocol_failure(
                             token,
@@ -4602,7 +4748,7 @@ impl TuiApp {
                         self.renderer_ui_language,
                         &validation_error,
                     );
-                } else if purpose != &PrivateRuntimePurpose::HealthSnapshot
+                } else if purpose.is_model_management()
                     && let Some(management) = self.model_management.as_mut()
                 {
                     management.apply_error(self.renderer_ui_language, &validation_error);
@@ -4633,6 +4779,49 @@ impl TuiApp {
         };
 
         match (purpose.clone(), result_kind.as_deref()) {
+            (PrivateRuntimePurpose::BugReportSubmit, Some("bug_report_submitted")) => {
+                match protocol_bug_report_feedback_id(value.pointer("/result/feedback_id")) {
+                    Ok(feedback_id) => {
+                        self.status = match self.renderer_ui_language {
+                            UiLanguage::ZhCn => {
+                                format!("错误报告已提交 · 反馈 ID：{feedback_id}")
+                            }
+                            UiLanguage::EnUs => {
+                                format!("Bug report submitted · Feedback ID: {feedback_id}")
+                            }
+                        };
+                    }
+                    Err(_) => {
+                        self.status = self
+                            .renderer_ui_language
+                            .text(
+                                "错误报告已返回，但反馈 ID 无效；无法确认提交结果",
+                                "The bug report returned an invalid feedback ID; submission could not be confirmed",
+                            )
+                            .to_string();
+                    }
+                }
+            }
+            (PrivateRuntimePurpose::BugReportSubmit, Some("bug_report_unconfirmed")) => {
+                self.status = self
+                    .renderer_ui_language
+                    .text(
+                        "服务可能已收到错误报告，但未返回反馈 ID；请勿立即重复提交",
+                        "The service may have received the bug report but returned no feedback ID; do not resubmit immediately",
+                    )
+                    .to_string();
+            }
+            (PrivateRuntimePurpose::BugReportSubmit, Some(result_kind))
+                if result_kind != "runtime_action_error" =>
+            {
+                self.status = self
+                    .renderer_ui_language
+                    .text(
+                        "错误报告结果与请求不匹配；无法确认是否提交成功",
+                        "The bug report result did not match the request; submission could not be confirmed",
+                    )
+                    .to_string();
+            }
             (PrivateRuntimePurpose::HealthSnapshot, Some("health_snapshot"))
                 if value.pointer("/result/status").and_then(Value::as_str) == Some("ready") =>
             {
@@ -4643,13 +4832,27 @@ impl TuiApp {
                     .pointer("/result/code")
                     .and_then(Value::as_str)
                     .unwrap_or("invalid_request");
-                self.status = match self.renderer_ui_language {
-                    UiLanguage::ZhCn => format!("TUI 私有运行请求被拒绝：{code}"),
-                    UiLanguage::EnUs => {
-                        format!("Private TUI runtime request was rejected: {code}")
+                self.status = if purpose == PrivateRuntimePurpose::BugReportSubmit {
+                    match self.renderer_ui_language {
+                        UiLanguage::ZhCn => {
+                            format!("错误报告发送失败或结果无法确认：{code}；请勿立即重复提交")
+                        }
+                        UiLanguage::EnUs => format!(
+                            "Bug report delivery failed or could not be confirmed: {code}; do not resubmit immediately"
+                        ),
+                    }
+                } else {
+                    match self.renderer_ui_language {
+                        UiLanguage::ZhCn => format!("TUI 私有运行请求被拒绝：{code}"),
+                        UiLanguage::EnUs => {
+                            format!("Private TUI runtime request was rejected: {code}")
+                        }
                     }
                 };
-                if let Some(token) = purpose.usage_plugin_token() {
+                if purpose == PrivateRuntimePurpose::BugReportSubmit {
+                    // The status above is the complete renderer lifecycle for
+                    // this one-shot command.
+                } else if let Some(token) = purpose.usage_plugin_token() {
                     let Some(management) = self.usage_plugin_management.as_mut() else {
                         // Closing a busy panel must not recreate it when the
                         // already-admitted request settles late.
@@ -4659,7 +4862,7 @@ impl TuiApp {
                 } else if let Some(retained) = purpose.retained() {
                     self.retained_commands
                         .apply_error(retained, self.renderer_ui_language, code);
-                } else if purpose != PrivateRuntimePurpose::HealthSnapshot {
+                } else if purpose.is_model_management() {
                     let Some(management) = self.model_management.as_mut() else {
                         return Vec::new();
                     };
@@ -4760,7 +4963,15 @@ impl TuiApp {
                 }
             }
             (purpose, None) => {
-                if let Some(token) = purpose.usage_plugin_token() {
+                if purpose == PrivateRuntimePurpose::BugReportSubmit {
+                    self.status = self
+                        .renderer_ui_language
+                        .text(
+                            "错误报告结果缺少类型；无法确认是否提交成功",
+                            "The bug report result omitted its kind; submission could not be confirmed",
+                        )
+                        .to_string();
+                } else if let Some(token) = purpose.usage_plugin_token() {
                     if let Some(management) = self.usage_plugin_management.as_mut() {
                         management.apply_protocol_failure(
                             token,
@@ -4941,12 +5152,26 @@ impl TuiApp {
                     UiLanguage::EnUs => format!("Side question could not be sent: {error}"),
                 };
             }
+            HostAction::SendControl {
+                purpose: OutboundPurpose::ContextUsageRefresh,
+                ..
+            } => {
+                self.context_usage_refresh_pending = false;
+            }
             HostAction::SendPrivateRuntimeAction {
                 request_id,
                 purpose,
                 ..
             } => {
                 let pending = self.pending_private_runtime.remove(request_id);
+                if purpose == &PrivateRuntimePurpose::BugReportSubmit {
+                    if self.bug_report_inflight_request_id.as_deref() != Some(request_id.as_str()) {
+                        // A late failure for an already-settled report must
+                        // neither release nor overwrite a newer report.
+                        return;
+                    }
+                    self.bug_report_inflight_request_id = None;
+                }
                 if pending
                     .as_ref()
                     .is_some_and(|request| !request.renderer_target_active)
@@ -4961,25 +5186,38 @@ impl TuiApp {
                         .as_ref()
                         .is_none_or(|request| request.purpose == *purpose)
                 );
-                if let Some(token) = purpose.usage_plugin_token() {
+                if purpose == &PrivateRuntimePurpose::BugReportSubmit {
+                    // This command has no modal state to retire or restore.
+                } else if let Some(token) = purpose.usage_plugin_token() {
                     if let Some(management) = self.usage_plugin_management.as_mut() {
                         management.apply_send_failure(token, self.renderer_ui_language, &error);
                     }
                 } else if let Some(retained) = purpose.retained() {
                     self.retained_commands
                         .apply_error(retained, self.renderer_ui_language, &error);
-                } else if purpose != &PrivateRuntimePurpose::HealthSnapshot
+                } else if purpose.is_model_management()
                     && let Some(management) = self.model_management.as_mut()
                 {
                     management.apply_error(self.renderer_ui_language, &error);
                 }
-                self.status = match self.renderer_ui_language {
-                    UiLanguage::ZhCn => {
-                        format!("TUI 私有运行请求 {request_id} 发送失败；会话继续运行：{error}")
+                self.status = if purpose == &PrivateRuntimePurpose::BugReportSubmit {
+                    match self.renderer_ui_language {
+                        UiLanguage::ZhCn => {
+                            format!("错误报告发送失败或结果无法确认：{error}；请勿立即重复提交")
+                        }
+                        UiLanguage::EnUs => format!(
+                            "Bug report delivery failed or could not be confirmed: {error}; do not resubmit immediately"
+                        ),
                     }
-                    UiLanguage::EnUs => format!(
-                        "Private TUI runtime request {request_id} could not be sent; session remains active: {error}"
-                    ),
+                } else {
+                    match self.renderer_ui_language {
+                        UiLanguage::ZhCn => {
+                            format!("TUI 私有运行请求 {request_id} 发送失败；会话继续运行：{error}")
+                        }
+                        UiLanguage::EnUs => format!(
+                            "Private TUI runtime request {request_id} could not be sent; session remains active: {error}"
+                        ),
+                    }
                 };
             }
             HostAction::SendUser { .. } | HostAction::SendControl { .. } => {
@@ -5388,11 +5626,19 @@ impl TuiApp {
             return;
         }
         let ui_language = self.renderer_ui_language;
-        let mut commands = self.commands.clone();
+        let mut commands = self
+            .commands
+            .iter()
+            .filter(|command| !reserved_private_local_command(&command.name))
+            .cloned()
+            .collect::<Vec<_>>();
         commands.extend(
             FIXED_LOCAL_COMMAND_COMPLETIONS
                 .iter()
-                .filter(|(name, _, _)| !self.commands.iter().any(|command| command.name == *name))
+                .filter(|(name, _, _)| {
+                    reserved_private_local_command(name)
+                        || !self.commands.iter().any(|command| command.name == *name)
+                })
                 .map(|(name, description, argument_hint)| SlashCommandChoice {
                     name: (*name).to_string(),
                     description: fixed_local_command_description(ui_language, name, description)
@@ -5939,7 +6185,8 @@ impl TuiApp {
             return Vec::new();
         };
         let command = self.completion_commands[index].clone();
-        let runtime_owned = self.runtime_catalog_contains(&command.name);
+        let runtime_owned = self.runtime_catalog_contains(&command.name)
+            && !reserved_private_local_command(&command.name);
         let renderer_owned = fixed_local_completion_contains(&command.name) && !runtime_owned;
         let completed = format!("/{} ", command.name);
         self.reset_composer_history_navigation();
@@ -8232,11 +8479,69 @@ impl TuiApp {
         // runtime entry therefore owns both dispatch and completion; the
         // renderer-local implementation is only a fallback when the exact
         // name is absent from the authoritative runtime catalog.
-        if self.runtime_catalog_contains(name) {
+        // Bug reporting is a reserved privacy-sensitive local command. It
+        // must not be shadowed into the ordinary conversation path by a
+        // same-named discovered command.
+        if !reserved_private_local_command(name) && self.runtime_catalog_contains(name) {
             return None;
         }
         if name == "/usage" {
             return Some(self.open_usage_management());
+        }
+        if matches!(name, "/bug" | "/feedback") {
+            if self.bug_report_inflight_request_id.is_some() {
+                self.status = self
+                    .renderer_ui_language
+                    .text(
+                        "已有错误报告正在提交；请等待当前结果后再试",
+                        "A bug report is already being submitted; wait for its result before trying again",
+                    )
+                    .to_string();
+                return Some(Vec::new());
+            }
+            let description = crate::text_safety::trim_ecmascript_whitespace(raw_rest);
+            if description.is_empty() {
+                self.status = self
+                    .renderer_ui_language
+                    .text("用法：/bug <问题描述>", "Usage: /bug <issue description>")
+                    .to_string();
+                return Some(Vec::new());
+            }
+            if description.len() > MAX_BUG_REPORT_DESCRIPTION_BYTES {
+                self.status = match self.renderer_ui_language {
+                    UiLanguage::ZhCn => {
+                        format!("问题描述超过 {MAX_BUG_REPORT_DESCRIPTION_BYTES} 字节上限；未提交")
+                    }
+                    UiLanguage::EnUs => format!(
+                        "Issue description exceeds the {MAX_BUG_REPORT_DESCRIPTION_BYTES}-byte limit; report was not submitted"
+                    ),
+                };
+                return Some(Vec::new());
+            }
+            if description.chars().any(|character| {
+                (character <= '\u{001f}' && !matches!(character, '\t' | '\n' | '\r'))
+                    || character == '\u{007f}'
+            }) {
+                self.status = self
+                    .renderer_ui_language
+                    .text(
+                        "问题描述包含不支持的控制字符；未提交",
+                        "Issue description contains an unsupported control character; report was not submitted",
+                    )
+                    .to_string();
+                return Some(Vec::new());
+            }
+            self.status = self
+                .renderer_ui_language
+                .text(
+                    "正在提交错误报告（仅包含问题描述和基本构建环境）…",
+                    "Submitting bug report (issue description and basic build environment only)…",
+                )
+                .to_string();
+            return Some(vec![self.private_runtime_action(
+                json!({"kind": "bug_report_submit", "description": description}),
+                PrivateRuntimePurpose::BugReportSubmit,
+            )]);
         }
         if matches!(name, "/plugin" | "/plugins") {
             return Some(self.open_plugin_management(rest));
@@ -9240,6 +9545,10 @@ impl TuiApp {
         self.turn_abort_pending = None;
         self.turn_abort_result_pending = false;
         self.pending_extra_usage_output = false;
+        self.live_context_usage = None;
+        self.context_usage_refresh_pending = false;
+        self.context_usage_refresh_dirty = false;
+        self.task_panel_projection_cache.get_mut().clear();
         self.active_goal = None;
         self.goal_tasks.clear();
         self.processed_goal_report_results.clear();
@@ -9278,12 +9587,18 @@ impl TuiApp {
                     UiLanguage::ZhCn => format!(
                         "CrabCode 已就绪 · 模型={} · 权限={}",
                         model.as_deref().unwrap_or("未知"),
-                        permission_mode.as_deref().unwrap_or("未知")
+                        localized_permission_mode_label(
+                            permission_mode.as_deref(),
+                            self.renderer_ui_language,
+                        )
                     ),
                     UiLanguage::EnUs => format!(
                         "CrabCode ready · model={} · permission={}",
                         model.as_deref().unwrap_or("unknown"),
-                        permission_mode.as_deref().unwrap_or("unknown")
+                        localized_permission_mode_label(
+                            permission_mode.as_deref(),
+                            self.renderer_ui_language,
+                        )
                     ),
                 };
                 Vec::new()
@@ -9445,7 +9760,9 @@ impl TuiApp {
                     (UiLanguage::ZhCn, false) => "已就绪".to_string(),
                     (UiLanguage::EnUs, false) => "Ready".to_string(),
                 };
-                Vec::new()
+                self.live_context_usage_refresh_action()
+                    .into_iter()
+                    .collect()
             }
             ProjectionEffect::CompatibilityFault { .. } => Vec::new(),
             ProjectionEffect::AbortTurn {
@@ -10531,6 +10848,9 @@ impl TuiApp {
             // late negative acknowledgement and cannot affect a successor.
             return Vec::new();
         }
+        if !success && matches!(&purpose, OutboundPurpose::ContextUsageRefresh) {
+            return self.complete_live_context_usage_refresh();
+        }
         if !success {
             let Some(error) = payload.get("error").and_then(Value::as_str) else {
                 self.fail_closed(format!(
@@ -10655,6 +10975,9 @@ impl TuiApp {
                 let health = self.private_runtime_health_snapshot_action();
                 let mut actions = vec![health];
                 actions.extend(self.request_retained_identity_snapshot());
+                if let Some(action) = self.live_context_usage_refresh_action() {
+                    actions.push(action);
+                }
                 actions
             }
             OutboundPurpose::Interrupt => {
@@ -11092,8 +11415,15 @@ impl TuiApp {
                         return Vec::new();
                     }
                 };
+                self.cache_context_usage(&visualization);
                 self.overlay = Some(Overlay::context(visualization, self.renderer_ui_language));
                 Vec::new()
+            }
+            OutboundPurpose::ContextUsageRefresh => {
+                if let Ok(visualization) = ContextVisualization::from_control_response(&payload) {
+                    self.cache_context_usage(&visualization);
+                }
+                self.complete_live_context_usage_refresh()
             }
             OutboundPurpose::Generic(_) => {
                 self.overlay_json(purpose_label(&purpose), payload);
@@ -12998,6 +13328,24 @@ fn protocol_label(value: Option<&Value>, label: &str) -> Result<String, String> 
 
 fn protocol_identifier(value: Option<&Value>, label: &str) -> Result<String, String> {
     protocol_safe_string(value, label, 1, SAFE_IDENTIFIER_UTF16_LIMIT)
+}
+
+fn protocol_bug_report_feedback_id(value: Option<&Value>) -> Result<String, String> {
+    let value = protocol_safe_string(value, "bug report feedback id", 1, 160)?;
+    if value.chars().any(|character| {
+        ('\u{0080}'..='\u{009f}').contains(&character)
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    }) {
+        return Err("bug report feedback id contains a terminal control character".to_string());
+    }
+    Ok(value)
 }
 
 fn protocol_setup_text_input(value: Option<&Value>, label: &str) -> Result<String, String> {
@@ -15561,9 +15909,32 @@ fn purpose_label(purpose: &OutboundPurpose) -> &str {
         OutboundPurpose::McpBulkToggleStep { .. } => "MCP bulk toggle",
         OutboundPurpose::McpReconnect { .. } => "MCP reconnect",
         OutboundPurpose::ContextUsage => "Context usage",
+        OutboundPurpose::ContextUsageRefresh => "Context usage refresh",
         OutboundPurpose::ReloadPlugins => "Reload plugins",
         OutboundPurpose::SideQuestion { .. } => "Side question",
         OutboundPurpose::StopTask { .. } => "Stop task",
+    }
+}
+
+pub(crate) fn localized_permission_mode_label(
+    mode: Option<&str>,
+    ui_language: UiLanguage,
+) -> &'static str {
+    match (ui_language, mode) {
+        (UiLanguage::ZhCn, Some("default")) => "标准审批",
+        (UiLanguage::ZhCn, Some("acceptEdits")) => "自动接受编辑",
+        (UiLanguage::ZhCn, Some("bypassPermissions")) => "跳过所有审批",
+        (UiLanguage::ZhCn, Some("plan")) => "只规划",
+        (UiLanguage::ZhCn, Some("dontAsk")) => "仅执行已批准",
+        (UiLanguage::ZhCn, Some(_)) => "自定义",
+        (UiLanguage::ZhCn, None) => "未知",
+        (UiLanguage::EnUs, Some("default")) => "standard",
+        (UiLanguage::EnUs, Some("acceptEdits")) => "accept edits",
+        (UiLanguage::EnUs, Some("bypassPermissions")) => "skip all approvals",
+        (UiLanguage::EnUs, Some("plan")) => "plan only",
+        (UiLanguage::EnUs, Some("dontAsk")) => "approved only",
+        (UiLanguage::EnUs, Some(_)) => "custom",
+        (UiLanguage::EnUs, None) => "unknown",
     }
 }
 
@@ -15588,6 +15959,7 @@ fn localized_purpose_label(purpose: &OutboundPurpose, ui_language: UiLanguage) -
         OutboundPurpose::McpBulkToggleStep { .. } => "批量切换 MCP",
         OutboundPurpose::McpReconnect { .. } => "重新连接 MCP",
         OutboundPurpose::ContextUsage => "上下文用量",
+        OutboundPurpose::ContextUsageRefresh => "刷新上下文用量",
         OutboundPurpose::ReloadPlugins => "重新加载插件",
         OutboundPurpose::SideQuestion { .. } => "旁路提问",
         OutboundPurpose::StopTask { .. } => "停止任务",
@@ -15886,8 +16258,12 @@ mod tests {
                     action: json!({"kind":"retained.identity.snapshot"}),
                     purpose: PrivateRuntimePurpose::RetainedIdentitySnapshot,
                 },
+                HostAction::SendControl {
+                    request: json!({"subtype":"get_context_usage"}),
+                    purpose: OutboundPurpose::ContextUsageRefresh,
+                },
             ],
-            "initialize must emit the health probe and persisted renderer identity snapshot",
+            "initialize must emit private probes and one silent context refresh",
         );
     }
 
@@ -16448,7 +16824,7 @@ mod tests {
 
         let mut result_app = app();
         start_request_activity(&mut result_app);
-        result_app.handle_runtime_event(raw(
+        let actions = result_app.handle_runtime_event(raw(
             1,
             json!({
                 "type":"result",
@@ -16468,6 +16844,14 @@ mod tests {
             }),
             EnvelopeClass::Result,
         ));
+        assert_eq!(
+            actions,
+            vec![HostAction::SendControl {
+                request: json!({"subtype":"get_context_usage"}),
+                purpose: OutboundPurpose::ContextUsageRefresh,
+            }]
+        );
+        assert!(result_app.context_usage_refresh_pending());
         assert!(!result_app.stream_requesting());
         assert_eq!(result_app.status, "Ready");
     }
@@ -17932,6 +18316,19 @@ mod tests {
         assert_eq!(overlay.kind, OverlayKind::Context);
         assert_eq!(overlay.title, "Context Usage");
         assert!(overlay.context_visualization.is_some());
+        let usage = context.live_context_usage().expect("cached context usage");
+        assert_eq!(
+            usage.total_tokens,
+            payload["response"]["totalTokens"].as_u64().unwrap()
+        );
+        assert_eq!(
+            usage.max_tokens,
+            payload["response"]["rawMaxTokens"].as_u64().unwrap()
+        );
+        assert_eq!(
+            usage.percentage,
+            payload["response"]["percentage"].as_u64().unwrap()
+        );
         assert!(
             !overlay.body.contains("\"categories\""),
             "context data must not fall back to the generic JSON surface"
@@ -17949,6 +18346,87 @@ mod tests {
         assert!(malformed.fatal.as_deref().is_some_and(|reason| {
             reason.contains("unknown historical theme role `futureColor`")
         }));
+    }
+
+    #[test]
+    fn silent_context_usage_refresh_caches_without_opening_or_poisoning_ui() {
+        let payload = crate::context_visualization::minimal_test_control_response();
+        let mut app = app();
+        app.context_usage_refresh_pending = true;
+        let original_status = app.status.clone();
+        assert!(
+            app.apply_control_response(
+                OutboundPurpose::ContextUsageRefresh,
+                true,
+                payload.clone(),
+                1,
+            )
+            .is_empty()
+        );
+        assert!(!app.context_usage_refresh_pending());
+        assert!(app.overlay.is_none());
+        assert_eq!(app.status, original_status);
+        let original_usage = app.live_context_usage().expect("live context usage");
+
+        let mut malformed = payload;
+        malformed["response"]["categories"][0]["color"] = json!("futureColor");
+        app.context_usage_refresh_pending = true;
+        assert!(
+            app.apply_control_response(OutboundPurpose::ContextUsageRefresh, true, malformed, 2,)
+                .is_empty()
+        );
+        assert_eq!(app.live_context_usage(), Some(original_usage));
+        assert!(app.fatal.is_none());
+
+        app.context_usage_refresh_pending = true;
+        assert!(
+            app.apply_control_response(
+                OutboundPurpose::ContextUsageRefresh,
+                false,
+                json!({"error":"usage temporarily unavailable"}),
+                3,
+            )
+            .is_empty()
+        );
+        assert!(!app.context_usage_refresh_pending());
+        assert_eq!(app.status, original_status);
+    }
+
+    #[test]
+    fn turn_completion_during_context_refresh_is_coalesced_into_a_follow_up() {
+        let payload = crate::context_visualization::minimal_test_control_response();
+        let mut app = app();
+        app.context_usage_refresh_pending = true;
+
+        assert!(
+            app.handle_projection_effect(ProjectionEffect::TurnCompleted {
+                subtype: "success".to_string(),
+                is_error: false,
+                raw_sequence: 1,
+            })
+            .is_empty()
+        );
+        assert!(app.context_usage_refresh_dirty);
+
+        assert_eq!(
+            app.apply_control_response(
+                OutboundPurpose::ContextUsageRefresh,
+                true,
+                payload.clone(),
+                2,
+            ),
+            vec![HostAction::SendControl {
+                request: json!({"subtype":"get_context_usage"}),
+                purpose: OutboundPurpose::ContextUsageRefresh,
+            }]
+        );
+        assert!(app.context_usage_refresh_pending);
+        assert!(!app.context_usage_refresh_dirty);
+        assert!(
+            app.apply_control_response(OutboundPurpose::ContextUsageRefresh, true, payload, 3,)
+                .is_empty()
+        );
+        assert!(!app.context_usage_refresh_pending);
     }
 
     #[test]
@@ -24146,9 +24624,11 @@ mod tests {
         use std::collections::BTreeSet;
 
         let retained = [
+            "bug",
             "color",
             "context",
             "exit",
+            "feedback",
             "help",
             "login",
             "marketplace",
@@ -24658,6 +25138,8 @@ mod tests {
                 "color" => "/color blue",
                 "rename" => "/rename fixture name",
                 "usage" => "/usage",
+                "bug" => "/bug fixture problem",
+                "feedback" => "/feedback fixture suggestion",
                 "plugin" => "/plugin",
                 "plugins" => "/plugins",
                 "marketplace" => "/marketplace",
@@ -24686,8 +25168,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_first_wins_even_for_local_exit_name_collisions() {
+    fn runtime_first_wins_for_local_collisions_except_reserved_bug_reporting() {
         for (name, _, _) in FIXED_LOCAL_COMMAND_COMPLETIONS {
+            if reserved_private_local_command(name) {
+                continue;
+            }
             let command = format!("/{name}");
             let mut app = TuiApp::new(
                 &json!({
@@ -26911,6 +27396,325 @@ mod tests {
         };
         app.record_private_runtime_action(request_id.clone(), purpose.clone());
         request_id.clone()
+    }
+
+    #[test]
+    fn bug_and_feedback_commands_submit_only_the_description_and_report_feedback_id() {
+        for command in ["/bug 终端渲染错位", "/feedback 终端渲染错位"] {
+            let mut app = app();
+            let actions = app
+                .handle_local_command(command)
+                .expect("fixed bug-report command");
+            let [action] = actions.as_slice() else {
+                panic!("bug report must emit exactly one private action");
+            };
+            let HostAction::SendPrivateRuntimeAction {
+                action: payload,
+                purpose,
+                ..
+            } = action
+            else {
+                panic!("bug report must use the closed direct-runtime action lane");
+            };
+            assert_eq!(
+                payload,
+                &json!({
+                    "kind": "bug_report_submit",
+                    "description": "终端渲染错位"
+                })
+            );
+            assert_eq!(purpose, &PrivateRuntimePurpose::BugReportSubmit);
+            assert!(app.status.contains("basic build environment"));
+
+            let request_id = admit_private_action(&mut app, action);
+            assert!(
+                app.handle_private_runtime_result(
+                    Some(request_id),
+                    Some("bug_report_submitted".to_string()),
+                    None,
+                    &json!({"result": {
+                        "kind": "bug_report_submitted",
+                        "feedback_id": "feedback-123"
+                    }}),
+                )
+                .is_empty()
+            );
+            assert_eq!(
+                app.status,
+                "Bug report submitted · Feedback ID: feedback-123"
+            );
+        }
+
+        let mut collision = TuiApp::new(
+            &json!({"commands": [{
+                "name": "bug",
+                "description": "must not shadow the private report command",
+                "argumentHint": "<text>"
+            }]}),
+            InitialSessionRequest::New,
+            None,
+        );
+        collision.renderer_ui_language = UiLanguage::EnUs;
+        collision.release_startup_barrier_for_test();
+        collision.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
+        collision.rebuild_completion_commands();
+        let bug_entries = collision
+            .completion_commands
+            .iter()
+            .filter(|command| command.name == "bug")
+            .collect::<Vec<_>>();
+        assert_eq!(bug_entries.len(), 1);
+        assert_eq!(bug_entries[0].description, "Submit a bug report");
+        assert_eq!(bug_entries[0].argument_hint, "<description>");
+        assert_ne!(bug_entries[0].argument_hint, "<text>");
+
+        let bug_index = collision
+            .completion_commands
+            .iter()
+            .position(|command| command.name == "bug")
+            .expect("reserved bug completion");
+        collision.composer.set_text("/bug");
+        collision.composer.set_cursor(4);
+        collision.command_palette.matches = vec![bug_index];
+        assert!(collision.accept_selected_command(true).is_empty());
+        assert_eq!(collision.status, "Usage: /bug <issue description>");
+
+        let actions = collision
+            .handle_local_command("/bug renderer collision")
+            .expect("bug reporting remains reserved locally");
+        assert!(matches!(
+            actions.as_slice(),
+            [HostAction::SendPrivateRuntimeAction {
+                purpose: PrivateRuntimePurpose::BugReportSubmit,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn bug_report_guard_blocks_duplicates_until_the_exact_result_settles() {
+        let mut app = app();
+        let first = app
+            .handle_local_command("/bug first report")
+            .expect("first report command");
+        let [first_action] = first.as_slice() else {
+            panic!("first report action");
+        };
+        let HostAction::SendPrivateRuntimeAction {
+            request_id: first_request_id,
+            ..
+        } = first_action
+        else {
+            panic!("first private report action");
+        };
+        assert_eq!(
+            app.bug_report_inflight_request_id.as_deref(),
+            Some(first_request_id.as_str())
+        );
+
+        assert_eq!(
+            app.handle_local_command("/feedback duplicate report"),
+            Some(Vec::new())
+        );
+        assert!(app.status.contains("already being submitted"));
+
+        let admitted_id = admit_private_action(&mut app, first_action);
+        assert!(
+            app.handle_private_runtime_result(
+                Some("unrelated-report-result".to_string()),
+                Some("bug_report_submitted".to_string()),
+                None,
+                &json!({"result": {
+                    "kind": "bug_report_submitted",
+                    "feedback_id": "unrelated-feedback"
+                }}),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            app.bug_report_inflight_request_id.as_deref(),
+            Some(admitted_id.as_str()),
+            "an uncorrelated result cannot release the active report"
+        );
+        assert_eq!(
+            app.handle_local_command("/bug still duplicate"),
+            Some(Vec::new())
+        );
+
+        app.handle_private_runtime_result(
+            Some(admitted_id),
+            Some("bug_report_submitted".to_string()),
+            None,
+            &json!({"result": {
+                "kind": "bug_report_submitted",
+                "feedback_id": "feedback-first"
+            }}),
+        );
+        assert!(app.bug_report_inflight_request_id.is_none());
+        assert!(matches!(
+            app.handle_local_command("/bug after exact result")
+                .expect("a settled report permits a new command")
+                .as_slice(),
+            [HostAction::SendPrivateRuntimeAction {
+                purpose: PrivateRuntimePurpose::BugReportSubmit,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn bug_report_guard_clears_on_error_unconfirmed_and_send_failure() {
+        let mut app = app();
+
+        let action_error = app
+            .handle_local_command("/bug action error")
+            .expect("action-error report")
+            .remove(0);
+        let request_id = admit_private_action(&mut app, &action_error);
+        app.handle_private_runtime_result(
+            Some(request_id),
+            Some("runtime_action_error".to_string()),
+            None,
+            &json!({"result": {
+                "kind": "runtime_action_error",
+                "code": "action_failed"
+            }}),
+        );
+        assert!(app.bug_report_inflight_request_id.is_none());
+
+        let unconfirmed = app
+            .handle_local_command("/feedback unconfirmed")
+            .expect("unconfirmed report")
+            .remove(0);
+        let request_id = admit_private_action(&mut app, &unconfirmed);
+        app.handle_private_runtime_result(
+            Some(request_id),
+            Some("bug_report_unconfirmed".to_string()),
+            None,
+            &json!({"result": {"kind": "bug_report_unconfirmed"}}),
+        );
+        assert!(app.bug_report_inflight_request_id.is_none());
+
+        let invalid = app
+            .handle_local_command("/bug malformed result")
+            .expect("invalid-result report")
+            .remove(0);
+        let request_id = admit_private_action(&mut app, &invalid);
+        app.handle_private_runtime_result(
+            Some(request_id),
+            Some("bug_report_submitted".to_string()),
+            Some("invalid-private-bug-result".to_string()),
+            &json!({"result": {"kind": "bug_report_submitted"}}),
+        );
+        assert!(app.bug_report_inflight_request_id.is_none());
+
+        let send_failure = app
+            .handle_local_command("/bug writer failure")
+            .expect("writer-failure report")
+            .remove(0);
+        // This is the pre-admission failure path: no pending-map entry exists,
+        // but the renderer-created exact request still owns the guard.
+        app.action_failed(&send_failure, "queue_full");
+        assert!(app.bug_report_inflight_request_id.is_none());
+        assert!(matches!(
+            app.handle_local_command("/bug retry after writer failure")
+                .expect("writer failure permits a fresh retry")
+                .as_slice(),
+            [HostAction::SendPrivateRuntimeAction {
+                purpose: PrivateRuntimePurpose::BugReportSubmit,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn bug_command_rejects_empty_oversized_or_control_text_and_reports_runtime_failure() {
+        let mut app = app();
+        assert_eq!(app.handle_local_command("/bug"), Some(Vec::new()));
+        assert_eq!(app.status, "Usage: /bug <issue description>");
+
+        let oversized = format!("/bug {}", "x".repeat(MAX_BUG_REPORT_DESCRIPTION_BYTES + 1));
+        assert_eq!(app.handle_local_command(&oversized), Some(Vec::new()));
+        assert!(app.status.contains("exceeds the 8000-byte limit"));
+
+        assert_eq!(
+            app.handle_local_command("/bug invalid\u{0000}description"),
+            Some(Vec::new())
+        );
+        assert!(app.status.contains("unsupported control character"));
+
+        let actions = app
+            .handle_local_command("/bug still broken")
+            .expect("fixed bug command");
+        let [action] = actions.as_slice() else {
+            panic!("bug report action");
+        };
+        let action = action.clone();
+        let request_id = admit_private_action(&mut app, &action);
+        app.handle_private_runtime_result(
+            Some(request_id),
+            Some("runtime_action_error".to_string()),
+            None,
+            &json!({"result": {
+                "kind": "runtime_action_error",
+                "code": "action_failed"
+            }}),
+        );
+        assert_eq!(
+            app.status,
+            "Bug report delivery failed or could not be confirmed: action_failed; do not resubmit immediately"
+        );
+
+        let actions = app
+            .handle_local_command("/bug confirmation missing")
+            .expect("fixed bug command");
+        let [action] = actions.as_slice() else {
+            panic!("bug report action");
+        };
+        let request_id = admit_private_action(&mut app, action);
+        app.handle_private_runtime_result(
+            Some(request_id),
+            Some("bug_report_unconfirmed".to_string()),
+            None,
+            &json!({"result": {"kind": "bug_report_unconfirmed"}}),
+        );
+        assert_eq!(
+            app.status,
+            "The service may have received the bug report but returned no feedback ID; do not resubmit immediately"
+        );
+
+        for unsafe_id in [
+            "feedback-\u{009b}unsafe",
+            "feedback-\u{061c}unsafe",
+            "feedback-\u{200e}unsafe",
+            "feedback-\u{200f}unsafe",
+            "feedback-\u{202e}unsafe",
+        ] {
+            let actions = app
+                .handle_local_command("/bug unsafe result id")
+                .expect("fixed bug command");
+            let [action] = actions.as_slice() else {
+                panic!("bug report action");
+            };
+            let request_id = admit_private_action(&mut app, action);
+            app.handle_private_runtime_result(
+                Some(request_id),
+                Some("bug_report_submitted".to_string()),
+                None,
+                &json!({"result": {
+                    "kind": "bug_report_submitted",
+                    "feedback_id": unsafe_id
+                }}),
+            );
+            assert_eq!(
+                app.status,
+                "The bug report returned an invalid feedback ID; submission could not be confirmed"
+            );
+            assert!(
+                !app.status
+                    .contains(['\u{009b}', '\u{061c}', '\u{200e}', '\u{200f}', '\u{202e}'])
+            );
+        }
     }
 
     fn custom_model_list_result() -> Value {

@@ -4,6 +4,7 @@ import {
   CRABCODE_TUI_RUNTIME_ACTION_TYPE,
   CRABCODE_TUI_RUNTIME_PROTOCOL_VERSION,
   CRABCODE_TUI_RUNTIME_RESULT_TYPE,
+  createDirectTuiRuntimeActionRouter,
   DirectTuiRuntimeActionRequestSchema,
   DirectTuiRuntimeActionResultSchema,
   routeDirectTuiRuntimeAction,
@@ -135,6 +136,144 @@ describe('direct native TUI private runtime actions', () => {
     })
   })
 
+  test('a slow bug submission settles behind the FIFO without blocking later input or private control', async () => {
+    let releaseSubmission:
+      | ((value: { feedbackId: string }) => void)
+      | undefined
+    let submissionCalls = 0
+    const pendingSubmission = new Promise<{ feedbackId: string }>(resolve => {
+      releaseSubmission = resolve
+    })
+    const inbound = lines([
+      JSON.stringify({
+        ...request('bug-slow'),
+        action: {
+          kind: 'bug_report_submit',
+          description: 'the terminal remains responsive',
+        },
+      }),
+      JSON.stringify(request('health-after-slow-bug')),
+      JSON.stringify({
+        type: 'user',
+        session_id: '',
+        message: { role: 'user', content: 'input after slow bug report' },
+        parent_tool_use_id: null,
+      }),
+    ])
+    const io = new StructuredIO(inbound)
+    io.setDirectTuiRuntimeActionRouter(
+      createDirectTuiRuntimeActionRouter({
+        bugReportDependencies: {
+          submitBugReport: description => {
+            submissionCalls += 1
+            expect(description).toBe('the terminal remains responsive')
+            return pendingSubmission
+          },
+        },
+      }),
+    )
+
+    const firstInput = await resolvesBeforeDeadline(
+      io.structuredInput.next(),
+      'later stdin remained blocked behind bug submission',
+    )
+    expect(firstInput).toMatchObject({
+      done: false,
+      value: {
+        type: 'user',
+        message: { content: 'input after slow bug report' },
+      },
+    })
+    expect(submissionCalls).toBe(1)
+
+    expect(await resolvesBeforeDeadline(io.outbound.next(), 'health result')).toEqual({
+      done: false,
+      value: {
+        type: CRABCODE_TUI_RUNTIME_RESULT_TYPE,
+        protocol_version: CRABCODE_TUI_RUNTIME_PROTOCOL_VERSION,
+        request_id: 'health-after-slow-bug',
+        result: { kind: 'health_snapshot', status: 'ready' },
+      },
+    })
+
+    // Finish the finite input first: a later background completion must still
+    // be observed and must not create an unhandled rejection after input close.
+    expect(await io.structuredInput.next()).toEqual({
+      done: true,
+      value: undefined,
+    })
+    releaseSubmission?.({ feedbackId: 'feedback-after-input-close' })
+    expect(await resolvesBeforeDeadline(io.outbound.next(), 'bug result')).toEqual({
+      done: false,
+      value: {
+        type: CRABCODE_TUI_RUNTIME_RESULT_TYPE,
+        protocol_version: CRABCODE_TUI_RUNTIME_PROTOCOL_VERSION,
+        request_id: 'bug-slow',
+        result: {
+          kind: 'bug_report_submitted',
+          feedback_id: 'feedback-after-input-close',
+        },
+      },
+    })
+  })
+
+  test('a background bug failure after input close becomes one correlated result', async () => {
+    let rejectSubmission: ((reason: Error) => void) | undefined
+    const pendingSubmission = new Promise<{ feedbackId: string }>(
+      (_resolve, reject) => {
+        rejectSubmission = reject
+      },
+    )
+    const io = new StructuredIO(
+      lines([
+        JSON.stringify({
+          ...request('bug-fails-after-close'),
+          action: {
+            kind: 'bug_report_submit',
+            description: 'network failure after stdin closes',
+          },
+        }),
+        JSON.stringify({
+          type: 'user',
+          session_id: '',
+          message: { role: 'user', content: 'reader still progressed' },
+          parent_tool_use_id: null,
+        }),
+      ]),
+    )
+    io.setDirectTuiRuntimeActionRouter(
+      createDirectTuiRuntimeActionRouter({
+        bugReportDependencies: {
+          submitBugReport: () => pendingSubmission,
+        },
+      }),
+    )
+
+    expect(
+      await resolvesBeforeDeadline(io.structuredInput.next(), 'later input'),
+    ).toMatchObject({
+      done: false,
+      value: { type: 'user', message: { content: 'reader still progressed' } },
+    })
+    expect(await io.structuredInput.next()).toEqual({
+      done: true,
+      value: undefined,
+    })
+
+    rejectSubmission?.(new Error('service unavailable'))
+    expect(
+      await resolvesBeforeDeadline(io.outbound.next(), 'correlated failure'),
+    ).toEqual({
+      done: false,
+      value: {
+        type: CRABCODE_TUI_RUNTIME_RESULT_TYPE,
+        protocol_version: CRABCODE_TUI_RUNTIME_PROTOCOL_VERSION,
+        request_id: 'bug-fails-after-close',
+        result: { kind: 'runtime_action_error', code: 'action_failed' },
+      },
+    })
+  })
+
   test('a malformed correlated private action does not terminate the following normal message', async () => {
     const inbound = lines([
       JSON.stringify({
@@ -201,4 +340,24 @@ describe('direct native TUI private runtime actions', () => {
 
 async function* lines(values: string[]): AsyncGenerator<string> {
   for (const value of values) yield `${value}\n`
+}
+
+async function resolvesBeforeDeadline<T>(
+  promise: Promise<T>,
+  label: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`timed out waiting for ${label}`)),
+          1_000,
+        )
+      }),
+    ])
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+  }
 }

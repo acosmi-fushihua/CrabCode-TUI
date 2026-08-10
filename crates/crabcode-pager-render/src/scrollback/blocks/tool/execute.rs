@@ -3,7 +3,7 @@
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
 
-use super::TOOL_HEADER_RANGE;
+use super::{TOOL_HEADER_RANGE, failure::failure_lines};
 use crate::appearance::ExecuteHeaderStyle;
 use crate::render::wrapping::word_wrap_lines_with_joiners;
 use crate::scrollback::block::BlockContent;
@@ -533,18 +533,19 @@ impl ExecuteToolCallBlock {
             true, // include $ command when expanded/truncated
         );
 
-        if self.output.is_none()
-            && let Some(error) = &self.error
-            && !error.is_empty()
-        {
+        if let Some(error) = &self.error {
             lines.push(BlockLine::separator(Line::from("")));
-            let error_style = ratatui::style::Style::default().fg(theme.accent_error);
-            for line in error.lines() {
-                lines.push(BlockLine::separator(Line::from(Span::styled(
-                    line.to_string(),
-                    error_style,
-                ))));
-            }
+            let mode = if truncate.is_some() {
+                DisplayMode::Truncated
+            } else {
+                DisplayMode::Expanded
+            };
+            lines.extend(failure_lines(
+                error,
+                mode,
+                width,
+                ratatui::style::Style::default().fg(theme.accent_error),
+            ));
         }
 
         if let Some(output) = &self.output
@@ -676,6 +677,14 @@ impl BlockContent for ExecuteToolCallBlock {
                     true,
                     false, // hide command when description is the title
                 );
+                if let Some(error) = &self.error {
+                    lines.extend(failure_lines(
+                        error,
+                        ctx.mode,
+                        content_width,
+                        theme.fg(theme.accent_error),
+                    ));
+                }
                 BlockOutput { lines }
             }
             DisplayMode::Truncated => self.render_with_truncation(
@@ -767,7 +776,11 @@ impl BlockContent for ExecuteToolCallBlock {
     }
 
     fn finished_display_mode(&self) -> Option<DisplayMode> {
-        if self.bash_mode {
+        if self.error.is_some() {
+            // Keep a user's running-time fold/expand gesture on failure. The
+            // compact state already includes the shared one-line summary.
+            None
+        } else if self.bash_mode {
             // Interactive bash: full output on finish, like a terminal —
             // the streaming preview would silently drop the middle lines.
             Some(DisplayMode::Expanded)
@@ -790,15 +803,18 @@ impl BlockContent for ExecuteToolCallBlock {
             .map(|(line, _)| line)
             .collect();
 
-        if self.output.is_none()
-            && let Some(error) = &self.error
-            && !error.is_empty()
-        {
+        if let Some(error) = &self.error {
             lines.push(Line::from(""));
-            let error_style = ratatui::style::Style::default().fg(theme.accent_error);
-            for line in error.lines() {
-                lines.push(Line::from(Span::styled(line.to_string(), error_style)));
-            }
+            lines.extend(
+                failure_lines(
+                    error,
+                    DisplayMode::Expanded,
+                    ctx.content_width(),
+                    ratatui::style::Style::default().fg(theme.accent_error),
+                )
+                .into_iter()
+                .map(|line| line.content),
+            );
         }
 
         Some(Text::from(lines))
@@ -1016,15 +1032,12 @@ mod tests {
         assert_eq!(failed.default_display_mode(), DisplayMode::Collapsed);
         assert_eq!(failed.finished_display_mode(), None);
 
-        // Failed user bash keeps the Truncated default: a Collapsed default
-        // would defeat the finish expand (see default_display_mode).
+        // Failed user bash keeps the Truncated materialization default, but
+        // completion no longer overrides a user's running-time fold.
         let mut failed_bash = ExecuteToolCallBlock::new("pytest").with_error("exit 2");
         failed_bash.bash_mode = true;
         assert_eq!(failed_bash.default_display_mode(), DisplayMode::Truncated);
-        assert_eq!(
-            failed_bash.finished_display_mode(),
-            Some(DisplayMode::Expanded)
-        );
+        assert_eq!(failed_bash.finished_display_mode(), None);
     }
 
     #[test]

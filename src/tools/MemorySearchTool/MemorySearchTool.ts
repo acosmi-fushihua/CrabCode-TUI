@@ -13,7 +13,12 @@ import { errorMessage } from '../../utils/errors.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
-import { DESCRIPTION, MEMORY_SEARCH_TOOL_NAME, PROMPT } from './prompt.js'
+import {
+  DESCRIPTION,
+  MEMORY_SEARCH_DRIFT_REMINDER,
+  MEMORY_SEARCH_TOOL_NAME,
+  PROMPT,
+} from './prompt.js'
 
 const DEFAULT_TOP_K = 5
 const MAX_TOP_K = 20
@@ -57,6 +62,10 @@ type OutputSchema = ReturnType<typeof outputSchema>
 
 export type Output = z.infer<OutputSchema>
 type Hit = Output['results'][number]
+
+export function renderMemorySearchResultsForModel(results: Hit[]): string {
+  return `${MEMORY_SEARCH_DRIFT_REMINDER}\n${jsonStringify(results)}`
+}
 
 /** Parse the orchestrator's snake_case `memory.search` result envelope. */
 function parseHits(response: unknown): Hit[] {
@@ -200,7 +209,7 @@ export const MemorySearchTool = buildTool({
     return {
       tool_use_id: toolUseID,
       type: 'tool_result',
-      content: jsonStringify(content.results),
+      content: renderMemorySearchResultsForModel(content.results),
     }
   },
 } satisfies ToolDef<InputSchema, Output>)

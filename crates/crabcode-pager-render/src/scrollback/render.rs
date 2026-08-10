@@ -1454,11 +1454,10 @@ mod tests {
     }
 
     /// A verb-group header on the viewport's last row must paint the label of
-    /// the FULL run (count + failure suffix), not just the on-screen members:
-    /// `paint_window` extends the slice past the window bottom so the label
-    /// walk sees every member.
+    /// the full successful run, while failed members split the run so their
+    /// compact error summaries retain their own rows.
     #[test]
-    fn windowed_paint_renders_full_verb_group_label_for_offscreen_members() {
+    fn windowed_paint_stops_verb_group_before_failed_members() {
         use crate::scrollback::ScrollbackState;
         use crate::scrollback::blocks::tool::{ReadToolCallBlock, ToolCallBlock};
 
@@ -1482,14 +1481,15 @@ mod tests {
 
         let virtual_y = state.get_cached_virtual_y().expect("layout cache");
         let layouts = state.get_cached_entry_layouts().expect("layout cache");
-        // Header row on the viewport's last row: all 50 members are off-screen.
+        // Header row on the viewport's last row: all 48 successful members
+        // are off-screen; the two failed rows are standalone after the run.
         let scroll = virtual_y[header] + 1 - viewport.height as usize;
         let (paint_range, content_y0) =
             state.paint_window(0..state.len(), scroll, viewport.height as usize);
         assert_eq!(
             paint_range.end,
-            header + 50,
-            "window must cover the whole run"
+            header + 48,
+            "window must cover the successful run and stop at the failure"
         );
 
         let window = state.entries_in_range(paint_range.clone());
@@ -1516,7 +1516,7 @@ mod tests {
 
         let header_row = buffer_row_text(&buf, viewport.height - 1);
         assert!(
-            header_row.contains("Read 50 files · 2 failed"),
+            header_row.contains("Read 48 files"),
             "header label must aggregate the full off-screen run: {header_row:?}"
         );
     }
@@ -1701,11 +1701,11 @@ mod tests {
         }
     }
 
-    /// A single groupable tool call folds on its own: the run renders the
-    /// aggregated header label — not the tool's own row — and finished
-    /// thoughts fold behind it just like in a multi-member run.
+    /// A single groupable tool call keeps its semantic row. Finished thoughts
+    /// are not collateral members of a fold until a second tool makes this a
+    /// real run.
     #[test]
-    fn rendered_verb_group_singleton_folds_tool_and_trailing_thoughts() {
+    fn rendered_verb_group_singleton_keeps_tool_and_trailing_thoughts_visible() {
         use crate::scrollback::ScrollbackState;
 
         crate::appearance::cache::set_group_tool_verbs(true);
@@ -1723,9 +1723,9 @@ mod tests {
         state.prepare_layout(viewport.width, viewport.height);
 
         let layouts = state.get_cached_entry_layouts().expect("layout cache");
-        assert!(layouts[0].verb_group_header, "singleton run folds");
-        assert_eq!(layouts[1].height, 0, "thoughts claim into the fold");
-        assert_eq!(layouts[2].height, 0, "thoughts claim into the fold");
+        assert!(!layouts[0].verb_group_header, "singleton stays standalone");
+        assert!(layouts[1].height > 0, "first thought remains visible");
+        assert!(layouts[2].height > 0, "second thought remains visible");
 
         let refs = state.entries_in_range(0..state.len());
         let mut buf = Buffer::empty(viewport);
@@ -1749,18 +1749,15 @@ mod tests {
             None,
         );
 
-        let header_row = buffer_row_text(&buf, 0);
+        let tool_row = buffer_row_text(&buf, 0);
         assert!(
-            header_row.contains("Listed 1 dir"),
-            "singleton header must render the aggregated label: {header_row:?}"
+            tool_row.contains("List src"),
+            "singleton must render its own semantic row: {tool_row:?}"
         );
-        for y in 0..viewport.height {
-            let row = buffer_row_text(&buf, y);
-            assert!(
-                !row.contains("List src") && !row.contains("Thought"),
-                "neither the raw tool row nor a thought row may render (row {y}): {row:?}"
-            );
-        }
+        assert!(
+            !tool_row.contains("Listed 1 dir"),
+            "singleton must not be replaced by an aggregate: {tool_row:?}"
+        );
     }
 
     /// A subagent lifecycle row folds into the verb group: the collapsed

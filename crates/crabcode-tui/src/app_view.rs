@@ -212,6 +212,43 @@ mod tests {
         }))
     }
 
+    fn scrollback_searchable(view: &AppView) -> String {
+        (0..view.agent().scrollback().len())
+            .filter_map(|index| {
+                view.agent()
+                    .scrollback()
+                    .entry(index)?
+                    .block
+                    .searchable_text()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn draw_prepared_buffer(
+        view: &mut AppView,
+        app: &mut TuiApp,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                view.draw_prepared(frame, app)
+                    .expect("prepared task-history draw");
+            })
+            .expect("task-history draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn assert_presentable(app: &mut TuiApp, view: &mut AppView, label: &str) {
         view.prepare(app)
             .unwrap_or_else(|error| panic!("{label} failed during AppView::prepare: {error}"));
@@ -264,6 +301,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        app.release_startup_barrier_for_test();
         let mut view = AppView::new();
 
         terminal
@@ -279,17 +317,450 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .any(|cell| cell.symbol().contains("CrabCode") || cell.symbol().contains("ready"));
-        // The wordmark is cell-oriented, so the stable assertion is that the
-        // frame is non-empty and the owner remained the fixed state.
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(painted.contains("CrabCode"), "{painted}");
+        assert!(painted.replace(' ', "").contains("快速开始"), "{painted}");
+    }
+
+    #[test]
+    fn empty_welcome_is_compact_and_responsive_at_supported_terminal_sizes() {
+        for (width, height) in [(120_u16, 30_u16), (80, 24), (60, 20)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("responsive welcome terminal");
+            let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+            app.release_startup_barrier_for_test();
+            let mut view = AppView::new();
+
+            terminal
+                .draw(|frame| {
+                    view.draw(frame, &mut app)
+                        .expect("responsive empty welcome must render");
+                })
+                .expect("responsive welcome draw");
+
+            let buffer = terminal.backend().buffer();
+            let rows = buffer
+                .content()
+                .chunks(usize::from(width))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>();
+            let compact = rows
+                .iter()
+                .map(|row| row.replace(' ', ""))
+                .collect::<Vec<_>>();
+            let diagnostic = format!("{width}x{height}: {rows:#?}");
+
+            assert_eq!(rows.len(), usize::from(height), "{diagnostic}");
+            assert!(compact[3].contains("CrabCode原生RustTUI"), "{diagnostic}");
+            assert!(compact[4].contains("●已就绪，可以开始"), "{diagnostic}");
+            assert!(compact[6].contains("快速开始"), "{diagnostic}");
+            assert!(
+                compact[7].contains("›直接描述目标，或粘贴错误信息与日志"),
+                "{diagnostic}"
+            );
+            assert!(
+                compact[8].contains("Enter发送·/help操作说明·/model选择模型"),
+                "{diagnostic}"
+            );
+
+            let joined = rows.join("\n");
+            assert!(!joined.contains(['▀', '▄']), "{diagnostic}");
+            assert!(!joined.contains("请在下方输入提示词"), "{diagnostic}");
+            for row in 0..height {
+                for column in 0..width {
+                    let symbol_width =
+                        unicode_width::UnicodeWidthStr::width(buffer[(column, row)].symbol());
+                    assert!(
+                        symbol_width <= usize::from(width - column),
+                        "wide glyph outside buffer at ({column},{row}): {diagnostic}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task_card_compacts_successful_raw_history_but_keeps_failures_and_verbose_audit() {
+        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        app.release_startup_barrier_for_test();
+        let mut view = AppView::new();
+
+        let create = json!({
+            "type":"assistant",
+            "uuid":"task-create-use",
+            "session_id":"task-history-session",
+            "parent_tool_use_id":null,
+            "message":{
+                "id":"task-create-message",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"task-create",
+                    "name":"TaskCreate",
+                    "input":{
+                        "subject":"审计任务",
+                        "description":"TASK-CREATE-AUDIT-DETAIL"
+                    }
+                }]
+            }
+        });
+        assert!(ingest_json(&mut app, 1, create).is_empty());
+        view.prepare(&mut app)
+            .expect("pending TaskCreate remains visible");
+        assert_eq!(view.agent().scrollback().len(), 1);
+        let pending_create = scrollback_searchable(&view);
+        assert!(pending_create.contains("TaskCreate"), "{pending_create}");
         assert!(
-            painted
-                || terminal
-                    .backend()
-                    .buffer()
-                    .content()
-                    .iter()
-                    .any(|cell| { !cell.symbol().trim().is_empty() })
+            pending_create.contains("TASK-CREATE-AUDIT-DETAIL"),
+            "{pending_create}"
+        );
+        for (width, height) in [(120, 30), (80, 24), (60, 20)] {
+            let rendered = draw_prepared_buffer(&mut view, &mut app, width, height);
+            let compact = rendered.replace(' ', "");
+            assert!(
+                compact.contains("TaskCreate"),
+                "{width}x{height}: pending call disappeared: {rendered}"
+            );
+        }
+
+        let create_result = json!({
+            "type":"user",
+            "uuid":"task-create-result",
+            "timestamp":"2026-08-10T00:00:00.000Z",
+            "toolUseResult":{"task":{"id":"1","subject":"审计任务"}},
+            "message":{
+                "role":"user",
+                "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"task-create",
+                    "content":"TASK-CREATE-RESULT-AUDIT-DETAIL",
+                    "is_error":false
+                }]
+            }
+        });
+        assert!(ingest_json(&mut app, 2, create_result).is_empty());
+        view.prepare(&mut app)
+            .expect("successful TaskCreate compaction");
+        assert!(view.agent().scrollback().is_empty());
+        assert_eq!(
+            app.projection.items().len(),
+            2,
+            "compaction must not delete the authoritative audit projection"
+        );
+        assert_eq!(app.projection.raw_envelopes().len(), 2);
+        assert!(app.projection.raw_envelopes().iter().any(|envelope| {
+            envelope.value["message"]["content"][0]["content"] == "TASK-CREATE-RESULT-AUDIT-DETAIL"
+        }));
+
+        for (width, height) in [(120, 30), (80, 24), (60, 20)] {
+            let rendered = draw_prepared_buffer(&mut view, &mut app, width, height);
+            let compact = rendered.replace(' ', "");
+            assert!(compact.contains("审计任务"), "{width}x{height}: {rendered}");
+            assert!(
+                !compact.contains("TaskCreate")
+                    && !compact.contains("TASK-CREATE-RESULT-AUDIT-DETAIL"),
+                "{width}x{height}: duplicate raw task history leaked beside the card: {rendered}"
+            );
+        }
+
+        let update = json!({
+            "type":"assistant",
+            "uuid":"task-update-use",
+            "session_id":"task-history-session",
+            "parent_tool_use_id":null,
+            "message":{
+                "id":"task-update-message",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"task-update",
+                    "name":"TaskUpdate",
+                    "input":{"taskId":"1","status":"in_progress"}
+                }]
+            }
+        });
+        assert!(ingest_json(&mut app, 3, update).is_empty());
+        view.prepare(&mut app)
+            .expect("pending TaskUpdate remains visible");
+        assert_eq!(view.agent().scrollback().len(), 1);
+        let pending_update = scrollback_searchable(&view);
+        assert!(pending_update.contains("TaskUpdate"), "{pending_update}");
+        let update_result = json!({
+            "type":"user",
+            "uuid":"task-update-result",
+            "timestamp":"2026-08-10T00:00:01.000Z",
+            "toolUseResult":{
+                "success":true,
+                "taskId":"1",
+                "updatedFields":["status"],
+                "statusChange":{"from":"pending","to":"in_progress"}
+            },
+            "message":{
+                "role":"user",
+                "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"task-update",
+                    "content":"TASK-UPDATE-RESULT-AUDIT-DETAIL",
+                    "is_error":false
+                }]
+            }
+        });
+        assert!(ingest_json(&mut app, 4, update_result).is_empty());
+        view.prepare(&mut app)
+            .expect("successful TaskUpdate compaction");
+        assert!(view.agent().scrollback().is_empty());
+
+        let failed_update = json!({
+            "type":"assistant",
+            "uuid":"task-update-failed-use",
+            "session_id":"task-history-session",
+            "parent_tool_use_id":null,
+            "message":{
+                "id":"task-update-failed-message",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"task-update-failed",
+                    "name":"TaskUpdate",
+                    "input":{"taskId":"1","status":"completed"}
+                }]
+            }
+        });
+        assert!(ingest_json(&mut app, 5, failed_update).is_empty());
+        view.prepare(&mut app)
+            .expect("pending failed TaskUpdate remains visible");
+        assert_eq!(view.agent().scrollback().len(), 1);
+        let pending_failed_update = scrollback_searchable(&view);
+        assert!(
+            pending_failed_update.contains("TaskUpdate"),
+            "{pending_failed_update}"
+        );
+        let failed_result = json!({
+            "type":"user",
+            "uuid":"task-update-failed-result",
+            "timestamp":"2026-08-10T00:00:02.000Z",
+            "toolUseResult":{
+                "success":false,
+                "taskId":"1",
+                "updatedFields":[],
+                "error":"TASK-UPDATE-FAILURE-AUDIT"
+            },
+            "message":{
+                "role":"user",
+                "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"task-update-failed",
+                    "content":"TASK-UPDATE-FAILURE-AUDIT",
+                    "is_error":true
+                }]
+            }
+        });
+        assert!(ingest_json(&mut app, 6, failed_result).is_empty());
+        view.prepare(&mut app)
+            .expect("failed TaskUpdate remains visible");
+        assert_eq!(view.agent().scrollback().len(), 1);
+        let failed_searchable = scrollback_searchable(&view);
+        assert!(
+            failed_searchable.contains("TaskUpdate"),
+            "{failed_searchable}"
+        );
+        assert!(
+            failed_searchable.contains("TASK-UPDATE-FAILURE-AUDIT"),
+            "a failed task update must retain its sanitized audit detail: {failed_searchable}"
+        );
+
+        app.set_presentation_verbose(true);
+        view.prepare(&mut app)
+            .expect("verbose mode restores compacted task audit rows");
+        let searchable = scrollback_searchable(&view);
+        assert!(searchable.contains("TaskCreate"), "{searchable}");
+        assert!(
+            searchable.contains("TASK-CREATE-AUDIT-DETAIL"),
+            "{searchable}"
+        );
+        assert!(
+            searchable.contains("TASK-CREATE-RESULT-AUDIT-DETAIL"),
+            "{searchable}"
+        );
+        assert!(searchable.contains("TaskUpdate"), "{searchable}");
+        assert!(
+            searchable.contains("TASK-UPDATE-RESULT-AUDIT-DETAIL"),
+            "{searchable}"
+        );
+
+        app.set_presentation_verbose(false);
+        view.prepare(&mut app)
+            .expect("quiet mode retires successful task audit rows again");
+        let quiet_searchable = scrollback_searchable(&view);
+        assert!(!quiet_searchable.contains("TASK-CREATE-AUDIT-DETAIL"));
+        assert!(!quiet_searchable.contains("TASK-UPDATE-RESULT-AUDIT-DETAIL"));
+        assert!(quiet_searchable.contains("TASK-UPDATE-FAILURE-AUDIT"));
+    }
+
+    #[test]
+    fn malformed_task_result_keeps_pending_call_and_result_visible() {
+        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        app.release_startup_barrier_for_test();
+        let mut view = AppView::new();
+        assert!(
+            ingest_json(
+                &mut app,
+                1,
+                json!({
+                    "type":"assistant",
+                    "uuid":"malformed-create-use",
+                    "session_id":"malformed-task-session",
+                    "parent_tool_use_id":null,
+                    "message":{
+                        "id":"malformed-create-message",
+                        "content":[{
+                            "type":"tool_use",
+                            "id":"malformed-create",
+                            "name":"TaskCreate",
+                            "input":{"subject":"expected subject","description":"details"}
+                        }]
+                    }
+                }),
+            )
+            .is_empty()
+        );
+        view.prepare(&mut app)
+            .expect("valid pending TaskCreate remains visible");
+        assert_eq!(view.agent().scrollback().len(), 1);
+        let pending_searchable = scrollback_searchable(&view);
+        assert!(
+            pending_searchable.contains("TaskCreate"),
+            "{pending_searchable}"
+        );
+        assert!(
+            pending_searchable.contains("expected subject"),
+            "{pending_searchable}"
+        );
+
+        assert!(
+            ingest_json(
+                &mut app,
+                2,
+                json!({
+                    "type":"user",
+                    "uuid":"malformed-create-result",
+                    "timestamp":"2026-08-10T00:00:00.000Z",
+                    "toolUseResult":{
+                        "task":{"id":"1","subject":"MALFORMED-TASK-RESULT-AUDIT"}
+                    },
+                    "message":{
+                        "role":"user",
+                        "content":[{
+                            "type":"tool_result",
+                            "tool_use_id":"malformed-create",
+                            "content":"MALFORMED-TASK-RESULT-AUDIT",
+                            "is_error":false
+                        }]
+                    }
+                }),
+            )
+            .is_empty()
+        );
+        view.prepare(&mut app)
+            .expect("malformed TaskCreate result remains renderable");
+        assert!(app.task_panel_projection_state().degraded);
+        assert_eq!(view.agent().scrollback().len(), 1);
+        let malformed_searchable = scrollback_searchable(&view);
+        assert!(
+            malformed_searchable.contains("TaskCreate")
+                && malformed_searchable.contains("expected subject")
+                && malformed_searchable.contains("MALFORMED-TASK-RESULT-AUDIT"),
+            "a compatibility failure must retain its call and bounded raw result: {malformed_searchable}"
+        );
+    }
+
+    #[test]
+    fn task_history_compaction_identity_is_reset_across_sessions() {
+        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        app.release_startup_barrier_for_test();
+        let mut view = AppView::new();
+        assert!(
+            ingest_json(
+                &mut app,
+                1,
+                json!({
+                    "type":"assistant",
+                    "uuid":"old-session-create",
+                    "session_id":"old-task-session",
+                    "parent_tool_use_id":null,
+                    "message":{
+                        "id":"old-session-message",
+                        "content":[{
+                            "type":"tool_use",
+                            "id":"reused-task-id",
+                            "name":"TaskCreate",
+                            "input":{"subject":"old","description":"old"}
+                        }]
+                    }
+                }),
+            )
+            .is_empty()
+        );
+        view.prepare(&mut app)
+            .expect("old-session pending TaskCreate remains visible");
+        assert_eq!(view.agent().scrollback().len(), 1);
+        assert!(scrollback_searchable(&view).contains("TaskCreate"));
+
+        assert!(
+            ingest_json(
+                &mut app,
+                2,
+                json!({
+                    "type":"user",
+                    "uuid":"old-session-create-result",
+                    "timestamp":"2026-08-10T00:00:00.000Z",
+                    "toolUseResult":{"task":{"id":"1","subject":"old"}},
+                    "message":{
+                        "role":"user",
+                        "content":[{
+                            "type":"tool_result",
+                            "tool_use_id":"reused-task-id",
+                            "content":"OLD-SESSION-CREATE-RESULT",
+                            "is_error":false
+                        }]
+                    }
+                }),
+            )
+            .is_empty()
+        );
+        view.prepare(&mut app)
+            .expect("old-session successful TaskCreate is compacted");
+        assert!(view.agent().scrollback().is_empty());
+
+        assert!(
+            ingest_json(
+                &mut app,
+                3,
+                json!({
+                    "type":"assistant",
+                    "uuid":"new-session-update",
+                    "session_id":"new-task-session",
+                    "parent_tool_use_id":null,
+                    "message":{
+                        "id":"new-session-message",
+                        "content":[{
+                            "type":"tool_use",
+                            "id":"reused-task-id",
+                            "name":"TaskUpdate",
+                            "input":{"taskId":"1","status":"in_progress"}
+                        }]
+                    }
+                }),
+            )
+            .is_empty()
+        );
+        view.prepare(&mut app)
+            .expect("new-session TaskUpdate does not inherit old compaction identity");
+        assert_eq!(view.agent().scrollback().len(), 1);
+        let new_session_searchable = scrollback_searchable(&view);
+        assert!(new_session_searchable.contains("TaskUpdate"));
+        assert!(
+            !new_session_searchable.contains("TaskCreate")
+                && !new_session_searchable.contains("OLD-SESSION-CREATE-RESULT"),
+            "a reused tool_use_id in a new session must remain independent: {new_session_searchable}"
         );
     }
 
@@ -902,8 +1373,12 @@ mod tests {
                     action: json!({"kind":"retained.identity.snapshot"}),
                     purpose: crate::tui_app::PrivateRuntimePurpose::RetainedIdentitySnapshot,
                 },
+                crate::tui_app::HostAction::SendControl {
+                    request: json!({"subtype":"get_context_usage"}),
+                    purpose: OutboundPurpose::ContextUsageRefresh,
+                },
             ],
-            "initialize releases health and persisted renderer identity probes"
+            "initialize releases private probes and one silent context refresh"
         );
         let mut initialize_view = AppView::new();
         assert_presentable(

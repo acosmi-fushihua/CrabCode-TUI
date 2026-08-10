@@ -497,13 +497,41 @@ impl<'a> EntryRenderer<'a> {
         if let Some(lines) = self.entry.cached_estimate_lines(content_width) {
             return lines;
         }
+
+        // Inline-media tool cards always paint a filepath row and may paint a
+        // native-open affordance and a bounded failure preview. Those rows are
+        // intentionally absent from searchable source text, so the generic
+        // one/two-row collapsed shortcut cannot estimate them. Media entries
+        // are rare; materialize this one card through the same cached output
+        // path used by `desired_height` so terminal capability, display mode,
+        // hooks, and failure wrapping cannot drift.
+        if self.entry.block.media_ref_path().is_some() {
+            self.entry
+                .ensure_cached(content_width, self.appearance(), false, self.cwd);
+            let lines = self.entry.cached_output_ref().len().min(u16::MAX as usize) as u16;
+            self.entry.store_estimate_lines(content_width, lines);
+            return lines;
+        }
+
         // Collapsed / Truncated foldable entries render a compact ~1-line header,
         // NOT their (often huge) hidden body. Use the ENTRY-level foldability
         // (`block.is_foldable()` OR attached hooks), matching the fold path, so a
         // hook-only-foldable collapsed entry isn't over-counted.
         let lines = if self.entry.display_mode != DisplayMode::Expanded && self.entry.is_foldable()
         {
-            1
+            if self.entry.display_mode == DisplayMode::Collapsed
+                && matches!(
+                    &self.entry.block,
+                    RenderBlock::ToolCall(tool) if !tool.is_success()
+                )
+            {
+                // Failed collapsed tools keep one sanitized summary row below
+                // the compact header. Account for it in off-screen layout
+                // estimates so the visible correction never jumps the scroll.
+                2
+            } else {
+                1
+            }
         } else {
             self.entry.estimate_source_lines(content_width)
         };
@@ -1725,6 +1753,60 @@ mod tests {
             r.desired_height(80),
             "collapsed tool-call estimate must equal exact (compact header)"
         );
+    }
+
+    #[test]
+    fn estimate_collapsed_failed_tool_call_matches_exact() {
+        use crate::scrollback::blocks::tool::{ReadToolCallBlock, ToolCallBlock};
+
+        let _theme = pin_theme();
+        let theme = Theme::current();
+        let mut entry = ScrollbackEntry::new(RenderBlock::ToolCall(ToolCallBlock::Read(
+            ReadToolCallBlock::new("missing.rs").with_error("permission denied"),
+        )));
+        entry.set_display_mode(DisplayMode::Collapsed);
+        let renderer = EntryRenderer::new(&entry, &theme);
+        assert_eq!(renderer.estimate_height(80), renderer.desired_height(80));
+        assert_eq!(renderer.desired_height(80), 2);
+    }
+
+    #[test]
+    fn estimate_failed_inline_media_matches_exact_in_every_fold_mode() {
+        use crate::scrollback::blocks::tool::{OtherToolCallBlock, ToolCallBlock};
+        use crate::terminal::image::{GraphicsProtocol, set_protocol_for_test};
+
+        let _theme = pin_theme();
+        let _protocol = set_protocol_for_test(GraphicsProtocol::None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed-clip.mp4");
+        std::fs::write(&path, b"video-placeholder").unwrap();
+        let theme = Theme::current();
+
+        for mode in [
+            DisplayMode::Collapsed,
+            DisplayMode::Truncated,
+            DisplayMode::Expanded,
+        ] {
+            let mut entry = ScrollbackEntry::new(RenderBlock::ToolCall(ToolCallBlock::Other(
+                OtherToolCallBlock::new("video_gen", "saved clip")
+                    .with_media_ref(&path, true)
+                    .with_error("encode failed\nposter unavailable"),
+            )));
+            entry.set_display_mode(mode);
+            let renderer = EntryRenderer::new(&entry, &theme);
+            assert_eq!(
+                renderer.estimate_height(80),
+                renderer.desired_height(80),
+                "inline-media failure estimate drifted in {mode:?} mode"
+            );
+            if mode == DisplayMode::Collapsed {
+                assert_eq!(
+                    renderer.desired_height(80),
+                    6,
+                    "header + path + failure + blank/open/blank"
+                );
+            }
+        }
     }
 
     #[test]
