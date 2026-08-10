@@ -2242,6 +2242,14 @@ pub struct TuiApp {
     pub mcp_servers: Vec<McpServerState>,
     pub active_tasks: HashMap<String, String>,
     live_context_usage: Option<LiveContextUsage>,
+    /// `true` only while the displayed usage belongs to a blank, freshly
+    /// created session. The token total is still real: it is the runtime's
+    /// preloaded system/tool/agent context, not an invented zero.
+    context_usage_is_baseline: bool,
+    /// Renderer-queue-admitted user submissions that started while the
+    /// session was still baseline-only. If every such write fails before the
+    /// runtime observes one, the baseline label can be restored honestly.
+    baseline_context_send_users_pending: usize,
     context_usage_refresh_pending: bool,
     context_usage_refresh_dirty: bool,
     task_panel_projection_cache: RefCell<TaskPanelProjectionCache>,
@@ -2408,6 +2416,7 @@ impl TuiApp {
         };
         let account_summary = initialize_payload.get("account").map(bounded_pretty_json);
         let minimal_welcome_pending = matches!(&initial_session, InitialSessionRequest::New);
+        let context_usage_is_baseline = matches!(&initial_session, InitialSessionRequest::New);
         // The app is constructed before the direct runtime's existing SDK
         // initialize response. That response is the sole readiness boundary.
         let startup_barrier_pending = true;
@@ -2471,6 +2480,8 @@ impl TuiApp {
             mcp_servers: Vec::new(),
             active_tasks: HashMap::new(),
             live_context_usage: None,
+            context_usage_is_baseline,
+            baseline_context_send_users_pending: 0,
             context_usage_refresh_pending: false,
             context_usage_refresh_dirty: false,
             task_panel_projection_cache: RefCell::new(TaskPanelProjectionCache::default()),
@@ -2696,6 +2707,10 @@ impl TuiApp {
 
     pub(crate) const fn live_context_usage(&self) -> Option<LiveContextUsage> {
         self.live_context_usage
+    }
+
+    pub(crate) const fn context_usage_is_baseline(&self) -> bool {
+        self.context_usage_is_baseline
     }
 
     pub(crate) const fn context_usage_refresh_pending(&self) -> bool {
@@ -4243,6 +4258,27 @@ impl TuiApp {
     pub fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Vec<HostAction> {
         match event {
             RuntimeEvent::Envelope(envelope) => {
+                let is_hidden_or_replayed_context = [
+                    "isMeta",
+                    "isSynthetic",
+                    "isReplay",
+                    "isReconstructedHistory",
+                    "isVirtual",
+                    "isVisibleInTranscriptOnly",
+                ]
+                .iter()
+                .any(|field| {
+                    envelope
+                        .value
+                        .get(*field)
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                });
+                let observes_conversation_context = matches!(
+                    &envelope.classification,
+                    crate::sdk_runtime::EnvelopeClass::Assistant
+                        | crate::sdk_runtime::EnvelopeClass::User
+                ) && !is_hidden_or_replayed_context;
                 let stream_event_type = match &envelope.classification {
                     crate::sdk_runtime::EnvelopeClass::StreamEvent { event_type } => {
                         event_type.clone()
@@ -4328,6 +4364,10 @@ impl TuiApp {
                 // envelope so its task/artifact state enters the new session
                 // normally.
                 let effect = self.prepare_projection_effect(effect);
+                if observes_conversation_context {
+                    self.context_usage_is_baseline = false;
+                    self.baseline_context_send_users_pending = 0;
+                }
                 if let Some(envelope) = transition_envelope.as_ref() {
                     self.observe_client_runtime_state(envelope);
                     self.transcript_artifacts.ingest_envelope(envelope);
@@ -5023,6 +5063,14 @@ impl TuiApp {
     /// be mistaken for a concurrent interaction. Delivery failure after this
     /// point is fatal and never retried.
     pub(crate) fn action_admitted(&mut self, action: &HostAction) {
+        if matches!(action, HostAction::SendUser { .. }) {
+            if self.context_usage_is_baseline || self.baseline_context_send_users_pending > 0 {
+                self.context_usage_is_baseline = false;
+                self.baseline_context_send_users_pending =
+                    self.baseline_context_send_users_pending.saturating_add(1);
+            }
+            return;
+        }
         let HostAction::RespondStartupInteraction {
             request_id,
             subtype,
@@ -5220,7 +5268,22 @@ impl TuiApp {
                     }
                 };
             }
-            HostAction::SendUser { .. } | HostAction::SendControl { .. } => {
+            HostAction::SendUser { .. } => {
+                if self.baseline_context_send_users_pending > 0 {
+                    self.baseline_context_send_users_pending -= 1;
+                    if self.baseline_context_send_users_pending == 0 {
+                        self.context_usage_is_baseline = true;
+                    }
+                }
+                self.restore_pending_composer_submission();
+                self.status = match self.renderer_ui_language {
+                    UiLanguage::ZhCn => format!("运行环境操作失败；已恢复输入草稿：{error}"),
+                    UiLanguage::EnUs => {
+                        format!("Runtime action failed; composer restored: {error}")
+                    }
+                };
+            }
+            HostAction::SendControl { .. } => {
                 self.restore_pending_composer_submission();
                 self.status = match self.renderer_ui_language {
                     UiLanguage::ZhCn => format!("运行环境操作失败；已恢复输入草稿：{error}"),
@@ -5235,6 +5298,10 @@ impl TuiApp {
     pub fn action_succeeded(&mut self, action: &HostAction) {
         match action {
             HostAction::SendUser { content, .. } => {
+                if self.baseline_context_send_users_pending > 0 {
+                    self.baseline_context_send_users_pending = 0;
+                    self.context_usage_is_baseline = false;
+                }
                 if let Some(submission) = self.pending_composer_submission.take() {
                     self.remember_composer_submission(&submission.text);
                     self.observe_successful_goal_submission(&submission.text);
@@ -5288,6 +5355,23 @@ impl TuiApp {
                         && response.get("decision").and_then(Value::as_str) == Some("cancel")
                     {
                         self.session_picker_quit_after_response = None;
+                        self.should_quit = true;
+                    } else if response.get("kind").and_then(Value::as_str)
+                        == Some("workspace_trust")
+                        && response.get("decision").and_then(Value::as_str) == Some("reject")
+                    {
+                        // The response is now fully written, so the setup
+                        // runtime can observe the rejection. Exit through the
+                        // ordinary pre-handoff shutdown path instead of
+                        // waiting for its intentional status-1 termination to
+                        // be misclassified as a protocol/runtime crash.
+                        self.status = self
+                            .renderer_ui_language
+                            .text(
+                                "已拒绝工作区信任 · 正在安全退出",
+                                "Workspace trust declined · exiting safely",
+                            )
+                            .to_string();
                         self.should_quit = true;
                     }
                 } else if dialog_request_id(self.dialog.as_ref()) == Some(request_id.as_str()) {
@@ -6194,8 +6278,26 @@ impl TuiApp {
         self.composer.set_cursor(completed.len());
         self.composer_state = TextAreaState::default();
         self.refresh_command_palette();
-        if execute_on_enter && renderer_owned {
+        // `/bug` and `/feedback` require a description. The first Enter in
+        // the command palette accepts that reserved local completion only;
+        // executing the now-bare command here would immediately clear the
+        // composer and leave its usage hint visible for just one frame.
+        let waits_for_private_report_description =
+            reserved_private_local_command(&command.name) && !command.argument_hint.is_empty();
+        if execute_on_enter && renderer_owned && !waits_for_private_report_description {
             return self.submit_composer_with_priority(None);
+        }
+        if execute_on_enter && waits_for_private_report_description {
+            self.status = match self.renderer_ui_language {
+                UiLanguage::ZhCn => {
+                    format!("已接受 /{} · 请输入描述后按 Enter 提交", command.name)
+                }
+                UiLanguage::EnUs => format!(
+                    "Accepted /{} · enter a description, then press Enter to submit",
+                    command.name
+                ),
+            };
+            return Vec::new();
         }
         let expected = if command.argument_hint.is_empty() {
             String::new()
@@ -9546,6 +9648,8 @@ impl TuiApp {
         self.turn_abort_result_pending = false;
         self.pending_extra_usage_output = false;
         self.live_context_usage = None;
+        self.context_usage_is_baseline = true;
+        self.baseline_context_send_users_pending = 0;
         self.context_usage_refresh_pending = false;
         self.context_usage_refresh_dirty = false;
         self.task_panel_projection_cache.get_mut().clear();
@@ -15764,6 +15868,7 @@ fn help_text(commands: &[SlashCommandChoice], ui_language: UiLanguage) -> String
              g 到顶部 · G 跟随最新内容 · Tab 返回输入区\n\n\
              本地 TUI 命令\n\
              /help /quit /exit /model [id] /login\n\
+             /bug <问题描述> · /feedback <反馈内容>\n\
              /usage · /plugin|/plugins [subcommand] · /marketplace [list|add|remove|update]\n\
              /mcp [enable|disable [server-name]] | /mcp reconnect <server-name> | /context\n\
              /reload-plugins · /btw <question>\n\n\
@@ -15784,6 +15889,7 @@ fn help_text(commands: &[SlashCommandChoice], ui_language: UiLanguage) -> String
              g top · G follow live · Tab returns to composer\n\n\
              Local TUI commands\n\
              /help /quit /exit /model [id] /login\n\
+             /bug <description> · /feedback <description>\n\
              /usage · /plugin|/plugins [subcommand] · /marketplace [list|add|remove|update]\n\
              /mcp [enable|disable [server-name]] | /mcp reconnect <server-name> | /context\n\
              /reload-plugins · /btw <question>\n\n\
@@ -16919,6 +17025,9 @@ mod tests {
         app.selected_transcript_key = Some(old_key.clone());
         app.stream_requesting = true;
         app.interrupt_pending = true;
+        app.set_live_context_usage_for_test(91_000, 128_000, 71);
+        app.context_usage_refresh_pending = true;
+        app.context_usage_refresh_dirty = true;
         app.active_tasks
             .insert("background-task".to_string(), "still running".to_string());
 
@@ -16949,6 +17058,13 @@ mod tests {
         );
         assert!(!app.stream_requesting);
         assert!(!app.interrupt_pending);
+        assert!(app.live_context_usage().is_none());
+        assert!(!app.context_usage_refresh_pending);
+        assert!(!app.context_usage_refresh_dirty);
+        assert!(
+            !app.context_usage_is_baseline(),
+            "the real assistant envelope that opened the new session already carries conversation context"
+        );
         assert!(app.minimal_welcome_pending());
         assert_eq!(
             app.active_tasks.get("background-task").map(String::as_str),
@@ -21665,6 +21781,13 @@ mod tests {
                 }),
             }]
         );
+        assert!(!reject.should_quit);
+        reject.action_admitted(&actions[0]);
+        assert!(!reject.should_quit);
+        reject.action_succeeded(&actions[0]);
+        assert!(reject.should_quit);
+        assert_eq!(reject.status, "已拒绝工作区信任 · 正在安全退出");
+        assert!(reject.fatal.is_none());
     }
 
     #[test]
@@ -24290,8 +24413,9 @@ mod tests {
         app.set_slash_commands_enabled(false);
         assert!(!app.runtime_catalog_contains("/compact"));
         assert_eq!(app.handle_local_command("/help"), None);
+        assert_eq!(app.handle_local_command("/bug literal report"), None);
 
-        for text in ["/help", "/compact", "/quit"] {
+        for text in ["/help", "/compact", "/quit", "/bug literal report"] {
             app.composer.set_text(text);
             app.composer.set_cursor(text.len());
             app.refresh_command_palette();
@@ -24302,12 +24426,12 @@ mod tests {
             );
         }
 
-        app.composer.set_text("/help");
-        app.composer.set_cursor("/help".len());
+        app.composer.set_text("/bug literal report");
+        app.composer.set_cursor("/bug literal report".len());
         assert_eq!(
             app.submit_composer(),
             vec![HostAction::SendUser {
-                content: Value::String("/help".to_string()),
+                content: Value::String("/bug literal report".to_string()),
                 priority: None,
             }],
             "the unchanged direct backend receives literal text exactly as the historical empty command array did"
@@ -24777,6 +24901,8 @@ mod tests {
             "/quit",
             "/exit",
             "/model",
+            "/bug <description>",
+            "/feedback <description>",
             "/usage",
             "/plugin",
             "/plugins",
@@ -27399,6 +27525,49 @@ mod tests {
     }
 
     #[test]
+    fn bug_palette_first_enter_completes_before_described_submit_is_private() {
+        let mut app = app();
+        app.composer.set_text("/bug");
+        app.composer.set_cursor(4);
+        app.refresh_command_palette();
+        assert_eq!(app.command_palette.matches.len(), 1);
+
+        assert!(
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .is_empty()
+        );
+        assert_eq!(app.composer.text(), "/bug ");
+        assert_eq!(
+            app.status,
+            "Accepted /bug · enter a description, then press Enter to submit"
+        );
+        assert!(app.bug_report_inflight_request_id.is_none());
+
+        assert!(
+            app.handle_event(Event::Paste("terminal shifted".to_string()))
+                .is_empty()
+        );
+        assert_eq!(app.composer.text(), "/bug terminal shifted");
+        assert_eq!(
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            vec![HostAction::SendPrivateRuntimeAction {
+                request_id: "crabcode-tui-runtime-1".to_string(),
+                action: json!({
+                    "kind": "bug_report_submit",
+                    "description": "terminal shifted"
+                }),
+                purpose: PrivateRuntimePurpose::BugReportSubmit,
+            }]
+        );
+    }
+
+    #[test]
     fn bug_and_feedback_commands_submit_only_the_description_and_report_feedback_id() {
         for command in ["/bug 终端渲染错位", "/feedback 终端渲染错位"] {
             let mut app = app();
@@ -27477,7 +27646,12 @@ mod tests {
         collision.composer.set_cursor(4);
         collision.command_palette.matches = vec![bug_index];
         assert!(collision.accept_selected_command(true).is_empty());
-        assert_eq!(collision.status, "Usage: /bug <issue description>");
+        assert_eq!(collision.composer.text(), "/bug ");
+        assert_eq!(
+            collision.status,
+            "Accepted /bug · enter a description, then press Enter to submit"
+        );
+        assert!(collision.bug_report_inflight_request_id.is_none());
 
         let actions = collision
             .handle_local_command("/bug renderer collision")
@@ -27632,6 +27806,7 @@ mod tests {
         let mut app = app();
         assert_eq!(app.handle_local_command("/bug"), Some(Vec::new()));
         assert_eq!(app.status, "Usage: /bug <issue description>");
+        assert!(app.bug_report_inflight_request_id.is_none());
 
         let oversized = format!("/bug {}", "x".repeat(MAX_BUG_REPORT_DESCRIPTION_BYTES + 1));
         assert_eq!(app.handle_local_command(&oversized), Some(Vec::new()));

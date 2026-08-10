@@ -34,9 +34,11 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 const LOG_TAIL_BYTES: u64 = 4 * 1024;
 const MAX_PROBE_RESPONSE_BYTES: usize = 4 * 1024;
+const MAX_BUILD_ID_BYTES: usize = 256;
 const MEMORY_PROTOCOL_VERSION: u64 = 1;
 const MEMORY_SCHEMA_ID: &str = "crabcode-memory-ipc-v1-20260725";
 const MEMORY_SERVICE_IDENTITY: &str = "acosmi-memory-orchestrator";
+const MEMORY_OWNER_BOUND_PROMOTION_CAPABILITY: &str = "coordinator-promote-owner-bind-v2";
 const MEMORY_REQUIRED_CAPABILITIES: &[&str] =
     &["coordinator-promote-v1", "events-v1", "runner-journal-v1"];
 const MEMORY_PING_FRAME: &[u8] = b"{\"method\":\"memory.ping\"}\n";
@@ -79,6 +81,7 @@ pub enum MemoryRuntimeError {
 pub struct MemoryRuntimeCoordinator {
     state_root: PathBuf,
     endpoint: String,
+    caller_executable: PathBuf,
     binary: PathBuf,
     start_lock: PathBuf,
     owner_lock: PathBuf,
@@ -100,6 +103,8 @@ impl MemoryRuntimeCoordinator {
                     source,
                 })?;
         let binary = resolve_binary(caller_executable)?;
+        let caller_executable =
+            fs::canonicalize(caller_executable).unwrap_or_else(|_| caller_executable.to_path_buf());
         let username = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
         let endpoint = acosmi_daemon_launcher::paths::memory_ipc_endpoint_for_state_root(
             &state_root,
@@ -111,6 +116,7 @@ impl MemoryRuntimeCoordinator {
         Ok(Self {
             state_root,
             endpoint,
+            caller_executable,
             binary,
             start_lock: run_dir.join("memory-runtime.start.lock"),
             owner_lock: run_dir.join("memory-runtime.owner.lock"),
@@ -139,6 +145,15 @@ impl MemoryRuntimeCoordinator {
         &self.journal_path
     }
 
+    fn has_selected_generation_authority(&self) -> bool {
+        crate::native_generation::executable_is_selected_generation(
+            &self.caller_executable,
+            &self.binary,
+            acosmi_daemon_launcher::build_id::self_build_id(),
+        )
+        .unwrap_or(false)
+    }
+
     /// Ensure the stable supervisor is serving the endpoint.
     ///
     /// The startup lock remains held until readiness, preventing a second
@@ -147,7 +162,9 @@ impl MemoryRuntimeCoordinator {
     pub fn ensure(&self) -> Result<(), MemoryRuntimeError> {
         self.prepare_runtime_paths()?;
         let probe = EndpointProbe::new()?;
-        match probe.observe(&self.endpoint) {
+        let mut authority =
+            SelectedGenerationAuthorityGate::new(|| self.has_selected_generation_authority());
+        match probe.observe(&self.endpoint, authority.current()) {
             EndpointObservation::Reusable => return Ok(()),
             EndpointObservation::Incompatible(reason) => {
                 return Err(self.incompatible_endpoint(reason));
@@ -157,7 +174,7 @@ impl MemoryRuntimeCoordinator {
 
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
-            match probe.observe(&self.endpoint) {
+            match probe.observe(&self.endpoint, authority.current()) {
                 EndpointObservation::Reusable => return Ok(()),
                 EndpointObservation::Incompatible(reason) => {
                     return Err(self.incompatible_endpoint(reason));
@@ -177,28 +194,46 @@ impl MemoryRuntimeCoordinator {
                     // the handoff barrier between launcher and supervisor.
                     let _start_guard = start_guard;
                     let mut spawned = false;
-                    let mut promotion_requested_for = None::<String>;
+                    let mut promotion_requested_for = None::<MemoryPromotionKey>;
+                    let mut selected_generation_handoff_acknowledged = false;
                     while Instant::now() < deadline {
-                        match probe.observe(&self.endpoint) {
+                        match probe.observe(&self.endpoint, authority.current()) {
                             EndpointObservation::Reusable => return Ok(()),
                             EndpointObservation::Incompatible(reason) => {
                                 return Err(self.incompatible_endpoint(reason));
                             }
-                            EndpointObservation::PromotionRequired(identity) => {
-                                if promotion_requested_for.as_deref()
-                                    != Some(identity.build_id.as_str())
-                                {
-                                    probe.request_promotion(&self.endpoint, &identity).map_err(
-                                        |reason| MemoryRuntimeError::PromotionRejected {
-                                            endpoint: self.endpoint.clone(),
-                                            reason,
-                                        },
-                                    )?;
-                                    promotion_requested_for = Some(identity.build_id);
+                            EndpointObservation::PromotionRequired(promotion) => {
+                                authority
+                                    .require(
+                                        promotion.requires_selected_generation_authority,
+                                        "before",
+                                    )
+                                    .map_err(|reason| self.incompatible_endpoint(reason))?;
+                                let request_key = promotion.request_key();
+                                let already_requested =
+                                    promotion_requested_for.as_ref() == Some(&request_key);
+                                if !already_requested {
+                                    probe
+                                        .request_promotion(&self.endpoint, &promotion)
+                                        .map_err(|reason| {
+                                            MemoryRuntimeError::PromotionRejected {
+                                                endpoint: self.endpoint.clone(),
+                                                reason,
+                                            }
+                                        })?;
+                                    selected_generation_handoff_acknowledged =
+                                        promotion.requires_selected_generation_authority;
+                                    promotion_requested_for = Some(request_key);
                                 }
                             }
                             EndpointObservation::Unavailable => {
                                 if !spawned {
+                                    authority
+                                        .require(
+                                            selected_generation_handoff_acknowledged,
+                                            "after acknowledgement of",
+                                        )
+                                        .map_err(|reason| self.incompatible_endpoint(reason))?;
                                     match socket_lock::acquire(&self.owner_lock)
                                         .map_err(MemoryRuntimeError::LifecycleLock)?
                                     {
@@ -208,6 +243,14 @@ impl MemoryRuntimeCoordinator {
                                         // before spawning the successor so
                                         // the new coordinator can own it.
                                         LockOutcome::Acquired(owner_probe) => {
+                                            authority
+                                                .require(
+                                                    selected_generation_handoff_acknowledged,
+                                                    "immediately before spawning the successor for",
+                                                )
+                                                .map_err(|reason| {
+                                                    self.incompatible_endpoint(reason)
+                                                })?;
                                             drop(owner_probe);
                                             self.spawn_supervisor()?;
                                             spawned = true;
@@ -387,7 +430,64 @@ struct MemoryEndpointIdentity {
     protocol_version: u64,
     schema_id: String,
     build_id: String,
+    pid: u32,
     capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryPromotion {
+    current: MemoryEndpointIdentity,
+    /// Exact value sent over the v1 promotion wire and required in the ack.
+    /// For an installer-authorized same-version rebuild this is a deterministic
+    /// numeric successor alias whose metadata binds the real local commit.
+    successor_build_id: String,
+    requires_selected_generation_authority: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryPromotionKey {
+    current_build_id: String,
+    current_pid: u32,
+    successor_build_id: String,
+}
+
+impl MemoryPromotion {
+    fn request_key(&self) -> MemoryPromotionKey {
+        MemoryPromotionKey {
+            current_build_id: self.current.build_id.clone(),
+            current_pid: self.current.pid,
+            successor_build_id: self.successor_build_id.clone(),
+        }
+    }
+}
+
+struct SelectedGenerationAuthorityGate<F> {
+    check: F,
+}
+
+impl<F> SelectedGenerationAuthorityGate<F>
+where
+    F: FnMut() -> bool,
+{
+    fn new(check: F) -> Self {
+        Self { check }
+    }
+
+    /// Perform a fresh `.current`/companion/build-id proof. No positive result
+    /// is cached across classify, request, acknowledgement, or spawn phases.
+    fn current(&mut self) -> bool {
+        (self.check)()
+    }
+
+    fn require(&mut self, required: bool, phase: &str) -> Result<(), String> {
+        if !required || self.current() {
+            Ok(())
+        } else {
+            Err(format!(
+                "selected native generation changed {phase} same-version Memory handoff"
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,7 +500,7 @@ enum EndpointObservation {
     Reusable,
     /// The endpoint implements the complete contract but is an older,
     /// authoritative generation. It must explicitly acknowledge handoff.
-    PromotionRequired(MemoryEndpointIdentity),
+    PromotionRequired(MemoryPromotion),
     /// A process answered, but its identity or control contract is unsafe to
     /// reuse or replace automatically.
     Incompatible(String),
@@ -429,7 +529,7 @@ impl EndpointProbe {
         })
     }
 
-    fn observe(&self, endpoint: &str) -> EndpointObservation {
+    fn observe(&self, endpoint: &str, selected_generation_authority: bool) -> EndpointObservation {
         self.runtime.block_on(async {
             match tokio::time::timeout(
                 PROBE_TIMEOUT,
@@ -445,23 +545,25 @@ impl EndpointProbe {
                 Ok(Err(EndpointRequestError::Incompatible(reason))) => {
                     EndpointObservation::Incompatible(reason)
                 }
-                Ok(Ok(response)) => classify_memory_identity(&self.local_build_id, &response),
+                Ok(Ok(response)) => classify_memory_identity(
+                    &self.local_build_id,
+                    &response,
+                    selected_generation_authority,
+                ),
             }
         })
     }
 
-    fn request_promotion(
-        &self,
-        endpoint: &str,
-        current: &MemoryEndpointIdentity,
-    ) -> Result<(), String> {
+    fn request_promotion(&self, endpoint: &str, promotion: &MemoryPromotion) -> Result<(), String> {
         // Promotion is never inferred from connection loss. The old owner
         // must acknowledge this exact successor generation and the complete
         // protocol/schema contract before the launcher waits for lock release.
         let mut frame = serde_json::to_vec(&serde_json::json!({
             "method": "memory.coordinator.promote",
             "payload": {
-                "successor_build_id": self.local_build_id,
+                "successor_build_id": promotion.successor_build_id.as_str(),
+                "expected_current_build_id": promotion.current.build_id.as_str(),
+                "expected_current_pid": promotion.current.pid,
                 "protocol_version": MEMORY_PROTOCOL_VERSION,
                 "schema_id": MEMORY_SCHEMA_ID,
             }
@@ -493,10 +595,29 @@ impl EndpointProbe {
         let successor_build_id = response
             .get("successor_build_id")
             .and_then(serde_json::Value::as_str);
+        let owner_bound = promotion
+            .current
+            .capabilities
+            .iter()
+            .any(|capability| capability == MEMORY_OWNER_BOUND_PROMOTION_CAPABILITY);
+        let owner_binding_matches = !owner_bound
+            || (response
+                .get("current_pid")
+                .and_then(serde_json::Value::as_u64)
+                == Some(u64::from(promotion.current.pid))
+                && response
+                    .get("protocol_version")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(MEMORY_PROTOCOL_VERSION)
+                && response
+                    .get("schema_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(MEMORY_SCHEMA_ID));
         if ok == Some(true)
             && promote == Some(true)
-            && current_build_id == Some(current.build_id.as_str())
-            && successor_build_id == Some(self.local_build_id.as_str())
+            && current_build_id == Some(promotion.current.build_id.as_str())
+            && successor_build_id == Some(promotion.successor_build_id.as_str())
+            && owner_binding_matches
         {
             Ok(())
         } else {
@@ -512,6 +633,7 @@ impl EndpointProbe {
 fn classify_memory_identity(
     local_build_id: &str,
     response: &serde_json::Value,
+    selected_generation_authority: bool,
 ) -> EndpointObservation {
     let identity = match parse_memory_identity(response) {
         Ok(identity) => identity,
@@ -558,12 +680,68 @@ fn classify_memory_identity(
         return EndpointObservation::Reusable;
     }
     if acosmi_daemon_launcher::build_id::build_id_version_newer(local_build_id, build_id) {
-        return EndpointObservation::PromotionRequired(identity);
+        return EndpointObservation::PromotionRequired(MemoryPromotion {
+            current: identity,
+            successor_build_id: local_build_id.to_string(),
+            requires_selected_generation_authority: false,
+        });
+    }
+    if selected_generation_authority
+        && let Some(successor_build_id) =
+            selected_generation_wire_successor(local_build_id, build_id)
+    {
+        return EndpointObservation::PromotionRequired(MemoryPromotion {
+            current: identity,
+            successor_build_id,
+            requires_selected_generation_authority: true,
+        });
     }
 
     EndpointObservation::Incompatible(format!(
         "authoritative build ids differ but are not safely ordered: local={local_build_id}, remote={build_id}"
     ))
+}
+
+/// Construct the v1-compatible promotion target for two authoritative builds
+/// whose numeric versions are equal but whose commit metadata differs.
+///
+/// Existing coordinators deliberately reject raw same-version build ids. The
+/// extra numeric segment is therefore a control-plane alias, not a runtime
+/// identity: it is emitted only after `.current` authority is proven, is
+/// strictly newer under the existing v1 comparator, and preserves the exact
+/// local metadata so the acknowledgement remains commit-bound.
+fn selected_generation_wire_successor(
+    local_build_id: &str,
+    remote_build_id: &str,
+) -> Option<String> {
+    fn parts(build_id: &str) -> Option<(&str, &str, Vec<u64>)> {
+        let (version, metadata) = build_id.split_once('+')?;
+        if version.is_empty()
+            || metadata.is_empty()
+            || build_id.len() > MAX_BUILD_ID_BYTES
+            || !metadata
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        {
+            return None;
+        }
+        let numeric = version
+            .split('.')
+            .map(|part| part.parse::<u64>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        (!numeric.is_empty()).then_some((version, metadata, numeric))
+    }
+
+    let (local_version, local_metadata, local_numeric) = parts(local_build_id)?;
+    let (_, _, remote_numeric) = parts(remote_build_id)?;
+    if local_build_id == remote_build_id || local_numeric != remote_numeric {
+        return None;
+    }
+    let successor = format!("{local_version}.1+selected-generation.{local_metadata}");
+    (successor.len() <= MAX_BUILD_ID_BYTES
+        && acosmi_daemon_launcher::build_id::is_authoritative(&successor)
+        && acosmi_daemon_launcher::build_id::build_id_version_newer(&successor, remote_build_id))
+    .then_some(successor)
 }
 
 fn parse_memory_identity(response: &serde_json::Value) -> Result<MemoryEndpointIdentity, String> {
@@ -593,9 +771,15 @@ fn parse_memory_identity(response: &serde_json::Value) -> Result<MemoryEndpointI
     let build_id = response
         .get("build_id")
         .and_then(serde_json::Value::as_str)
-        .filter(|build_id| !build_id.is_empty())
-        .ok_or_else(|| "identity is missing non-empty build_id".to_string())?
+        .filter(|build_id| !build_id.is_empty() && build_id.len() <= MAX_BUILD_ID_BYTES)
+        .ok_or_else(|| "identity is missing bounded non-empty build_id".to_string())?
         .to_string();
+    let pid = response
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| "identity is missing valid process pid".to_string())?;
     let capabilities = response
         .get("capabilities")
         .and_then(serde_json::Value::as_array)
@@ -616,6 +800,7 @@ fn parse_memory_identity(response: &serde_json::Value) -> Result<MemoryEndpointI
         protocol_version,
         schema_id,
         build_id,
+        pid,
         capabilities,
     })
 }
@@ -852,11 +1037,11 @@ mod tests {
     fn unknown_endpoint_scheme_is_never_treated_as_compatible() {
         let probe = EndpointProbe::new().expect("probe runtime");
         assert!(matches!(
-            probe.observe("tcp:127.0.0.1:7"),
+            probe.observe("tcp:127.0.0.1:7", false),
             EndpointObservation::Incompatible(_)
         ));
         assert!(matches!(
-            probe.observe(""),
+            probe.observe("", false),
             EndpointObservation::Incompatible(_)
         ));
     }
@@ -884,7 +1069,7 @@ mod tests {
         });
         let probe = EndpointProbe::new().expect("probe runtime");
         assert_eq!(
-            probe.observe(&format!("unix:{}", socket.display())),
+            probe.observe(&format!("unix:{}", socket.display()), false),
             EndpointObservation::Reusable
         );
         server.join().expect("server joins");
@@ -909,7 +1094,7 @@ mod tests {
         });
         let probe = EndpointProbe::new().expect("probe runtime");
         assert!(matches!(
-            probe.observe(&format!("unix:{}", socket.display())),
+            probe.observe(&format!("unix:{}", socket.display()), false),
             EndpointObservation::Incompatible(_)
         ));
         server.join().expect("server joins");
@@ -919,7 +1104,7 @@ mod tests {
     fn identity_reuse_requires_complete_protocol_schema_and_capabilities() {
         let exact = identity_response("1.2.3+aaaaaaaaaaaa");
         assert_eq!(
-            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &exact),
+            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &exact, false),
             EndpointObservation::Reusable
         );
 
@@ -929,21 +1114,21 @@ mod tests {
             .expect("identity object")
             .remove("schema_id");
         assert_incompatible_contains(
-            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &missing_schema),
+            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &missing_schema, false),
             "schema_id",
         );
 
         let mut wrong_schema = exact.clone();
         wrong_schema["schema_id"] = serde_json::json!("memory-v2");
         assert_incompatible_contains(
-            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &wrong_schema),
+            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &wrong_schema, false),
             "schema mismatch",
         );
 
         let mut missing_capability = exact.clone();
         missing_capability["capabilities"] = serde_json::json!(["coordinator-promote-v1"]);
         assert_incompatible_contains(
-            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &missing_capability),
+            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &missing_capability, false),
             "events-v1",
         );
 
@@ -951,7 +1136,7 @@ mod tests {
         missing_promotion_capability["capabilities"] =
             serde_json::json!(["events-v1", "runner-journal-v1"]);
         assert_incompatible_contains(
-            classify_memory_identity("1.2.4+bbbbbbbbbbbb", &missing_promotion_capability),
+            classify_memory_identity("1.2.4+bbbbbbbbbbbb", &missing_promotion_capability, false),
             "coordinator-promote-v1",
         );
 
@@ -959,52 +1144,169 @@ mod tests {
         missing_journal_capability["capabilities"] =
             serde_json::json!(["coordinator-promote-v1", "events-v1"]);
         assert_incompatible_contains(
-            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &missing_journal_capability),
+            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &missing_journal_capability, false),
             "runner-journal-v1",
         );
 
         let mut wrong_protocol = exact;
         wrong_protocol["protocol_version"] = serde_json::json!(2);
         assert_incompatible_contains(
-            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &wrong_protocol),
+            classify_memory_identity("1.2.3+aaaaaaaaaaaa", &wrong_protocol, false),
             "protocol mismatch",
         );
     }
 
     #[test]
-    fn build_order_is_monotonic_and_same_version_different_sha_fails_closed() {
+    fn build_order_is_monotonic_and_same_version_requires_current_generation_authority() {
         let older = identity_response("1.2.2+aaaaaaaaaaaa");
-        let observation = classify_memory_identity("1.2.3+bbbbbbbbbbbb", &older);
-        let EndpointObservation::PromotionRequired(identity) = observation else {
+        let observation = classify_memory_identity("1.2.3+bbbbbbbbbbbb", &older, false);
+        let EndpointObservation::PromotionRequired(promotion) = observation else {
             panic!("strictly older authoritative owner must require promotion");
         };
-        assert_eq!(identity.build_id, "1.2.2+aaaaaaaaaaaa");
+        assert_eq!(promotion.current.build_id, "1.2.2+aaaaaaaaaaaa");
+        assert_eq!(promotion.successor_build_id, "1.2.3+bbbbbbbbbbbb");
+        assert!(!promotion.requires_selected_generation_authority);
 
         let newer = identity_response("1.2.4+cccccccccccc");
         assert_eq!(
-            classify_memory_identity("1.2.3+bbbbbbbbbbbb", &newer),
+            classify_memory_identity("1.2.3+bbbbbbbbbbbb", &newer, false),
             EndpointObservation::Reusable,
             "an older caller must never downgrade the stable owner"
         );
 
         let same_version_other_sha = identity_response("1.2.3+cccccccccccc");
         assert_incompatible_contains(
-            classify_memory_identity("1.2.3+bbbbbbbbbbbb", &same_version_other_sha),
+            classify_memory_identity("1.2.3+bbbbbbbbbbbb", &same_version_other_sha, false),
             "not safely ordered",
         );
+
+        let authorized =
+            classify_memory_identity("1.2.3+bbbbbbbbbbbb", &same_version_other_sha, true);
+        let EndpointObservation::PromotionRequired(promotion) = authorized else {
+            panic!(
+                "the exact installer-selected generation should promote its same-version predecessor"
+            );
+        };
+        assert_eq!(promotion.current.build_id, "1.2.3+cccccccccccc");
+        assert_eq!(promotion.current.pid, 42);
+        assert_eq!(
+            promotion.successor_build_id,
+            "1.2.3.1+selected-generation.bbbbbbbbbbbb"
+        );
+        assert!(promotion.requires_selected_generation_authority);
+        assert!(acosmi_daemon_launcher::build_id::build_id_version_newer(
+            &promotion.successor_build_id,
+            &promotion.current.build_id,
+        ));
+
+        assert_eq!(
+            classify_memory_identity("1.2.3+bbbbbbbbbbbb", &newer, true),
+            EndpointObservation::Reusable,
+            "current-pointer authority must never authorize a downgrade"
+        );
+    }
+
+    #[test]
+    fn same_version_wire_successor_is_exact_bounded_and_canonical() {
+        assert_eq!(
+            selected_generation_wire_successor("1.0.29+05ea4ecc807b", "1.0.29+2d32744ea8ea")
+                .as_deref(),
+            Some("1.0.29.1+selected-generation.05ea4ecc807b")
+        );
+        assert_eq!(
+            selected_generation_wire_successor("1.0.29+05ea4ecc807b", "1.0.28+2d32744ea8ea"),
+            None
+        );
+        assert_eq!(
+            selected_generation_wire_successor("1.0.29+bad/metadata", "1.0.29+safe"),
+            None
+        );
+        let oversized = format!("1.0.29+{}", "a".repeat(MAX_BUILD_ID_BYTES));
+        assert_eq!(
+            selected_generation_wire_successor(&oversized, "1.0.29+safe"),
+            None
+        );
+    }
+
+    #[test]
+    fn promotion_dedupe_key_is_bound_to_the_observed_owner() {
+        let promotion = MemoryPromotion {
+            current: parse_memory_identity(&identity_response("1.2.2+aaaaaaaaaaaa"))
+                .expect("identity"),
+            successor_build_id: "1.2.3+bbbbbbbbbbbb".to_string(),
+            requires_selected_generation_authority: false,
+        };
+        let mut replacement = promotion.clone();
+        replacement.current.build_id = "1.2.1+cccccccccccc".to_string();
+        assert_ne!(promotion.request_key(), replacement.request_key());
+
+        replacement.current.build_id = promotion.current.build_id.clone();
+        replacement.current.pid += 1;
+        assert_ne!(promotion.request_key(), replacement.request_key());
+
+        replacement.current.pid = promotion.current.pid;
+        assert_eq!(promotion.request_key(), replacement.request_key());
+    }
+
+    #[test]
+    fn same_version_authority_is_rechecked_before_request_and_before_spawn() {
+        use std::collections::VecDeque;
+
+        let mut classify_then_request = VecDeque::from([true, false]);
+        let mut gate = SelectedGenerationAuthorityGate::new(|| {
+            classify_then_request
+                .pop_front()
+                .expect("one fresh authority result per phase")
+        });
+        assert!(
+            gate.current(),
+            "classification sees the selected generation"
+        );
+        assert!(
+            gate.require(true, "before").is_err(),
+            "losing .current after classification must stop before sending promote"
+        );
+        drop(gate);
+        assert!(classify_then_request.is_empty());
+
+        let mut request_then_spawn = VecDeque::from([true, false]);
+        let mut gate = SelectedGenerationAuthorityGate::new(|| {
+            request_then_spawn
+                .pop_front()
+                .expect("one fresh authority result per phase")
+        });
+        gate.require(true, "before")
+            .expect("authority is present immediately before request");
+        assert!(
+            gate.require(true, "immediately before spawning the successor for")
+                .is_err(),
+            "losing .current after acknowledgement must stop before successor spawn"
+        );
+        drop(gate);
+        assert!(request_then_spawn.is_empty());
+
+        let mut checks = 0;
+        let mut gate = SelectedGenerationAuthorityGate::new(|| {
+            checks += 1;
+            false
+        });
+        gate.require(false, "for an ordinary upgrade")
+            .expect("strict SemVer upgrades do not consume same-version authority");
+        drop(gate);
+        assert_eq!(checks, 0);
     }
 
     #[test]
     fn non_authoritative_builds_never_trigger_promotion() {
         let authoritative_remote = identity_response("1.2.2+aaaaaaaaaaaa");
         assert_eq!(
-            classify_memory_identity("1.2.3+unknown", &authoritative_remote),
+            classify_memory_identity("1.2.3+unknown", &authoritative_remote, false),
             EndpointObservation::Reusable
         );
 
         let unknown_remote = identity_response("1.2.2+unknown");
         assert_eq!(
-            classify_memory_identity("1.2.3+bbbbbbbbbbbb", &unknown_remote),
+            classify_memory_identity("1.2.3+bbbbbbbbbbbb", &unknown_remote, false),
             EndpointObservation::Reusable
         );
     }
@@ -1041,6 +1343,11 @@ mod tests {
                 serde_json::from_str(&promote).expect("parse promotion");
             assert_eq!(request["method"], "memory.coordinator.promote");
             assert_eq!(
+                request["payload"]["expected_current_build_id"],
+                "1.2.2+aaaaaaaaaaaa"
+            );
+            assert_eq!(request["payload"]["expected_current_pid"], 42);
+            assert_eq!(
                 request["payload"]["successor_build_id"],
                 "1.2.3+bbbbbbbbbbbb"
             );
@@ -1058,13 +1365,151 @@ mod tests {
 
         let probe = EndpointProbe::with_build_id("1.2.3+bbbbbbbbbbbb").expect("probe runtime");
         let endpoint = format!("unix:{}", socket.display());
-        let EndpointObservation::PromotionRequired(identity) = probe.observe(&endpoint) else {
+        let EndpointObservation::PromotionRequired(promotion) = probe.observe(&endpoint, false)
+        else {
             panic!("older endpoint should require promotion");
         };
         probe
-            .request_promotion(&endpoint, &identity)
+            .request_promotion(&endpoint, &promotion)
             .expect("valid promotion acknowledgement");
         server.join().expect("server joins");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn selected_same_version_generation_hands_off_a_legacy_v1_owner() {
+        use std::io::BufRead as _;
+        use std::io::BufReader;
+        use std::io::Write as _;
+
+        let temp = tempdir().expect("tempdir");
+        let socket = temp.path().join("same-version-promotion.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (mut ping_stream, _) = listener.accept().expect("accept ping");
+            let mut ping = String::new();
+            BufReader::new(&mut ping_stream)
+                .read_line(&mut ping)
+                .expect("read ping");
+            let mut identity = serde_json::to_vec(&identity_response("1.0.29+2d32744ea8ea"))
+                .expect("serialize identity");
+            identity.push(b'\n');
+            ping_stream.write_all(&identity).expect("write identity");
+            drop(ping_stream);
+
+            let (mut promote_stream, _) = listener.accept().expect("accept promotion");
+            let mut promote = String::new();
+            BufReader::new(&mut promote_stream)
+                .read_line(&mut promote)
+                .expect("read promotion");
+            let request: serde_json::Value =
+                serde_json::from_str(&promote).expect("parse promotion");
+            assert_eq!(
+                request["payload"]["successor_build_id"],
+                "1.0.29.1+selected-generation.05ea4ecc807b"
+            );
+            assert_eq!(
+                request["payload"]["expected_current_build_id"],
+                "1.0.29+2d32744ea8ea"
+            );
+            assert_eq!(request["payload"]["expected_current_pid"], 42);
+            promote_stream
+                .write_all(
+                    b"{\"ok\":true,\"promote\":true,\"current_build_id\":\"1.0.29+2d32744ea8ea\",\"successor_build_id\":\"1.0.29.1+selected-generation.05ea4ecc807b\"}\n",
+                )
+                .expect("write legacy acknowledgement");
+        });
+
+        let probe = EndpointProbe::with_build_id("1.0.29+05ea4ecc807b").expect("probe runtime");
+        let endpoint = format!("unix:{}", socket.display());
+        let EndpointObservation::PromotionRequired(promotion) = probe.observe(&endpoint, true)
+        else {
+            panic!("selected same-version generation must request a bound handoff");
+        };
+        assert!(promotion.requires_selected_generation_authority);
+        probe
+            .request_promotion(&endpoint, &promotion)
+            .expect("legacy v1 owner acknowledgement remains compatible");
+        server.join().expect("server joins");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owner_bound_v2_ack_requires_pid_protocol_and_schema() {
+        use std::io::BufRead as _;
+        use std::io::BufReader;
+        use std::io::Write as _;
+
+        fn request_with_response(response: &'static [u8]) -> Result<(), String> {
+            let temp = tempdir().expect("tempdir");
+            let socket = temp.path().join("owner-bound-promotion.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept promotion");
+                let mut request = String::new();
+                BufReader::new(&mut stream)
+                    .read_line(&mut request)
+                    .expect("read promotion");
+                stream.write_all(response).expect("write promotion ack");
+            });
+
+            let mut identity = identity_response("1.2.2+aaaaaaaaaaaa");
+            identity["capabilities"] = serde_json::json!([
+                "coordinator-promote-v1",
+                MEMORY_OWNER_BOUND_PROMOTION_CAPABILITY,
+                "events-v1",
+                "runner-journal-v1"
+            ]);
+            let promotion = MemoryPromotion {
+                current: parse_memory_identity(&identity).expect("identity"),
+                successor_build_id: "1.2.3+bbbbbbbbbbbb".to_string(),
+                requires_selected_generation_authority: false,
+            };
+            let probe = EndpointProbe::with_build_id("1.2.3+bbbbbbbbbbbb").expect("probe runtime");
+            let result = probe.request_promotion(&format!("unix:{}", socket.display()), &promotion);
+            server.join().expect("server joins");
+            result
+        }
+
+        request_with_response(
+            b"{\"ok\":true,\"promote\":true,\"current_build_id\":\"1.2.2+aaaaaaaaaaaa\",\"current_pid\":42,\"successor_build_id\":\"1.2.3+bbbbbbbbbbbb\",\"protocol_version\":1,\"schema_id\":\"crabcode-memory-ipc-v1-20260725\"}\n",
+        )
+        .expect("complete owner-bound acknowledgement");
+
+        for (case, response) in [
+            (
+                "missing pid",
+                b"{\"ok\":true,\"promote\":true,\"current_build_id\":\"1.2.2+aaaaaaaaaaaa\",\"successor_build_id\":\"1.2.3+bbbbbbbbbbbb\",\"protocol_version\":1,\"schema_id\":\"crabcode-memory-ipc-v1-20260725\"}\n"
+                    .as_slice(),
+            ),
+            (
+                "wrong pid",
+                b"{\"ok\":true,\"promote\":true,\"current_build_id\":\"1.2.2+aaaaaaaaaaaa\",\"current_pid\":43,\"successor_build_id\":\"1.2.3+bbbbbbbbbbbb\",\"protocol_version\":1,\"schema_id\":\"crabcode-memory-ipc-v1-20260725\"}\n"
+                    .as_slice(),
+            ),
+            (
+                "wrong protocol",
+                b"{\"ok\":true,\"promote\":true,\"current_build_id\":\"1.2.2+aaaaaaaaaaaa\",\"current_pid\":42,\"successor_build_id\":\"1.2.3+bbbbbbbbbbbb\",\"protocol_version\":2,\"schema_id\":\"crabcode-memory-ipc-v1-20260725\"}\n"
+                    .as_slice(),
+            ),
+            (
+                "wrong schema",
+                b"{\"ok\":true,\"promote\":true,\"current_build_id\":\"1.2.2+aaaaaaaaaaaa\",\"current_pid\":42,\"successor_build_id\":\"1.2.3+bbbbbbbbbbbb\",\"protocol_version\":1,\"schema_id\":\"wrong-memory-schema\"}\n"
+                    .as_slice(),
+            ),
+            (
+                "wrong successor",
+                b"{\"ok\":true,\"promote\":true,\"current_build_id\":\"1.2.2+aaaaaaaaaaaa\",\"current_pid\":42,\"successor_build_id\":\"1.2.4+cccccccccccc\",\"protocol_version\":1,\"schema_id\":\"crabcode-memory-ipc-v1-20260725\"}\n"
+                    .as_slice(),
+            ),
+        ] {
+            let error = request_with_response(response)
+                .expect_err("incomplete or mismatched v2 acknowledgement must fail closed");
+            assert!(
+                error.contains("generation-mismatched"),
+                "{case}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1093,8 +1538,13 @@ mod tests {
         let probe = EndpointProbe::with_build_id("1.2.3+bbbbbbbbbbbb").expect("probe runtime");
         let identity =
             parse_memory_identity(&identity_response("1.2.2+aaaaaaaaaaaa")).expect("identity");
+        let promotion = MemoryPromotion {
+            current: identity,
+            successor_build_id: "1.2.3+bbbbbbbbbbbb".to_string(),
+            requires_selected_generation_authority: false,
+        };
         let error = probe
-            .request_promotion(&format!("unix:{}", socket.display()), &identity)
+            .request_promotion(&format!("unix:{}", socket.display()), &promotion)
             .expect_err("mismatched ack must fail closed");
         assert!(error.contains("generation-mismatched"), "{error}");
         server.join().expect("server joins");

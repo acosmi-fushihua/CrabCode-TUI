@@ -2928,6 +2928,11 @@ fn permission_mode_label(mode: &str, language: UiLanguage, compact: bool) -> &'s
 
 fn header_context_spans(app: &TuiApp, theme: CrabCodeTheme) -> Vec<Span<'static>> {
     let language = app.ui_language();
+    let label = if app.context_usage_is_baseline() {
+        language.text("基础上下文", "baseline context")
+    } else {
+        language.text("上下文", "context")
+    };
     let (text, color) = if let Some(usage) = app.live_context_usage() {
         let color = if usage.percentage >= 80 {
             theme.accent_error
@@ -2939,7 +2944,7 @@ fn header_context_spans(app: &TuiApp, theme: CrabCodeTheme) -> Vec<Span<'static>
         (
             format!(
                 " {} {}/{} · {}% ",
-                language.text("上下文", "context"),
+                label,
                 format_header_tokens(usage.total_tokens),
                 format_header_tokens(usage.max_tokens),
                 usage.percentage
@@ -2950,7 +2955,7 @@ fn header_context_spans(app: &TuiApp, theme: CrabCodeTheme) -> Vec<Span<'static>
         (
             format!(
                 " {} {} ",
-                language.text("上下文", "context"),
+                label,
                 if app.context_usage_refresh_pending() {
                     language.text("计算中…", "calculating…")
                 } else {
@@ -10028,9 +10033,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::sdk_runtime::{EnvelopeClass, RawEnvelope, SystemSubtype};
+    use crate::sdk_runtime::{EnvelopeClass, RawEnvelope, RuntimeEvent, SystemSubtype};
     use crate::transcript_search::{TranscriptSearchDocument, TranscriptSearchState};
-    use crate::tui_app::InitialSessionRequest;
+    use crate::tui_app::{HostAction, InitialSessionRequest};
 
     fn render_buffer(app: &mut TuiApp, width: u16, height: u16) -> String {
         render_test_buffer(app, width, height)
@@ -11304,14 +11309,14 @@ mod tests {
             "{initialized}"
         );
         assert!(
-            initialized_compact.contains("上下文待同步"),
+            initialized_compact.contains("基础上下文待同步"),
             "{initialized}"
         );
         assert!(!initialized_compact.contains("SDK帧"), "{initialized}");
     }
 
     #[test]
-    fn header_localizes_approval_and_shows_exact_live_context_without_sdk_frames() {
+    fn header_localizes_approval_and_shows_exact_live_baseline_without_sdk_frames() {
         let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
         app.release_startup_barrier_for_test();
         let effect = app.projection.ingest(RawEnvelope {
@@ -11351,7 +11356,7 @@ mod tests {
             .collect::<String>();
         let compact = rendered.replace(' ', "");
         assert!(compact.contains("审批跳过所有审批"), "{rendered}");
-        assert!(compact.contains("上下文12.4k/128k·10%"), "{rendered}");
+        assert!(compact.contains("基础上下文12.4k/128k·10%"), "{rendered}");
         assert!(compact.contains("模型deepseek-v4-flash"), "{rendered}");
         assert!(!rendered.contains("bypassPermissions"), "{rendered}");
         assert!(!rendered.contains("SDK"), "{rendered}");
@@ -11367,6 +11372,144 @@ mod tests {
             assert!(!narrow.contains("bypassPermissions"), "{narrow}");
             assert!(!narrow.contains("SDK"), "{narrow}");
         }
+    }
+
+    #[test]
+    fn context_header_tracks_new_turn_resume_and_clear_at_common_widths() {
+        fn init_envelope(sequence: u64, session_id: &str) -> RuntimeEvent {
+            RuntimeEvent::Envelope(RawEnvelope {
+                sequence,
+                encoded_len: 1,
+                value: json!({
+                    "type":"system",
+                    "subtype":"init",
+                    "apiKeySource":"none",
+                    "crab_code_version":"1.0.0",
+                    "cwd":"/tmp",
+                    "tools":[],
+                    "mcp_servers":[],
+                    "model":"deepseek-v4-flash",
+                    "permissionMode":"default",
+                    "slash_commands":[],
+                    "output_style":"default",
+                    "skills":[],
+                    "plugins":[],
+                    "uuid":format!("init-{sequence}"),
+                    "session_id":session_id
+                }),
+                classification: EnvelopeClass::System(SystemSubtype::Init),
+                correlation: None,
+            })
+        }
+
+        fn hidden_assistant_envelope(sequence: u64, marker: &str) -> RuntimeEvent {
+            let mut value = json!({
+                "type":"assistant",
+                "uuid":format!("hidden-assistant-{sequence}"),
+                "timestamp":"2026-08-10T00:00:00.000Z",
+                "message":{
+                    "id":format!("hidden-message-{sequence}"),
+                    "model":"deepseek-v4-flash",
+                    "content":[{"type":"text","text":"hidden initialization context"}]
+                }
+            });
+            value[marker] = Value::Bool(true);
+            RuntimeEvent::Envelope(RawEnvelope {
+                sequence,
+                encoded_len: 1,
+                value,
+                classification: EnvelopeClass::Assistant,
+                correlation: None,
+            })
+        }
+
+        fn assert_context_label(
+            app: &mut TuiApp,
+            expected: &str,
+            baseline_marker: &str,
+            expect_baseline: bool,
+        ) {
+            for width in [120, 80, 60] {
+                let rendered = render_buffer(app, width, 30);
+                let compact = rendered.replace(' ', "");
+                assert!(compact.contains(expected), "width={width}: {rendered}");
+                assert_eq!(
+                    compact.contains(baseline_marker),
+                    expect_baseline,
+                    "width={width}: {rendered}"
+                );
+            }
+        }
+
+        let mut fresh = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        fresh.release_startup_barrier_for_test();
+        fresh.handle_runtime_event(init_envelope(1, "session-before-clear"));
+        fresh.set_live_context_usage_for_test(30_200, 1_000_000, 3);
+        fresh.handle_runtime_event(hidden_assistant_envelope(2, "isSynthetic"));
+        fresh.handle_runtime_event(hidden_assistant_envelope(3, "isReplay"));
+        assert_context_label(&mut fresh, "基础上下文30.2k/1m·3%", "基础上下文", true);
+
+        let first_send = HostAction::SendUser {
+            content: Value::String("first real turn".to_string()),
+            priority: None,
+        };
+        fresh.action_admitted(&first_send);
+        assert_context_label(&mut fresh, "上下文30.2k/1m·3%", "基础上下文", false);
+        fresh.action_failed(&first_send, "writer unavailable");
+        assert_context_label(&mut fresh, "基础上下文30.2k/1m·3%", "基础上下文", true);
+
+        fresh.handle_runtime_event(RuntimeEvent::Envelope(RawEnvelope {
+            sequence: 4,
+            encoded_len: 1,
+            value: json!({
+                "type":"user",
+                "message":{"role":"user","content":"first real turn"},
+                "uuid":"first-user",
+                "timestamp":"2026-08-10T00:00:00.000Z"
+            }),
+            classification: EnvelopeClass::User,
+            correlation: None,
+        }));
+        assert_context_label(&mut fresh, "上下文30.2k/1m·3%", "基础上下文", false);
+
+        // The backend's validated session-id transition is the existing
+        // `/clear` boundary. It must discard the old snapshot and return the
+        // newly blank session to baseline semantics.
+        fresh.handle_runtime_event(init_envelope(5, "session-after-clear"));
+        assert!(fresh.live_context_usage().is_none());
+        assert!(!fresh.context_usage_refresh_pending());
+        fresh.set_live_context_usage_for_test(30_200, 1_000_000, 3);
+        assert_context_label(&mut fresh, "基础上下文30.2k/1m·3%", "基础上下文", true);
+
+        let delivered_send = HostAction::SendUser {
+            content: Value::String("post-clear turn".to_string()),
+            priority: None,
+        };
+        fresh.action_admitted(&delivered_send);
+        assert_context_label(&mut fresh, "上下文30.2k/1m·3%", "基础上下文", false);
+        fresh.action_succeeded(&delivered_send);
+        assert!(!fresh.context_usage_is_baseline());
+
+        let mut resumed = TuiApp::new(
+            &json!({}),
+            InitialSessionRequest::ResumeExact {
+                session_id: "resumed-session".to_string(),
+            },
+            None,
+        );
+        resumed.release_startup_barrier_for_test();
+        resumed.set_live_context_usage_for_test(30_200, 1_000_000, 3);
+        assert_context_label(&mut resumed, "上下文30.2k/1m·3%", "基础上下文", false);
+
+        let mut english = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        switch_to_english_and_initialize(&mut english);
+        english.set_live_context_usage_for_test(30_200, 1_000_000, 3);
+        assert_context_label(
+            &mut english,
+            "baselinecontext30.2k/1m·3%",
+            "baselinecontext",
+            true,
+        );
     }
 
     #[test]

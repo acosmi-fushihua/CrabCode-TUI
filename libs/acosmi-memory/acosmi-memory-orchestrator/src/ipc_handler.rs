@@ -1995,6 +1995,14 @@ impl IpcHandler {
                 "pid": std::process::id(),
             })),
             "memory.coordinator.promote" => {
+                let expected_current_build_id = payload
+                    .get("expected_current_build_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_input("missing expected_current_build_id"))?;
+                let expected_current_pid = payload
+                    .get("expected_current_pid")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid_input("missing expected_current_pid"))?;
                 let successor_build_id = payload
                     .get("successor_build_id")
                     .and_then(Value::as_str)
@@ -2007,6 +2015,18 @@ impl IpcHandler {
                     .get("schema_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| invalid_input("missing schema_id"))?;
+                if expected_current_build_id != env!("CRABCODE_BUILD_ID") {
+                    return Err(invalid_input(
+                        "expected current build does not match the live Memory owner",
+                    )
+                    .into());
+                }
+                if expected_current_pid != u64::from(std::process::id()) {
+                    return Err(invalid_input(
+                        "expected current pid does not match the live Memory owner",
+                    )
+                    .into());
+                }
                 if protocol_version != crate::MEMORY_PROTOCOL_VERSION
                     || schema_id != crate::MEMORY_SCHEMA_ID
                 {
@@ -2024,7 +2044,10 @@ impl IpcHandler {
                     "ok": true,
                     "promote": true,
                     "current_build_id": env!("CRABCODE_BUILD_ID"),
+                    "current_pid": std::process::id(),
                     "successor_build_id": successor_build_id,
+                    "protocol_version": crate::MEMORY_PROTOCOL_VERSION,
+                    "schema_id": crate::MEMORY_SCHEMA_ID,
                 }))
             }
             "memory.turn_end.evaluate" => {
@@ -6062,6 +6085,24 @@ mod tests {
         format!("{}.0.0+promotion-test", major + 1)
     }
 
+    fn selected_generation_successor_alias(current: &str) -> String {
+        let version = current
+            .split_once('+')
+            .expect("current build id has metadata")
+            .0;
+        format!("{version}.1+selected-generation.handler-test")
+    }
+
+    fn owner_bound_promotion_payload(successor_build_id: impl Into<String>) -> Value {
+        json!({
+            "expected_current_build_id": env!("CRABCODE_BUILD_ID"),
+            "expected_current_pid": std::process::id(),
+            "successor_build_id": successor_build_id.into(),
+            "protocol_version": crate::MEMORY_PROTOCOL_VERSION,
+            "schema_id": crate::MEMORY_SCHEMA_ID,
+        })
+    }
+
     /// W4 (2026-07-16)：真实形状的主会话转写行（镜像 dream_corpus 测试的
     /// `user_assistant_line`）。空对象 `{}` 行压缩后为空文本，会被 RC-7a
     /// 空语料门拦下 —— 需要「做梦真执行」的夹具一律用本 helper。
@@ -6147,48 +6188,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipc_handler_coordinator_promote_requires_strictly_newer_compatible_successor() {
+    async fn ipc_handler_coordinator_promote_requires_owner_binding_and_strict_successor() {
         let handler = IpcHandler::new();
         let current_build_id = env!("CRABCODE_BUILD_ID");
+        let current_pid = std::process::id();
+        let successor_build_id = selected_generation_successor_alias(current_build_id);
 
         let accepted = handler
             .handle_value(request(
                 "memory.coordinator.promote",
-                json!({
-                    "successor_build_id": strictly_newer_build_id(current_build_id),
-                    "protocol_version": crate::MEMORY_PROTOCOL_VERSION,
-                    "schema_id": crate::MEMORY_SCHEMA_ID,
-                }),
+                owner_bound_promotion_payload(&successor_build_id),
             ))
             .await;
         assert_eq!(accepted["ok"], true);
         assert_eq!(accepted["promote"], true);
         assert_eq!(accepted["current_build_id"], current_build_id);
+        assert_eq!(accepted["current_pid"], current_pid);
+        assert_eq!(accepted["successor_build_id"], successor_build_id);
+        assert_eq!(accepted["protocol_version"], crate::MEMORY_PROTOCOL_VERSION);
+        assert_eq!(accepted["schema_id"], crate::MEMORY_SCHEMA_ID);
 
-        let same_build = handler
-            .handle_value(request(
-                "memory.coordinator.promote",
-                json!({
-                    "successor_build_id": current_build_id,
-                    "protocol_version": crate::MEMORY_PROTOCOL_VERSION,
-                    "schema_id": crate::MEMORY_SCHEMA_ID,
-                }),
-            ))
-            .await;
-        assert_eq!(same_build["ok"], false);
-        assert!(same_build["error"]
-            .as_str()
-            .is_some_and(|message| message.contains("strictly newer")));
-
-        let wrong_schema = handler
+        let missing_owner_binding = handler
             .handle_value(request(
                 "memory.coordinator.promote",
                 json!({
                     "successor_build_id": strictly_newer_build_id(current_build_id),
                     "protocol_version": crate::MEMORY_PROTOCOL_VERSION,
-                    "schema_id": "incompatible-memory-schema",
+                    "schema_id": crate::MEMORY_SCHEMA_ID,
                 }),
             ))
+            .await;
+        assert_eq!(missing_owner_binding["ok"], false);
+        assert!(missing_owner_binding["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("expected_current_build_id")));
+
+        let mut wrong_build_payload = owner_bound_promotion_payload(&successor_build_id);
+        wrong_build_payload["expected_current_build_id"] = json!("0.0.0+wrong-owner");
+        let wrong_build = handler
+            .handle_value(request("memory.coordinator.promote", wrong_build_payload))
+            .await;
+        assert_eq!(wrong_build["ok"], false);
+        assert!(wrong_build["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("current build")));
+
+        let wrong_pid_value = if current_pid == u32::MAX {
+            current_pid - 1
+        } else {
+            current_pid + 1
+        };
+        let mut wrong_pid_payload = owner_bound_promotion_payload(&successor_build_id);
+        wrong_pid_payload["expected_current_pid"] = json!(wrong_pid_value);
+        let wrong_pid = handler
+            .handle_value(request("memory.coordinator.promote", wrong_pid_payload))
+            .await;
+        assert_eq!(wrong_pid["ok"], false);
+        assert!(wrong_pid["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("current pid")));
+
+        let raw_same_version_build_id = format!(
+            "{}+raw-same-version",
+            current_build_id
+                .split_once('+')
+                .expect("current build id has metadata")
+                .0
+        );
+        let same_version = handler
+            .handle_value(request(
+                "memory.coordinator.promote",
+                owner_bound_promotion_payload(raw_same_version_build_id),
+            ))
+            .await;
+        assert_eq!(same_version["ok"], false);
+        assert!(same_version["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("strictly newer")));
+
+        let mut wrong_protocol_payload = owner_bound_promotion_payload(&successor_build_id);
+        wrong_protocol_payload["protocol_version"] = json!(crate::MEMORY_PROTOCOL_VERSION + 1);
+        let wrong_protocol = handler
+            .handle_value(request(
+                "memory.coordinator.promote",
+                wrong_protocol_payload,
+            ))
+            .await;
+        assert_eq!(wrong_protocol["ok"], false);
+        assert!(wrong_protocol["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("incompatible")));
+
+        let mut wrong_schema_payload = owner_bound_promotion_payload(successor_build_id);
+        wrong_schema_payload["schema_id"] = json!("incompatible-memory-schema");
+        let wrong_schema = handler
+            .handle_value(request("memory.coordinator.promote", wrong_schema_payload))
             .await;
         assert_eq!(wrong_schema["ok"], false);
         assert!(wrong_schema["error"]

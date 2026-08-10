@@ -379,6 +379,69 @@ fn validate_generation_root(versions_dir: &Path, marker: &Path) -> Result<PathBu
     validate_generation_directory(versions_dir, &marker_target)
 }
 
+/// Prove that `executable` belongs to the generation selected by the native
+/// installer's durable `.current` pointer.
+///
+/// This is intentionally stronger than merely recognizing a launcher under
+/// `versions/`: an already-running old generation keeps its lifetime lease,
+/// but loses update authority as soon as the installer selects a successor.
+/// Memory uses this proof only for the otherwise-unordered case where two
+/// authoritative build ids have the same numeric version and different
+/// commit metadata.
+pub(crate) fn executable_is_selected_generation(
+    executable: &Path,
+    memory_binary: &Path,
+    expected_build_id: &str,
+) -> Result<bool> {
+    let versions = native_installer_versions_dir()?;
+    executable_is_selected_generation_in(executable, memory_binary, expected_build_id, &versions)
+}
+
+fn executable_is_selected_generation_in(
+    executable: &Path,
+    memory_binary: &Path,
+    expected_build_id: &str,
+    versions_dir: &Path,
+) -> Result<bool> {
+    if !is_generation_launcher(executable, versions_dir) {
+        return Ok(false);
+    }
+    let marker = versions_dir.join(CURRENT_GENERATION_MARKER);
+    let selected = match fs::symlink_metadata(&marker) {
+        Ok(_) => validate_generation_root(versions_dir, &marker)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect generation marker {}", marker.display()));
+        }
+    };
+    if !same_path(executable, &selected.join(launcher_file_name()))
+        || !same_path(memory_binary, &selected.join(memory_file_name()))
+    {
+        return Ok(false);
+    }
+    let build_id_path = selected.join("build-id");
+    let metadata = fs::symlink_metadata(&build_id_path)
+        .with_context(|| format!("cannot inspect {}", build_id_path.display()))?;
+    if !metadata.is_file()
+        || metadata_is_reparse_point(&metadata)
+        || metadata.len() == 0
+        || metadata.len() > 256
+    {
+        bail!("selected generation build-id is not a bounded real regular file");
+    }
+    let raw = fs::read_to_string(&build_id_path)
+        .with_context(|| format!("cannot read {}", build_id_path.display()))?;
+    let build_id = raw.strip_suffix('\n').unwrap_or(&raw);
+    if build_id.is_empty()
+        || (raw != build_id && raw != format!("{build_id}\n"))
+        || build_id.chars().any(char::is_control)
+    {
+        bail!("selected generation build-id is not one canonical value line");
+    }
+    Ok(build_id == expected_build_id)
+}
+
 fn is_generation_launcher(current_exe: &Path, versions_dir: &Path) -> bool {
     let (Ok(current), Ok(versions)) = (
         fs::canonicalize(current_exe),
@@ -1613,10 +1676,7 @@ mod tests {
         fs::write(path, b"fixture").unwrap();
     }
 
-    fn generation_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf) {
-        let temp = TempDir::new().unwrap();
-        let versions = temp.path().join("versions");
-        let generation = versions.join("1.2.3");
+    fn write_generation_fixture(generation: &Path) -> PathBuf {
         let launcher = generation.join(launcher_file_name());
         for relative in [
             launcher_file_name(),
@@ -1630,12 +1690,156 @@ mod tests {
         ] {
             write_file(&generation.join(relative));
         }
+        launcher
+    }
+
+    fn generation_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let versions = temp.path().join("versions");
+        let generation = versions.join("1.2.3");
+        let launcher = write_generation_fixture(&generation);
         fs::write(
             versions.join(CURRENT_GENERATION_MARKER),
             format!("{}\n", generation.display()),
         )
         .unwrap();
         (temp, versions, generation, launcher)
+    }
+
+    #[test]
+    fn only_the_exact_current_generation_has_same_version_handoff_authority() {
+        let (_temp, versions, generation, launcher) = generation_fixture();
+        let memory = generation.join(memory_file_name());
+        assert!(
+            executable_is_selected_generation_in(&launcher, &memory, "fixture", &versions).unwrap()
+        );
+
+        let stale_generation = versions.join("1.2.2");
+        let stale_launcher = write_generation_fixture(&stale_generation);
+        let stale_memory = stale_generation.join(memory_file_name());
+        assert!(is_generation_launcher(&stale_launcher, &versions));
+        assert!(
+            !executable_is_selected_generation_in(
+                &stale_launcher,
+                &stale_memory,
+                "fixture",
+                &versions,
+            )
+            .unwrap(),
+            "a valid leased generation that is no longer selected must not promote an unordered peer"
+        );
+
+        assert!(
+            !executable_is_selected_generation_in(&launcher, &stale_memory, "fixture", &versions,)
+                .unwrap(),
+            "an orchestrator override outside the selected generation cannot inherit launcher authority"
+        );
+        assert!(
+            !executable_is_selected_generation_in(
+                &launcher,
+                &memory,
+                "other-build+aaaaaaaaaaaa",
+                &versions,
+            )
+            .unwrap(),
+            "a selected path cannot authorize a different process build"
+        );
+
+        fs::write(
+            versions.join(CURRENT_GENERATION_MARKER),
+            format!("{}\n", stale_generation.display()),
+        )
+        .unwrap();
+        assert!(
+            !executable_is_selected_generation_in(&launcher, &memory, "fixture", &versions)
+                .unwrap()
+        );
+        assert!(
+            executable_is_selected_generation_in(
+                &stale_launcher,
+                &stale_memory,
+                "fixture",
+                &versions,
+            )
+            .unwrap()
+        );
+
+        fs::write(
+            versions.join(CURRENT_GENERATION_MARKER),
+            format!("{}\n", generation.parent().unwrap().display()),
+        )
+        .unwrap();
+        assert!(
+            executable_is_selected_generation_in(&launcher, &memory, "fixture", &versions).is_err()
+        );
+    }
+
+    #[test]
+    fn selected_generation_authority_fails_closed_for_missing_or_malformed_files() {
+        let (_temp, versions, generation, launcher) = generation_fixture();
+        let memory = generation.join(memory_file_name());
+        let marker = versions.join(CURRENT_GENERATION_MARKER);
+
+        fs::remove_file(&marker).unwrap();
+        assert!(
+            !executable_is_selected_generation_in(&launcher, &memory, "fixture", &versions)
+                .unwrap()
+        );
+
+        fs::write(&marker, "x".repeat((MAX_MARKER_BYTES + 1) as usize)).unwrap();
+        assert!(
+            executable_is_selected_generation_in(&launcher, &memory, "fixture", &versions).is_err()
+        );
+
+        fs::write(&marker, format!("{}\n", generation.display())).unwrap();
+        fs::write(generation.join("build-id"), b"fixture\nsecond\n").unwrap();
+        assert!(
+            executable_is_selected_generation_in(&launcher, &memory, "fixture", &versions).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_generation_authority_rejects_symlinks_and_non_utf8_build_id() {
+        use std::os::unix::fs::symlink;
+
+        {
+            let (temp, versions, generation, launcher) = generation_fixture();
+            let memory = generation.join(memory_file_name());
+            let marker = versions.join(CURRENT_GENERATION_MARKER);
+            let real_marker = temp.path().join("real-current");
+            fs::write(&real_marker, format!("{}\n", generation.display())).unwrap();
+            fs::remove_file(&marker).unwrap();
+            symlink(&real_marker, &marker).unwrap();
+            assert!(
+                executable_is_selected_generation_in(&launcher, &memory, "fixture", &versions)
+                    .is_err()
+            );
+        }
+
+        {
+            let (temp, versions, generation, launcher) = generation_fixture();
+            let memory = generation.join(memory_file_name());
+            let build_id = generation.join("build-id");
+            let real_build_id = temp.path().join("real-build-id");
+            fs::write(&real_build_id, b"fixture\n").unwrap();
+            fs::remove_file(&build_id).unwrap();
+            symlink(&real_build_id, &build_id).unwrap();
+            assert!(
+                executable_is_selected_generation_in(&launcher, &memory, "fixture", &versions)
+                    .is_err()
+            );
+        }
+
+        {
+            let (_temp, versions, generation, launcher) = generation_fixture();
+            let memory = generation.join(memory_file_name());
+            fs::write(generation.join("build-id"), [0xff, 0xfe]).unwrap();
+            assert!(
+                executable_is_selected_generation_in(&launcher, &memory, "fixture", &versions)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

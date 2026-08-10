@@ -1330,7 +1330,7 @@ fn untrusted_workspace_uses_one_cwd_only_decision_before_initialize_ready_bounda
 }
 
 #[test]
-fn workspace_trust_rejection_restores_terminal_without_initialize_response() {
+fn workspace_trust_escape_exits_cleanly_without_initialize_response() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
         .expect("canonical test cwd");
@@ -1381,9 +1381,9 @@ fn workspace_trust_rejection_restores_terminal_without_initialize_response() {
     {
         let mut writer = writer.lock().expect("trust PTY writer lock");
         writer
-            .write_all(b"n")
-            .expect("reject native workspace-trust prompt");
-        writer.flush().expect("flush workspace-trust rejection");
+            .write_all(&[0x1b])
+            .expect("escape native workspace-trust prompt");
+        writer.flush().expect("flush workspace-trust escape");
     }
     wait_until_condition(
         Duration::from_secs(5),
@@ -1393,10 +1393,6 @@ fn workspace_trust_rejection_restores_terminal_without_initialize_response() {
                 .is_ok_and(|transcript| transcript.contains("\"workspace_trust_response\""))
         },
     );
-    wait_until(&captured, Duration::from_secs(5), |output| {
-        output.contains("协议兼容性失败")
-    });
-
     let runtime_pid = fixture.runtime_pid();
     let transcript = fixture.setup_transcript();
     assert_eq!(
@@ -1463,21 +1459,12 @@ fn workspace_trust_rejection_restores_terminal_without_initialize_response() {
         Some(3)
     );
 
-    {
-        let mut writer = writer.lock().expect("trust PTY writer lock");
-        writer
-            .write_all(&[0x03, 0x03])
-            .expect("exit after rejecting workspace trust");
-        writer
-            .flush()
-            .expect("flush rejection-path exit key events");
-    }
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait().expect("poll trust-reject child") {
             assert!(
-                !status.success(),
-                "workspace-trust rejection must fail closed: {status:?}"
+                status.success(),
+                "workspace-trust escape must be a clean user-requested exit: {status:?}"
             );
             break;
         }
@@ -1503,8 +1490,10 @@ fn workspace_trust_rejection_restores_terminal_without_initialize_response() {
         let bytes = captured.lock().expect("capture lock");
         String::from_utf8_lossy(&bytes).into_owned()
     };
+    let rendered = rendered_terminal_text(&output);
+    assert!(!rendered.contains("协议兼容性失败"), "{output:?}");
     assert!(
-        rendered_terminal_text(&output).contains("Workspace trust was declined for"),
+        !rendered.contains("runtime exited unexpectedly"),
         "{output:?}"
     );
     // The welcome-card copy is present while the composer is locked and is

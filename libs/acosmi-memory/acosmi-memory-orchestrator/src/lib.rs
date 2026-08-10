@@ -99,8 +99,16 @@ pub const MEMORY_IPC_ENDPOINT_ENV: &str = "CRABCODE_MEMORY_IPC_ENDPOINT";
 pub const MEMORY_PROTOCOL_VERSION: u64 = 1;
 pub const MEMORY_SCHEMA_ID: &str = "crabcode-memory-ipc-v1-20260725";
 pub const MEMORY_SERVICE_IDENTITY: &str = "acosmi-memory-orchestrator";
-pub const MEMORY_CAPABILITIES: &[&str] =
-    &["coordinator-promote-v1", "events-v1", "runner-journal-v1"];
+// Keep the v1 discovery token so older launchers identify this as the same
+// coordinator surface. The v2 token is an explicit payload upgrade: this
+// owner intentionally rejects an unbound legacy promotion request rather than
+// letting an older caller replace a newer live process.
+pub const MEMORY_CAPABILITIES: &[&str] = &[
+    "coordinator-promote-v1",
+    "coordinator-promote-owner-bind-v2",
+    "events-v1",
+    "runner-journal-v1",
+];
 pub const MEMORY_PROMOTION_EXIT_CODE: i32 = 75;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1160,10 +1168,43 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn unix_server_acknowledges_compatible_promotion_before_releasing_endpoint() {
+    async fn send_unix_request(
+        socket_path: &std::path::Path,
+        request: &serde_json::Value,
+    ) -> serde_json::Value {
         use tokio::io::AsyncWriteExt as _;
 
+        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match tokio::net::UnixStream::connect(socket_path).await {
+                    Ok(stream) => break stream,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("connect to Memory endpoint: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Memory endpoint must become connectable within 2s");
+
+        let mut frame = serde_json::to_vec(request).expect("encode request");
+        frame.push(b'\n');
+        stream.write_all(&frame).await.expect("write request");
+        stream.flush().await.expect("flush request");
+        read_one_shot_response(stream)
+            .await
+            .expect("one-shot response")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_server_owner_bound_promotion_fails_closed_then_releases_after_exact_ack() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let socket_path = temp_dir.path().join("memory.sock");
         let endpoint = format!("unix:{}", socket_path.display());
@@ -1178,21 +1219,20 @@ mod tests {
                 .expect("serve")
         });
 
-        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match tokio::net::UnixStream::connect(&socket_path).await {
-                    Ok(stream) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
-                    Err(error) => panic!("connect to Memory endpoint: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("Memory endpoint must become connectable within 2s");
-
-        let current_major = env!("CRABCODE_BUILD_ID")
+        let ping = send_unix_request(
+            &socket_path,
+            &serde_json::json!({ "method": "memory.ping" }),
+        )
+        .await;
+        assert_eq!(ping["ok"], true);
+        assert!(ping["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability.as_str() == Some("coordinator-promote-owner-bind-v2")
+            })));
+        let current_build_id = ping["build_id"].as_str().expect("ping build id");
+        let current_pid = ping["pid"].as_u64().expect("ping pid");
+        let current_major = current_build_id
             .split_once('+')
             .expect("build id includes authority suffix")
             .0
@@ -1201,24 +1241,72 @@ mod tests {
             .expect("build id includes major version")
             .parse::<u64>()
             .expect("major version is numeric");
-        let request = serde_json::json!({
-            "method": "memory.coordinator.promote",
-            "payload": {
-                "successor_build_id": format!("{}.0.0+promotion-test", current_major + 1),
+        let successor_build_id = format!("{}.0.0+promotion-test", current_major + 1);
+        let valid_payload = serde_json::json!({
+                "expected_current_build_id": current_build_id,
+                "expected_current_pid": current_pid,
+                "successor_build_id": successor_build_id,
                 "protocol_version": MEMORY_PROTOCOL_VERSION,
                 "schema_id": MEMORY_SCHEMA_ID,
-            }
         });
-        let mut frame = serde_json::to_vec(&request).expect("encode promotion");
-        frame.push(b'\n');
-        stream.write_all(&frame).await.expect("write promotion");
-        stream.flush().await.expect("flush promotion");
 
-        let response = read_one_shot_response(stream)
-            .await
-            .expect("promotion acknowledgement");
+        let wrong_pid = if current_pid == u64::MAX {
+            current_pid - 1
+        } else {
+            current_pid + 1
+        };
+        let raw_same_version_build_id = format!(
+            "{}+raw-same-version",
+            current_build_id
+                .split_once('+')
+                .expect("build id has metadata")
+                .0
+        );
+        let mut invalid_payloads = Vec::new();
+        let mut wrong_build_payload = valid_payload.clone();
+        wrong_build_payload["expected_current_build_id"] = serde_json::json!("0.0.0+wrong-owner");
+        invalid_payloads.push(("wrong current build", wrong_build_payload));
+        let mut wrong_pid_payload = valid_payload.clone();
+        wrong_pid_payload["expected_current_pid"] = serde_json::json!(wrong_pid);
+        invalid_payloads.push(("wrong current pid", wrong_pid_payload));
+        let mut wrong_protocol_payload = valid_payload.clone();
+        wrong_protocol_payload["protocol_version"] = serde_json::json!(MEMORY_PROTOCOL_VERSION + 1);
+        invalid_payloads.push(("wrong protocol", wrong_protocol_payload));
+        let mut wrong_schema_payload = valid_payload.clone();
+        wrong_schema_payload["schema_id"] = serde_json::json!("wrong-memory-schema");
+        invalid_payloads.push(("wrong schema", wrong_schema_payload));
+        let mut same_version_payload = valid_payload.clone();
+        same_version_payload["successor_build_id"] = serde_json::json!(raw_same_version_build_id);
+        invalid_payloads.push(("raw same-version successor", same_version_payload));
+
+        for (case, payload) in invalid_payloads {
+            let response = send_unix_request(
+                &socket_path,
+                &serde_json::json!({
+                    "method": "memory.coordinator.promote",
+                    "payload": payload,
+                }),
+            )
+            .await;
+            assert_eq!(response["ok"], false, "{case}: {response}");
+            assert_ne!(response["promote"], true, "{case}: {response}");
+        }
+
+        let response = send_unix_request(
+            &socket_path,
+            &serde_json::json!({
+                "method": "memory.coordinator.promote",
+                "payload": valid_payload,
+            }),
+        )
+        .await;
         assert_eq!(response["ok"], true);
         assert_eq!(response["promote"], true);
+        assert_eq!(response["current_build_id"], current_build_id);
+        assert_eq!(response["current_pid"], current_pid);
+        assert_eq!(response["successor_build_id"], successor_build_id);
+        assert_eq!(response["protocol_version"], MEMORY_PROTOCOL_VERSION);
+        assert_eq!(response["schema_id"], MEMORY_SCHEMA_ID);
 
         let exit = tokio::time::timeout(std::time::Duration::from_secs(2), server)
             .await

@@ -834,6 +834,10 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
       identity.ok !== true ||
       identity.protocol_version !== 1 ||
       identity.schema_id !== incidentSchema ||
+      typeof identity.build_id !== 'string' ||
+      identity.build_id.length === 0 ||
+      !Array.isArray(identity.capabilities) ||
+      !identity.capabilities.includes('coordinator-promote-owner-bind-v2') ||
       !Number.isSafeInteger(identity.pid)
     ) {
       memoryLifecycleFailure(
@@ -851,6 +855,8 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
         method: 'memory.coordinator.promote',
         payload: {
           successor_build_id: '2.0.0+release-smoke-cleanup',
+          expected_current_build_id: identity.build_id,
+          expected_current_pid: identity.pid,
           protocol_version: 1,
           schema_id: incidentSchema,
         },
@@ -861,7 +867,11 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
     if (
       promotion.ok !== true ||
       promotion.promote !== true ||
-      promotion.successor_build_id !== '2.0.0+release-smoke-cleanup'
+      promotion.current_build_id !== identity.build_id ||
+      promotion.current_pid !== identity.pid ||
+      promotion.successor_build_id !== '2.0.0+release-smoke-cleanup' ||
+      promotion.protocol_version !== 1 ||
+      promotion.schema_id !== incidentSchema
     ) {
       memoryLifecycleFailure(
         endpoint,
