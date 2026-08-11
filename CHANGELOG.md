@@ -10,7 +10,8 @@
 - Binds assembly and the embedded runtime to the official `acosmi/crabcode`
   `v1.0.29` Account Bridge `7.2.71-crabcode.9` assets, exact archive and lock
   hashes, production Ed25519 trust root, eligibility trust root, and the
-  Developer ID plus Apple notarization evidence actually carried by macOS.
+  same-team Developer ID plus Apple notarization evidence actually carried by
+  macOS, without requiring the broad library-validation disabling entitlement.
 - Adds a cheap source-stage supply-chain gate that downloads and fully verifies
   the three public Account Bridge archives on Ubuntu before any macOS or
   Windows preflight or native build is allocated. It checks the official
@@ -28,7 +29,8 @@
   Bridge lock 固定值而拒绝继续，fail-fast 取消另外两项构建，没有发布 Release 或资产。
 - 将装配流程与内嵌 runtime 统一绑定到官方 `acosmi/crabcode v1.0.29` 中的 Account
   Bridge `7.2.71-crabcode.9`：固定三平台归档哈希、lock 哈希、生产 Ed25519 信任根、
-  eligibility 信任根，并严格接受 macOS 资产实际携带的 Developer ID 与 Apple 公证证据。
+  eligibility 信任根，并严格接受 macOS 资产实际携带的同团队 Developer ID 与 Apple
+  公证证据，不再要求扩大动态库加载范围的 library-validation 禁用 entitlement。
 - 新增低成本源码阶段供应链门禁：在分配任何 macOS、Windows 预检或原生构建机前，
   先在 Ubuntu 下载并完整验证三个公开 Account Bridge 归档，覆盖官方 checksum 清单、
   归档哈希、仓库 lock 逐字一致、签名 provenance、SBOM、许可证清单、平台签名证据、

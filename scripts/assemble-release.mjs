@@ -451,16 +451,11 @@ function verifyDarwinAccountBridgeCodeSeals(packageDirectory) {
     }
   }
 
-  const helper = join(packageDirectory, 'bin', 'oauthapi-plugin-host')
-  const entitlements = spawnSync('/usr/bin/codesign', ['-d', '--entitlements', '-', helper], {
-    encoding: 'utf8',
-    maxBuffer: 1024 * 1024,
-  })
-  const entitlementOutput = `${entitlements.stdout ?? ''}\n${entitlements.stderr ?? ''}`
-  if (entitlements.status !== 0
-    || !entitlementOutput.includes('com.apple.security.cs.disable-library-validation')) {
-    fail('Account Bridge plugin host lacks its explicit library-validation entitlement')
-  }
+  // The helper and its fixed plugin are Developer ID signed by the same team,
+  // so hardened-runtime library validation accepts the plugin without the
+  // broad disable-library-validation entitlement. The signer equality is
+  // enforced by verifyPackagedArtifact above and re-bound to each on-disk
+  // signature in this loop.
 }
 
 function stageSharp(packageDirectory, platformKey) {
