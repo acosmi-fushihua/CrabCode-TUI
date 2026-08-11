@@ -15,7 +15,10 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { runProcess } from '../../scripts/release-package-smoke.mjs'
+import {
+  runBoundedProcessInventory,
+  runProcess,
+} from '../../scripts/release-package-smoke.mjs'
 
 const fixtureSource = resolve(
   import.meta.dir,
@@ -112,6 +115,71 @@ afterEach(async () => {
 })
 
 describe('release package bounded process runner', () => {
+  test('retries only transient process inventory timeouts', () => {
+    const timeout = {
+      status: null,
+      signal: 'SIGTERM',
+      stdout: '',
+      stderr: '',
+      error: Object.assign(new Error('spawnSync tasklist ETIMEDOUT'), {
+        code: 'ETIMEDOUT',
+      }),
+    }
+    const success = {
+      status: 0,
+      signal: null,
+      stdout: 'inventory',
+      stderr: '',
+    }
+    let calls = 0
+    const result = runBoundedProcessInventory(
+      'tasklist',
+      ['/FO', 'CSV', '/NH'],
+      { timeout: 10_000 },
+      () => {
+        calls += 1
+        return calls === 1 ? timeout : success
+      },
+    )
+
+    expect(result).toBe(success)
+    expect(calls).toBe(2)
+  })
+
+  test('bounds repeated inventory timeouts and does not retry other failures', () => {
+    const timeout = {
+      status: null,
+      signal: 'SIGTERM',
+      stdout: '',
+      stderr: '',
+      error: Object.assign(new Error('spawnSync tasklist ETIMEDOUT'), {
+        code: 'ETIMEDOUT',
+      }),
+    }
+    let timeoutCalls = 0
+    expect(() =>
+      runBoundedProcessInventory(
+        'tasklist',
+        [],
+        { timeout: 10_000 },
+        () => {
+          timeoutCalls += 1
+          return timeout
+        },
+      ),
+    ).toThrow('process inventory failed after bounded retries')
+    expect(timeoutCalls).toBe(3)
+
+    let hardFailureCalls = 0
+    expect(() =>
+      runBoundedProcessInventory('tasklist', [], {}, () => {
+        hardFailureCalls += 1
+        return { status: 1, signal: null, stdout: '', stderr: 'denied' }
+      }),
+    ).toThrow('denied')
+    expect(hardFailureCalls).toBe(1)
+  })
+
   test('accepts a complete contract when a successful descendant keeps stdio open', async () => {
     const pidFile = join(scratch(), 'descendant.pid')
     const started = Date.now()

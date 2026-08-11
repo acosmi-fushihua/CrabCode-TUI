@@ -50,6 +50,26 @@ function spawnFailure(result) {
     .join('; ') || `status=${String(result.status)}`
 }
 
+export function runBoundedProcessInventory(
+  command,
+  args,
+  options,
+  spawnCommand = spawnSync,
+) {
+  const attempts = 3
+  let result
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    result = spawnCommand(command, args, options)
+    if (result.status === 0) return result
+    const timedOut = result.error?.code === 'ETIMEDOUT'
+    if (!timedOut || attempt === attempts) break
+    process.stderr.write(
+      `release package smoke: ${command} inventory timed out; retrying ${attempt + 1}/${attempts}\n`,
+    )
+  }
+  fail(`process inventory failed after bounded retries: ${spawnFailure(result)}`)
+}
+
 export function combinePrimaryAndCleanupFailures(primaryError, cleanupErrors, label) {
   const secondary = cleanupErrors.filter(Boolean)
   if (primaryError) {
@@ -614,12 +634,15 @@ export function parseWindowsTasklistInventory(stdout) {
 function listPackageProcesses(packageRoot) {
   let candidates = []
   if (process.platform === 'win32') {
-    const result = spawnSync('tasklist', ['/FO', 'CSV', '/NH'], {
-      encoding: 'utf8',
-      timeout: 10_000,
-      windowsHide: true,
-    })
-    if (result.status !== 0) fail(`process inventory failed: ${spawnFailure(result)}`)
+    const result = runBoundedProcessInventory(
+      'tasklist',
+      ['/FO', 'CSV', '/NH'],
+      {
+        encoding: 'utf8',
+        timeout: 10_000,
+        windowsHide: true,
+      },
+    )
     // Native tasklist avoids contending with the PowerShell installer. Resolve
     // the executable path only for the handful of package-named candidates so
     // ownership checks remain exact without a full CIM/WMI inventory.
@@ -629,11 +652,14 @@ function listPackageProcesses(packageRoot) {
     // macOS. Pre-filter by the kernel process command, then resolve and
     // canonicalize only package-named candidates below. The final ownership
     // decision still uses the executable realpath inside packageRoot.
-    const result = spawnSync('ps', ['-axo', 'pid=,comm='], {
-      encoding: 'utf8',
-      timeout: 10_000,
-    })
-    if (result.status !== 0) fail(`process inventory failed: ${spawnFailure(result)}`)
+    const result = runBoundedProcessInventory(
+      'ps',
+      ['-axo', 'pid=,comm='],
+      {
+        encoding: 'utf8',
+        timeout: 10_000,
+      },
+    )
     candidates = spawnText(result.stdout)
       .split(/\r?\n/u)
       .flatMap(line => {
