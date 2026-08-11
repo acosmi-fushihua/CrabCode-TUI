@@ -234,11 +234,11 @@ jobs:
             "fn main() {}`n",
             [System.Text.UTF8Encoding]::new($false)
           )
-          & rustc $source '-C' 'debuginfo=0' '-C' 'link-arg=/Brepro' '-o' $output
+          & rustc $source '-C' 'debuginfo=0' '-C' 'strip=symbols' '-C' 'link-arg=/Brepro' '-o' $output
           if ($LASTEXITCODE -ne 0) { throw "first deterministic PE probe link failed: $LASTEXITCODE" }
           Copy-Item -LiteralPath $output -Destination $baseline -Force
           Start-Sleep -Seconds 2
-          & rustc $source '-C' 'debuginfo=0' '-C' 'link-arg=/Brepro' '-o' $output
+          & rustc $source '-C' 'debuginfo=0' '-C' 'strip=symbols' '-C' 'link-arg=/Brepro' '-o' $output
           if ($LASTEXITCODE -ne 0) { throw "second deterministic PE probe link failed: $LASTEXITCODE" }
           $baselineHash = (Get-FileHash -LiteralPath $baseline -Algorithm SHA256).Hash
           $outputHash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash

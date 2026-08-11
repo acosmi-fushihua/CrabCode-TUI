@@ -16,6 +16,7 @@ describe("Windows release recovery quota controls", () => {
     expect(workflow).toContain(
       "CARGO_ENCODED_RUSTFLAGS: -Clink-arg=/Brepro",
     );
+    expect(workflow).toContain("'strip=symbols'");
     expect(workflow).toContain("'link-arg=/Brepro'");
     expect(workflow.indexOf(probe)).toBeGreaterThan(-1);
     expect(workflow.indexOf(nativeBuild)).toBeGreaterThan(-1);
