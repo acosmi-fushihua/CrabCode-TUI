@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <linearGradient id="leftShade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#070b0e" stop-opacity=".99"/>
+      <stop offset=".40" stop-color="#070b0e" stop-opacity=".94"/>
+      <stop offset=".58" stop-color="#070b0e" stop-opacity=".66"/>
+      <stop offset=".76" stop-color="#070b0e" stop-opacity=".10"/>
+      <stop offset="1" stop-color="#070b0e" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="edgeShade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#05080a" stop-opacity=".42"/>
+      <stop offset=".58" stop-color="#05080a" stop-opacity="0"/>
+      <stop offset="1" stop-color="#05080a" stop-opacity=".78"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#35d8ff"/>
+      <stop offset="1" stop-color="#ff774f"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="10" flood-color="#000" flood-opacity=".45"/>
+    </filter>
+    <style>
+      .sans { font-family: "Hiragino Sans GB", "PingFang SC", "Helvetica Neue", Arial, sans-serif; }
+      .mono { font-family: "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace; }
+      .cn { fill:#f4f7f8; font-weight:600; }
+      .en { fill:#8fa3ad; font-weight:500; letter-spacing:1.3px; }
+      .card { fill:#0b1216; fill-opacity:.80; stroke:#97bdc9; stroke-opacity:.22; }
+    </style>
+  </defs>
+
+  <image x="0" y="0" width="1600" height="900" preserveAspectRatio="xMidYMid slice" xlink:href="crabcode-tui-x-poster-bg.png"/>
+  <rect width="1600" height="900" fill="url(#leftShade)"/>
+  <rect width="1600" height="900" fill="url(#edgeShade)"/>
+  <rect width="1600" height="8" fill="url(#accent)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="43" width="640" height="204" rx="24" fill="#fdf6ed" stroke="#ff774f" stroke-opacity=".45"/>
+    <rect x="70" y="43" width="640" height="5" rx="2.5" fill="url(#accent)"/>
+    <image x="88" y="65" width="190" height="129" preserveAspectRatio="xMidYMid meet" xlink:href="crab-code-logo-icon.png"/>
+    <line x1="301" y1="70" x2="301" y2="220" stroke="#8d3022" stroke-opacity=".18"/>
+    <image x="323" y="76" width="355" height="77" preserveAspectRatio="xMidYMid meet" xlink:href="crab-code-logo-wordmark.png"/>
+    <g transform="translate(323 173)">
+      <rect width="58" height="31" rx="9" fill="#ff5c43"/>
+      <text x="29" y="22" text-anchor="middle" class="mono" fill="#3f140f" font-size="15" font-weight="900">TUI</text>
+      <circle cx="81" cy="15.5" r="4.5" fill="#18bfdc"/>
+      <text x="96" y="21" class="mono" fill="#62251d" font-size="13" font-weight="800" letter-spacing="1.15">纯终端 · OPEN SOURCE</text>
+    </g>
+  </g>
+
+  <text x="78" y="290" class="sans cn" font-size="29" letter-spacing=".4">面向终端的开源编码智能体</text>
+  <text x="80" y="319" class="mono en" font-size="13.5">AN OPEN-SOURCE, TERMINAL-FIRST AI CODING AGENT</text>
+
+  <g transform="translate(80 333)">
+    <rect width="34" height="3" rx="1.5" fill="#35d8ff"/>
+    <rect x="39" width="12" height="3" rx="1.5" fill="#ff774f"/>
+    <text y="30" class="mono" fill="#d7e4e9" font-size="14" font-weight="700" letter-spacing="1.7">核心能力 / CAPABILITIES</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <g transform="translate(78 382)">
+      <rect class="card" width="294" height="88" rx="12"/>
+      <text x="18" y="25" class="mono" fill="#35d8ff" font-size="12" font-weight="700">01</text>
+      <text x="18" y="52" class="sans cn" font-size="21">理解整个代码库</text>
+      <text x="18" y="73" class="mono en" font-size="11.5">UNDERSTAND YOUR CODEBASE</text>
+    </g>
+    <g transform="translate(388 382)">
+      <rect class="card" width="320" height="88" rx="12"/>
+      <text x="18" y="25" class="mono" fill="#ff774f" font-size="12" font-weight="700">02</text>
+      <text x="18" y="52" class="sans cn" font-size="21">编辑文件 · 执行命令</text>
+      <text x="18" y="73" class="mono en" font-size="11.5">EDIT FILES · RUN COMMANDS</text>
+    </g>
+    <g transform="translate(78 484)">
+      <rect class="card" width="294" height="88" rx="12"/>
+      <text x="18" y="25" class="mono" fill="#35d8ff" font-size="12" font-weight="700">03</text>
+      <text x="18" y="52" class="sans cn" font-size="21">联网搜索 · 深度研究</text>
+      <text x="18" y="73" class="mono en" font-size="11.5">WEB SEARCH · DEEP RESEARCH</text>
+    </g>
+    <g transform="translate(388 484)">
+      <rect class="card" width="320" height="88" rx="12"/>
+      <text x="18" y="25" class="mono" fill="#ff774f" font-size="12" font-weight="700">04</text>
+      <text x="18" y="52" class="sans cn" font-size="21">多智能体并行</text>
+      <text x="18" y="73" class="mono en" font-size="11.5">PARALLEL SUBAGENTS</text>
+    </g>
+    <g transform="translate(78 586)">
+      <rect class="card" width="294" height="88" rx="12"/>
+      <text x="18" y="25" class="mono" fill="#35d8ff" font-size="12" font-weight="700">05</text>
+      <text x="18" y="52" class="sans cn" font-size="21">技能 · 插件 · MCP</text>
+      <text x="18" y="73" class="mono en" font-size="11.5">SKILLS · PLUGINS · MCP</text>
+    </g>
+    <g transform="translate(388 586)">
+      <rect class="card" width="320" height="88" rx="12"/>
+      <text x="18" y="25" class="mono" fill="#ff774f" font-size="12" font-weight="700">06</text>
+      <text x="18" y="52" class="sans cn" font-size="21">TUI · 无头模式 · ACP</text>
+      <text x="18" y="73" class="mono en" font-size="11.5">TUI · HEADLESS · ACP</text>
+    </g>
+  </g>
+
+  <text x="79" y="736" class="sans" fill="#f4f7f8" font-size="24" font-weight="600">从理解到交付，不离开你的终端。</text>
+  <text x="80" y="766" class="mono" fill="#8fa3ad" font-size="12.5" font-weight="600" letter-spacing="1.1">FROM CONTEXT TO CODE — WITHOUT LEAVING YOUR TERMINAL.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="842" y="427" width="682" height="364" rx="22" fill="#071014" fill-opacity=".94" stroke="#87b8c6" stroke-opacity=".38"/>
+    <rect x="842" y="427" width="682" height="5" rx="2.5" fill="url(#accent)"/>
+    <path d="M1492 454h-30M1492 454v30" fill="none" stroke="#ff774f" stroke-width="2"/>
+    <circle cx="880" cy="457" r="5" fill="#35d8ff"/>
+    <text x="895" y="462" class="mono" fill="#d8f8ff" font-size="13" font-weight="700" letter-spacing="1.5">注册即送 / SIGN-UP BONUS</text>
+    <text x="872" y="574" class="sans" fill="#ff774f" font-size="104" font-weight="900" letter-spacing="-5">6</text>
+    <text x="954" y="522" class="sans" fill="#f7fafb" font-size="29" font-weight="700">个月 GO 订阅会员</text>
+    <text x="957" y="551" class="mono" fill="#9db0b8" font-size="13" font-weight="700" letter-spacing="1.25">MONTHS OF GO MEMBERSHIP</text>
+    <g transform="translate(872 592)">
+      <rect width="620" height="52" rx="11" fill="#0c2229" stroke="#35d8ff" stroke-opacity=".55"/>
+      <circle cx="22" cy="26" r="6" fill="#35d8ff"/>
+      <text x="40" y="24" class="sans" fill="#effcff" font-size="19" font-weight="700">DeepSeek 模型免费用</text>
+      <text x="40" y="42" class="mono" fill="#65ddf7" font-size="10.5" font-weight="700" letter-spacing="1.25">DEEPSEEK MODELS · FREE</text>
+      <text x="590" y="34" text-anchor="end" class="mono" fill="#35d8ff" font-size="22" font-weight="900">¥0</text>
+    </g>
+    <g transform="translate(874 672)">
+      <rect width="4" height="41" rx="2" fill="#ff774f"/>
+      <text x="18" y="17" class="sans" fill="#f2f6f7" font-size="17" font-weight="700">更高订阅支持 Kimi-3 · Qwen-3.8</text>
+      <text x="18" y="38" class="mono" fill="#93a8b0" font-size="10.5" font-weight="700" letter-spacing="1.1">HIGHER TIERS UNLOCK KIMI-3 + QWEN-3.8</text>
+    </g>
+    <g transform="translate(874 733)">
+      <rect width="4" height="41" rx="2" fill="#35d8ff"/>
+      <text x="18" y="17" class="sans" fill="#f2f6f7" font-size="17" font-weight="700">Claude · OpenAI · xAI 订阅账户 OAuth 接入</text>
+      <text x="18" y="38" class="mono" fill="#93a8b0" font-size="10.5" font-weight="700" letter-spacing="1.05">CONNECT SUBSCRIPTION ACCOUNTS VIA OAUTH</text>
+    </g>
+  </g>
+
+  <g transform="translate(80 826)">
+    <line x2="1440" stroke="#b1ccd5" stroke-opacity=".20"/>
+    <text y="34" class="mono" fill="#b7c8ce" font-size="12.5" font-weight="700" letter-spacing="1.35">RUST · TYPESCRIPT · GO · MIT LICENSE</text>
+    <text x="1440" y="20" text-anchor="end" class="mono" fill="#87a0aa" font-size="10.5" font-weight="700" letter-spacing="1.4">开源地址 / OPEN SOURCE REPOSITORY</text>
+    <text x="1440" y="43" text-anchor="end" class="mono" fill="#46dcfa" font-size="15" font-weight="800" letter-spacing=".6">github.com/acosmi/CrabCode-TUI</text>
+  </g>
+  <g transform="translate(1420 78)">
+    <path d="M0 0h72v72" fill="none" stroke="#35d8ff" stroke-width="2" stroke-opacity=".75"/>
+    <path d="M72 0v18M72 0H54" fill="none" stroke="#ff774f" stroke-width="5"/>
+  </g>
+</svg>

@@ -20,7 +20,7 @@ env:
   CRABCODE_BUILD_MINIFY: '1'
   ACCOUNT_BRIDGE_ELIGIBILITY_PUBLIC_KEY_BASE64URL: loXs2jEP4Spq1FRzy0dnU6qm9o6eELAuhJ7AdNw1SVE
   ACCOUNT_BRIDGE_CONNECTOR_POLICY_PUBLIC_KEY_BASE64URL: 1rLNPsLwBefJ_7pKyv-49onlWjUZlGn6TPDnI21QcIg
-  ACCOUNT_BRIDGE_ARTIFACT_PUBLIC_KEY_BASE64URL: NDtaDCEQQYvWQyxnaJuFCuEvG5lBMFtBKwQxdZwXBCE
+  ACCOUNT_BRIDGE_ARTIFACT_PUBLIC_KEY_BASE64URL: 15MaLfvECwoagY8Oehclhk5nqsngGq0ECrKkRwOxDAQ
   ACCOUNT_BRIDGE_CONTROL_PLANE_ENDPOINT: https://acosmi.com/api/v4/account-bridge/control-plane/v2
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
     name: Verify tagged pure-TUI source
     if: github.repository == 'acosmi/CrabCode-TUI'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     outputs:
       version: ${{ steps.identity.outputs.version }}
       build_id: ${{ steps.identity.outputs.build_id }}
@@ -64,6 +64,12 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install exact JavaScript dependency graph
+        run: bun install --frozen-lockfile
+
+      - name: Verify signed Account Bridge inputs before native allocation
+        run: bun scripts/verify-release-account-bridge.mjs
 
       - name: Bind tag, version, commit, and changelog
         id: identity

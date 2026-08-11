@@ -27,6 +27,10 @@ import {
   defaultBunRelease,
   x64DarwinBunRelease,
 } from './release-bun-pins.mjs'
+import {
+  accountBridgeReleaseAssetUrl,
+  accountBridgeReleasePins,
+} from './release-account-bridge-pins.mjs'
 import { comparePortablePaths } from './release-path-order.mjs'
 import {
   verifyTuiRuntimeArtifactBinding,
@@ -38,10 +42,6 @@ const repositoryRoot = resolve(import.meta.dir, '..')
 const sourceRepository = 'https://github.com/acosmi/CrabCode-TUI'
 const ripgrepVersion = '14.1.1'
 const browserVersion = '0.28.0'
-// The signed Go Account Bridge component has an independent release lineage.
-const accountBridgeRelease = 'account-bridge-v7.2.71-crabcode.5.1'
-const accountBridgeArtifactKey = 'NDtaDCEQQYvWQyxnaJuFCuEvG5lBMFtBKwQxdZwXBCE'
-const accountBridgeLockSha256 = '449fa63b0d3a276a99250b2e2158d8f5769b86571388475e8c88e72858e20c85'
 const maximumDownloadBytes = 300 * 1024 * 1024
 const maximumExpandedZipBytes = 600 * 1024 * 1024
 
@@ -58,8 +58,6 @@ const platforms = Object.freeze({
     ripgrepSha256: '24ad76777745fbff131c8fbc466742b011f925bfa4fffa2ded6def23b5b937be',
     browserAsset: 'crabcode-browser-darwin-arm64',
     browserSha256: '0d84ab3253c63c25566e3c8998bbd205507c66dbf5e5108f1b359419f9d9b369',
-    accountBridgeAsset: 'oauthapi-llm-arm64-darwin.zip',
-    accountBridgeSha256: 'a12ae08ef75b2425638348f21a59ce618620c01cc867e6746e5e3e7f8b257168',
     sharpKey: 'arm64-darwin',
   },
   'x64-darwin': {
@@ -79,8 +77,6 @@ const platforms = Object.freeze({
     ripgrepSha256: 'fc87e78f7cb3fea12d69072e7ef3b21509754717b746368fd40d88963630e2b3',
     browserAsset: 'crabcode-browser-darwin-x64',
     browserSha256: '142cc952dccccdcd585c5e1d16468c98120f055aafb70c3cf20a6138122e7093',
-    accountBridgeAsset: 'oauthapi-llm-x64-darwin.zip',
-    accountBridgeSha256: 'd8c6c76556d91d3d147b5c754266f25437d9ef061c540a9eca783675a38f7311',
     sharpKey: 'x64-darwin',
   },
   'arm64-linux': {
@@ -95,8 +91,6 @@ const platforms = Object.freeze({
     ripgrepSha256: 'c827481c4ff4ea10c9dc7a4022c8de5db34a5737cb74484d62eb94a95841ab2f',
     browserAsset: 'crabcode-browser-linux-arm64',
     browserSha256: '2352cb7ca456d0e59fb278db142f823be1ae5fd19b8ad602b9bc2ff03e5e21a0',
-    accountBridgeAsset: 'oauthapi-llm-arm64-linux.zip',
-    accountBridgeSha256: '9619eb4f3475f58573827113c034f3281d35ee861f51b6384ea4c6e734269f66',
     sharpKey: 'arm64-linux',
   },
   'x64-linux': {
@@ -111,8 +105,6 @@ const platforms = Object.freeze({
     ripgrepSha256: '4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e',
     browserAsset: 'crabcode-browser-linux-x64',
     browserSha256: '3fc7b6734dc161ef37efe8201518de08cb51bcef423802f114ff0b895bdb2899',
-    accountBridgeAsset: 'oauthapi-llm-x64-linux.zip',
-    accountBridgeSha256: '7c961d670c1c03d6d3ca32f1cd132747b84b72fdd739800f537970510794008b',
     sharpKey: 'x64-linux',
   },
   'x64-win32': {
@@ -127,8 +119,6 @@ const platforms = Object.freeze({
     ripgrepSha256: 'd0f534024c42afd6cb4d38907c25cd2b249b79bbe6cc1dbee8e3e37c2b6e25a1',
     browserAsset: 'crabcode-browser-win32-x64.exe',
     browserSha256: 'e011561bb9f391cacb18a028a6763c5b469cebbf367bd6f81ec65df19a24bff0',
-    accountBridgeAsset: 'oauthapi-llm-x64-win32.zip',
-    accountBridgeSha256: 'cdaa2c55009513e7646bea793e58ac1cbccf51991a8c572df20fe1d2ca3e8ec5',
     sharpKey: 'x64-win32',
   },
 })
@@ -397,47 +387,69 @@ function stageAccountBridge(archive, packageDirectory, platformToken) {
 function verifyDarwinAccountBridgeCodeSeals(packageDirectory) {
   if (process.platform !== 'darwin') fail('Darwin Account Bridge seals must be checked on macOS')
   const metadataDirectory = join(packageDirectory, 'bin', 'account-bridge')
-  if (existsSync(join(metadataDirectory, 'notarization.json'))) {
-    fail('ad-hoc Account Bridge must not carry a false notarization claim')
+  const notarizationPath = join(metadataDirectory, 'notarization.json')
+  const notarization = jsonFile(notarizationPath)
+  const notarizationSha256 = sha256File(notarizationPath)
+  const provenance = jsonFile(join(metadataDirectory, 'provenance.json'))
+  const entries = [
+    {
+      relativePath: 'bin/oauthapi-llm',
+      path: join(packageDirectory, 'bin', 'oauthapi-llm'),
+      signature: provenance.platformSignature,
+    },
+    {
+      relativePath: 'bin/oauthapi-plugin-host',
+      path: join(packageDirectory, 'bin', 'oauthapi-plugin-host'),
+      signature: provenance.runtimeHelpers?.[0]?.platformSignature,
+    },
+    {
+      relativePath: 'plugins/gemini-cli.dylib',
+      path: join(metadataDirectory, 'plugins', 'gemini-cli.dylib'),
+      signature: provenance.fixedPlugins?.[0]?.platformSignature,
+    },
+  ]
+  const expectedArtifacts = entries.map(entry => ({
+    path: entry.relativePath,
+    sha256: sha256File(entry.path),
+  }))
+  if (JSON.stringify(Object.keys(notarization).sort()) !==
+      JSON.stringify(['artifacts', 'schemaVersion', 'status', 'submissionId'])
+    || notarization.schemaVersion !== 1 || notarization.status !== 'Accepted'
+    || typeof notarization.submissionId !== 'string'
+    || !/^[0-9a-f-]{36}$/iu.test(notarization.submissionId)
+    || JSON.stringify(notarization.artifacts) !== JSON.stringify(expectedArtifacts)) {
+    fail('Account Bridge notarization evidence does not bind all three signed artifacts')
   }
-  const evidence = jsonFile(join(metadataDirectory, 'codesign-evidence.json'))
-  if (evidence.schemaVersion !== 1 || evidence.scheme !== 'apple-ad-hoc'
-    || evidence.authenticity !== 'ed25519-provenance' || evidence.notarization !== 'not-applicable'
-    || !Array.isArray(evidence.artifacts) || evidence.artifacts.length !== 3) {
-    fail('Account Bridge code-seal evidence has an invalid shape')
-  }
-  const paths = new Map([
-    ['bin/oauthapi-llm', join(packageDirectory, 'bin', 'oauthapi-llm')],
-    ['bin/oauthapi-plugin-host', join(packageDirectory, 'bin', 'oauthapi-plugin-host')],
-    ['plugins/gemini-cli.dylib', join(metadataDirectory, 'plugins', 'gemini-cli.dylib')],
-  ])
-  for (const artifact of evidence.artifacts) {
-    const path = paths.get(artifact.path)
-    if (!path || typeof artifact.codeDirectorySha256 !== 'string'
-      || !/^[a-f0-9]{64}$/u.test(artifact.codeDirectorySha256)) {
-      fail('Account Bridge code-seal evidence names an unexpected artifact')
+  for (const entry of entries) {
+    const signature = entry.signature
+    if (!signature || JSON.stringify(Object.keys(signature).sort()) !==
+        JSON.stringify(['detachedSignature', 'notarizationEvidenceSha256', 'scheme', 'signerIdSha256'])
+      || signature.scheme !== 'apple-developer-id' || signature.detachedSignature !== null
+      || typeof signature.signerIdSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(signature.signerIdSha256)
+      || signature.notarizationEvidenceSha256 !== notarizationSha256) {
+      fail(`Account Bridge Developer ID evidence is invalid for ${entry.relativePath}`)
     }
-    const verified = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--verbose=4', path], {
+    const verified = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--verbose=4', entry.path], {
       encoding: 'utf8',
       maxBuffer: 4 * 1024 * 1024,
     })
     if (verified.status !== 0) {
-      fail(`Account Bridge code seal is invalid for ${artifact.path}: ${verified.stderr}`)
+      fail(`Account Bridge code signature is invalid for ${entry.relativePath}: ${verified.stderr}`)
     }
-    const displayed = spawnSync('/usr/bin/codesign', ['-dvvv', path], {
+    const displayed = spawnSync('/usr/bin/codesign', ['-d', '--verbose=4', entry.path], {
       encoding: 'utf8',
       maxBuffer: 4 * 1024 * 1024,
     })
     const details = `${displayed.stdout ?? ''}\n${displayed.stderr ?? ''}`
-    const codeDirectory = details.match(/CandidateCDHashFull sha256=([a-f0-9]{64})/u)?.[1]
-    if (displayed.status !== 0 || !/Signature=adhoc/u.test(details)
-      || !/flags=0x[0-9a-f]+\(adhoc,runtime\)/u.test(details)
-      || codeDirectory !== artifact.codeDirectorySha256) {
-      fail(`Account Bridge code-seal identity differs for ${artifact.path}`)
+    const authority = details.match(/^Authority=(Developer ID Application:.+)$/mu)?.[1]?.trim()
+    const teamId = details.match(/^TeamIdentifier=(.+)$/mu)?.[1]?.trim()
+    const signerIdSha256 = authority && teamId
+      ? sha256Bytes(Buffer.from(`${teamId}\n${authority}`))
+      : null
+    if (displayed.status !== 0 || signerIdSha256 !== signature.signerIdSha256) {
+      fail(`Account Bridge Developer ID signer differs for ${entry.relativePath}`)
     }
-    paths.delete(artifact.path)
   }
-  if (paths.size !== 0) fail('Account Bridge code-seal evidence is incomplete')
 
   const helper = join(packageDirectory, 'bin', 'oauthapi-plugin-host')
   const entitlements = spawnSync('/usr/bin/codesign', ['-d', '--entitlements', '-', helper], {
@@ -747,7 +759,7 @@ function verifyPackageContract(packageDirectory, platformToken, version) {
     version,
     buildId,
   }, {
-    accountBridgeArtifactPublicKeyBase64url: accountBridgeArtifactKey,
+    accountBridgeArtifactPublicKeyBase64url: accountBridgeReleasePins.artifactPublicKeyBase64URL,
   })
   verifyTuiRuntimeArtifactBinding(
     join(packageDirectory, 'dist/tui-runtime/index.js'),
@@ -879,11 +891,19 @@ async function main() {
     .split(/\r?\n/u)
     .filter(Boolean)
   if (!tags.includes(expectedTag)) fail(`release source commit is not tagged ${expectedTag}`)
-  if (sha256File(join(repositoryRoot, 'components/oauthapi-llm/UPSTREAM.lock')) !== accountBridgeLockSha256) {
+  if (sha256File(join(repositoryRoot, 'components/oauthapi-llm/UPSTREAM.lock')) !== accountBridgeReleasePins.upstreamLockSha256) {
     fail('Account Bridge UPSTREAM.lock differs from the signed component release')
+  }
+  for (const [name, expected] of [
+    ['ACCOUNT_BRIDGE_ARTIFACT_PUBLIC_KEY_BASE64URL', accountBridgeReleasePins.artifactPublicKeyBase64URL],
+    ['ACCOUNT_BRIDGE_ELIGIBILITY_PUBLIC_KEY_BASE64URL', accountBridgeReleasePins.eligibilityPublicKeyBase64URL],
+  ]) {
+    if (process.env[name] !== expected) fail(`${name} differs from the signed Account Bridge release`)
   }
 
   const info = platforms[args.platform]
+  const accountBridgePin = accountBridgeReleasePins.platforms[args.platform]
+  if (!accountBridgePin) fail(`Account Bridge release has no ${args.platform} asset pin`)
   const bunRelease = bunReleaseForPlatform(args.platform)
   const bunVersion = info.bunVersion ?? defaultBunRelease.version
   if (bunVersion !== bunRelease.version) {
@@ -919,7 +939,7 @@ async function main() {
     version: args.version,
     buildId,
   }, {
-    accountBridgeArtifactPublicKeyBase64url: accountBridgeArtifactKey,
+    accountBridgeArtifactPublicKeyBase64url: accountBridgeReleasePins.artifactPublicKeyBase64URL,
   })
   verifyTuiRuntimeSourceBinding(repositoryRoot, sourceRuntimeMetafile)
   verifyTuiRuntimeArtifactBinding(
@@ -942,12 +962,12 @@ async function main() {
   }
   const ripgrepUrl = `https://github.com/BurntSushi/ripgrep/releases/download/${ripgrepVersion}/${info.ripgrepAsset}`
   const browserUrl = `https://github.com/acosmi/agent-browser/releases/download/v${browserVersion}/${info.browserAsset}`
-  const accountBridgeUrl = `https://github.com/acosmi/crabcode/releases/download/${accountBridgeRelease}/${info.accountBridgeAsset}`
+  const accountBridgeUrl = accountBridgeReleaseAssetUrl(accountBridgePin.asset)
   const [bunArchive, ripgrepArchive, browserBinary, accountBridgeArchive] = await Promise.all([
     downloadPinned(cacheDirectory, info.bunAsset, bunUrl, info.bunSha256),
     downloadPinned(cacheDirectory, info.ripgrepAsset, ripgrepUrl, info.ripgrepSha256),
     downloadPinned(cacheDirectory, info.browserAsset, browserUrl, info.browserSha256),
-    downloadPinned(cacheDirectory, info.accountBridgeAsset, accountBridgeUrl, info.accountBridgeSha256),
+    downloadPinned(cacheDirectory, accountBridgePin.asset, accountBridgeUrl, accountBridgePin.sha256),
   ])
 
   const bunName = `bun${extension}`
@@ -1009,7 +1029,8 @@ async function main() {
     expectedComponentVersion: bridgeLock.componentVersion,
     expectedPlatform: args.platform,
     expectedProtocolVersion: bridgeLock.protocolVersion,
-    artifactPublicKeyBase64URL: accountBridgeArtifactKey,
+    artifactPublicKeyBase64URL: accountBridgeReleasePins.artifactPublicKeyBase64URL,
+    eligibilityPublicKeyBase64URL: accountBridgeReleasePins.eligibilityPublicKeyBase64URL,
   })
   if (args.platform.endsWith('darwin')) verifyDarwinAccountBridgeCodeSeals(packageDirectory)
 
@@ -1032,7 +1053,7 @@ async function main() {
         componentVersion: bridgeLock.componentVersion,
         protocolVersion: bridgeLock.protocolVersion,
         url: accountBridgeUrl,
-        sha256: info.accountBridgeSha256,
+        sha256: accountBridgePin.sha256,
         provenanceSha256: sha256File(join(packageDirectory, 'bin/account-bridge/provenance.json')),
         signatureVerified: true,
         platformSignature: verifiedBridge.platformSignature ?? null,

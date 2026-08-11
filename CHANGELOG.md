@@ -1,5 +1,44 @@
 # Changelog / 更新日志
 
+## v1.0.32 — 2026-08-11
+
+- Forward-fixes the failed, unpublished `v1.0.31` tag without moving,
+  deleting, or rerunning it. Its signed-source and both native preflights
+  passed; arm64 macOS then completed the native build before assembly rejected
+  a stale Account Bridge lock pin, fail-fast cancelled the other two builds,
+  and no Release or asset was published.
+- Binds assembly and the embedded runtime to the official `acosmi/crabcode`
+  `v1.0.29` Account Bridge `7.2.71-crabcode.9` assets, exact archive and lock
+  hashes, production Ed25519 trust root, eligibility trust root, and the
+  Developer ID plus Apple notarization evidence actually carried by macOS.
+- Adds a cheap source-stage supply-chain gate that downloads and fully verifies
+  the three public Account Bridge archives on Ubuntu before any macOS or
+  Windows preflight or native build is allocated. It checks the official
+  checksum manifest, archive hashes, exact repository lock, signed provenance,
+  SBOM, license inventory, platform evidence, component version, and protocol.
+- Archives the local CrabCode TUI logo and social-poster source/export set under
+  `.github/assets/social/`; these repository-only materials are excluded from
+  the compiled release closure.
+- Public release scope remains macOS arm64, macOS x64, and Windows x64 only.
+
+---
+
+- 对失败且未公开的 `v1.0.31` 标签执行前滚修复，不移动、不删除、不重跑。其签名
+  源码与两项原生预检均已通过；macOS arm64 完成原生构建后，装配因过期的 Account
+  Bridge lock 固定值而拒绝继续，fail-fast 取消另外两项构建，没有发布 Release 或资产。
+- 将装配流程与内嵌 runtime 统一绑定到官方 `acosmi/crabcode v1.0.29` 中的 Account
+  Bridge `7.2.71-crabcode.9`：固定三平台归档哈希、lock 哈希、生产 Ed25519 信任根、
+  eligibility 信任根，并严格接受 macOS 资产实际携带的 Developer ID 与 Apple 公证证据。
+- 新增低成本源码阶段供应链门禁：在分配任何 macOS、Windows 预检或原生构建机前，
+  先在 Ubuntu 下载并完整验证三个公开 Account Bridge 归档，覆盖官方 checksum 清单、
+  归档哈希、仓库 lock 逐字一致、签名 provenance、SBOM、许可证清单、平台签名证据、
+  组件版本和协议版本。静态漂移不再等到原生编译完成后才暴露。
+- 将本地 CrabCode TUI 标识与社媒海报的源文件、导出文件归档到
+  `.github/assets/social/`；这些仅供仓库使用的素材不会进入编译发布闭包。
+- 公开发布范围不变：仍仅提供 macOS arm64、macOS x64 与 Windows x64。
+
+---
+
 ## v1.0.31 — 2026-08-11
 
 - Forward-fixes the failed, unpublished `v1.0.30` tag without moving,

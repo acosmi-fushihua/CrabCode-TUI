@@ -2764,7 +2764,9 @@ export async function verifyPackagedArtifact(input: {
   artifactPublicKeyBase64URL: string;
   eligibilityPublicKeyBase64URL: string;
 }): Promise<AccountBridgeArtifact> {
-  const binaryName = process.platform === "win32" ? "oauthapi-llm.exe" : "oauthapi-llm";
+  const binaryName = input.expectedPlatform.endsWith("win32")
+    ? "oauthapi-llm.exe"
+    : "oauthapi-llm";
   if (basename(input.binaryPath) !== binaryName) {
     throw new AccountBridgeError("artifact-layout-invalid");
   }
@@ -2802,7 +2804,7 @@ export async function verifyPackagedArtifact(input: {
     await packagedFileMustExist(join(input.metadataDir, name));
   }
   const platformEvidenceName = input.expectedPlatform.endsWith("darwin")
-    ? "codesign-evidence.json"
+    ? "notarization.json"
     : input.expectedPlatform.endsWith("linux")
       ? "binary.minisig"
       : null;
@@ -2846,9 +2848,6 @@ export async function verifyPackagedArtifact(input: {
       input.artifactPublicKeyBase64URL,
       32,
     );
-    const artifactPublicKeySha256 = createHash("sha256")
-      .update(artifactPublicKey)
-      .digest("hex");
     try {
       const publicKey = createPublicKey({
         key: Buffer.concat([
@@ -3095,6 +3094,8 @@ export async function verifyPackagedArtifact(input: {
       provenance.build.cgoEnabled !== false ||
       provenance.build.trimpath !== true ||
       provenance.build.buildvcs !== false ||
+      provenance.build.sourceMode !== "git-archive" ||
+      provenance.build.releaseState !== "signed" ||
       provenance.build.eligibilityTrustRootSha256 !==
         createHash("sha256")
           .update(Buffer.from(input.eligibilityPublicKeyBase64URL, "base64url"))
@@ -3109,9 +3110,8 @@ export async function verifyPackagedArtifact(input: {
       throw new AccountBridgeError("provenance-invalid");
     }
     const platformSignature = provenance.platformSignature;
-    const expectedSignatureScheme = input.expectedPlatform.endsWith("darwin")
-      ? "apple-ad-hoc"
-      : "minisign";
+    const darwinSigned = input.expectedPlatform.endsWith("darwin");
+    const expectedSignatureScheme = darwinSigned ? "apple-developer-id" : "minisign";
     if (windowsUnsigned) {
       if (platformSignature !== null) {
         throw new AccountBridgeError("platform-signature-evidence-invalid");
@@ -3122,35 +3122,31 @@ export async function verifyPackagedArtifact(input: {
     ) {
       throw new AccountBridgeError("platform-signature-evidence-invalid");
     }
-    if (!windowsUnsigned && expectedSignatureScheme === "apple-ad-hoc") {
+    if (!windowsUnsigned && darwinSigned) {
       if (!isRecord(platformSignature)) {
         throw new AccountBridgeError("platform-signature-evidence-invalid");
       }
-      const isAdHocSeal = (value: unknown): value is Record<string, unknown> =>
+      const isDeveloperIdSignature = (
+        value: unknown,
+      ): value is Record<string, unknown> =>
         isRecord(value) &&
         JSON.stringify(Object.keys(value).sort()) ===
           JSON.stringify([
-            "codeDirectorySha256",
             "detachedSignature",
-            "provenanceKeySha256",
+            "notarizationEvidenceSha256",
             "scheme",
-            "sealEvidenceSha256",
+            "signerIdSha256",
           ]) &&
         value.scheme === expectedSignatureScheme &&
         value.detachedSignature === null &&
-        value.provenanceKeySha256 === artifactPublicKeySha256 &&
-        typeof value.codeDirectorySha256 === "string" &&
-        /^[a-f0-9]{64}$/.test(value.codeDirectorySha256) &&
-        typeof value.sealEvidenceSha256 === "string" &&
-        /^[a-f0-9]{64}$/.test(value.sealEvidenceSha256);
-      if (!isAdHocSeal(platformSignature)) {
+        typeof value.signerIdSha256 === "string" &&
+        /^[a-f0-9]{64}$/.test(value.signerIdSha256) &&
+        typeof value.notarizationEvidenceSha256 === "string" &&
+        /^[a-f0-9]{64}$/.test(value.notarizationEvidenceSha256);
+      if (!isDeveloperIdSignature(platformSignature)) {
         throw new AccountBridgeError("platform-signature-evidence-invalid");
       }
 
-      // Authenticity comes from the release-scoped Ed25519 provenance key.
-      // The ad-hoc hardened-runtime code seals make all three Mach-O files
-      // loadable and integrity-checkable without claiming Developer ID or
-      // notarization that the component does not possess.
       const helperPath = join(dirname(input.binaryPath), "oauthapi-plugin-host");
       await packagedFileMustExist(helperPath);
       const helperDigest = await sha256File(helperPath);
@@ -3163,71 +3159,64 @@ export async function verifyPackagedArtifact(input: {
         runtimeHelper.id !== "plugin-host" ||
         runtimeHelper.path !== "bin/oauthapi-plugin-host" ||
         runtimeHelper.sha256 !== helperDigest ||
-        !isAdHocSeal(runtimeHelper.platformSignature) ||
-        runtimeHelper.platformSignature.sealEvidenceSha256 !==
-          platformSignature.sealEvidenceSha256
+        !isDeveloperIdSignature(runtimeHelper.platformSignature) ||
+        runtimeHelper.platformSignature.signerIdSha256 !==
+          platformSignature.signerIdSha256 ||
+        runtimeHelper.platformSignature.notarizationEvidenceSha256 !==
+          platformSignature.notarizationEvidenceSha256
       ) {
         throw new AccountBridgeError("platform-signature-evidence-invalid");
       }
       const pluginEntry: unknown = provenance.fixedPlugins[0];
       if (
         !isRecord(pluginEntry) ||
-        !isAdHocSeal(pluginEntry.platformSignature) ||
-        pluginEntry.platformSignature.sealEvidenceSha256 !==
-          platformSignature.sealEvidenceSha256
+        !isDeveloperIdSignature(pluginEntry.platformSignature) ||
+        pluginEntry.platformSignature.signerIdSha256 !==
+          platformSignature.signerIdSha256 ||
+        pluginEntry.platformSignature.notarizationEvidenceSha256 !==
+          platformSignature.notarizationEvidenceSha256
       ) {
         throw new AccountBridgeError("platform-signature-evidence-invalid");
       }
-      const sealEvidencePath = join(input.metadataDir, "codesign-evidence.json");
-      const sealEvidenceRaw = await fs.readFile(sealEvidencePath);
+      const notarizationPath = join(input.metadataDir, "notarization.json");
+      const notarizationRaw = await fs.readFile(notarizationPath);
       try {
-        const sealEvidence = JSON.parse(sealEvidenceRaw.toString("utf8")) as unknown;
+        const notarization = JSON.parse(notarizationRaw.toString("utf8")) as unknown;
         if (
-          platformSignature.sealEvidenceSha256 !==
-            createHash("sha256").update(sealEvidenceRaw).digest("hex") ||
-          !isRecord(sealEvidence) ||
-          JSON.stringify(Object.keys(sealEvidence).sort()) !==
+          platformSignature.notarizationEvidenceSha256 !==
+            createHash("sha256").update(notarizationRaw).digest("hex") ||
+          !isRecord(notarization) ||
+          JSON.stringify(Object.keys(notarization).sort()) !==
             JSON.stringify([
               "artifacts",
-              "authenticity",
-              "notarization",
-              "provenanceKeySha256",
               "schemaVersion",
-              "scheme",
+              "status",
+              "submissionId",
             ]) ||
-          sealEvidence.schemaVersion !== 1 ||
-          sealEvidence.scheme !== expectedSignatureScheme ||
-          sealEvidence.authenticity !== "ed25519-provenance" ||
-          sealEvidence.provenanceKeySha256 !== artifactPublicKeySha256 ||
-          sealEvidence.notarization !== "not-applicable" ||
-          JSON.stringify(sealEvidence.artifacts) !==
+          notarization.schemaVersion !== 1 ||
+          notarization.status !== "Accepted" ||
+          typeof notarization.submissionId !== "string" ||
+          !/^[0-9a-f-]{36}$/i.test(notarization.submissionId) ||
+          JSON.stringify(notarization.artifacts) !==
             JSON.stringify([
               {
                 path: `bin/${binaryName}`,
                 sha256: provenance.binary.sha256,
-                codeDirectorySha256: platformSignature.codeDirectorySha256,
               },
               {
                 path: "bin/oauthapi-plugin-host",
                 sha256: helperDigest,
-                codeDirectorySha256:
-                  runtimeHelper.platformSignature.codeDirectorySha256,
-                entitlements: [
-                  "com.apple.security.cs.disable-library-validation",
-                ],
               },
               {
                 path: pluginRelativePath,
                 sha256: await sha256File(pluginPath),
-                codeDirectorySha256:
-                  pluginEntry.platformSignature.codeDirectorySha256,
               },
             ])
         ) {
           throw new AccountBridgeError("platform-signature-evidence-invalid");
         }
       } finally {
-        sealEvidenceRaw.fill(0);
+        notarizationRaw.fill(0);
       }
     } else if (!windowsUnsigned) {
       if (!isRecord(platformSignature)) {
@@ -3255,7 +3244,7 @@ export async function verifyPackagedArtifact(input: {
     // Only signed macOS artifacts carry a runtime helper; Windows and Linux
     // builds must declare an exactly-empty list (mirrors build-account-bridge).
     if (
-      expectedSignatureScheme !== "apple-ad-hoc" &&
+      !darwinSigned &&
       provenance.runtimeHelpers.length !== 0
     ) {
       throw new AccountBridgeError("provenance-invalid");
@@ -3316,27 +3305,23 @@ export async function verifyPackagedArtifact(input: {
         !isRecord(pluginSignature) ||
         !isRecord(platformSignature) ||
         pluginSignature.scheme !== expectedSignatureScheme ||
-        (expectedSignatureScheme !== "apple-ad-hoc" &&
-          pluginSignature.signerIdSha256 !==
-            platformSignature.signerIdSha256)
+        pluginSignature.signerIdSha256 !== platformSignature.signerIdSha256
       ) {
         throw new AccountBridgeError("fixed-plugin-signature-evidence-invalid");
-      } else if (expectedSignatureScheme === "apple-ad-hoc") {
+      } else if (darwinSigned) {
         if (
           JSON.stringify(Object.keys(pluginSignature).sort()) !==
             JSON.stringify([
-              "codeDirectorySha256",
               "detachedSignature",
-              "provenanceKeySha256",
+              "notarizationEvidenceSha256",
               "scheme",
-              "sealEvidenceSha256",
+              "signerIdSha256",
             ]) ||
           pluginSignature.detachedSignature !== null ||
-          pluginSignature.provenanceKeySha256 !== artifactPublicKeySha256 ||
-          typeof pluginSignature.codeDirectorySha256 !== "string" ||
-          !/^[a-f0-9]{64}$/.test(pluginSignature.codeDirectorySha256) ||
-          pluginSignature.sealEvidenceSha256 !==
-            platformSignature.sealEvidenceSha256
+          typeof pluginSignature.signerIdSha256 !== "string" ||
+          !/^[a-f0-9]{64}$/.test(pluginSignature.signerIdSha256) ||
+          pluginSignature.notarizationEvidenceSha256 !==
+            platformSignature.notarizationEvidenceSha256
         ) {
           throw new AccountBridgeError("fixed-plugin-signature-evidence-invalid");
         }

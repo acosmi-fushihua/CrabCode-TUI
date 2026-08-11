@@ -31,7 +31,7 @@ members = [
     "crabcode-tui",
 ]
 [workspace.package]
-version = "1.0.31"
+version = "1.0.32"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
