@@ -869,8 +869,19 @@ async function main() {
   if (!args.version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$/u.test(args.version)) {
     fail('a canonical --version is required')
   }
-  if (hostPlatformToken() !== args.platform) {
-    fail(`native release assembly for ${args.platform} must run on that platform (host=${hostPlatformToken()})`)
+  const hostPlatform = hostPlatformToken()
+  const darwinCrossArch =
+    hostPlatform === 'arm64-darwin' &&
+    args.platform === 'x64-darwin' &&
+    process.env.CRABCODE_RELEASE_DARWIN_CROSS_ARCH === '1'
+  if (hostPlatform !== args.platform && !darwinCrossArch) {
+    fail(`native release assembly for ${args.platform} must run on that platform (host=${hostPlatform})`)
+  }
+  if (darwinCrossArch) {
+    const rosetta = spawnSync('arch', ['-x86_64', '/usr/bin/true'], { encoding: 'utf8' })
+    if (rosetta.status !== 0) {
+      fail(`x64-darwin local assembly requires Rosetta 2: ${rosetta.stderr || rosetta.error || ''}`)
+    }
   }
   const packageJson = jsonFile(join(repositoryRoot, 'package.json'))
   if (packageJson.version !== args.version) fail(`package.json version ${packageJson.version} != ${args.version}`)
@@ -916,12 +927,18 @@ async function main() {
   const cacheDirectory = join(repositoryRoot, 'dist', 'release-cache')
   const extension = info.executableExtension
   const buildId = `${args.version}+${commit.slice(0, 12)}`
+  const cratesReleaseDirectory = darwinCrossArch
+    ? join(repositoryRoot, 'crates/target', info.rustTarget, 'release')
+    : join(repositoryRoot, 'crates/target/release')
+  const memoryReleaseDirectory = darwinCrossArch
+    ? join(repositoryRoot, 'libs/acosmi-memory/target', info.rustTarget, 'release')
+    : join(repositoryRoot, 'libs/acosmi-memory/target/release')
 
   const buildInputs = [
-    ['crabcode launcher', join(repositoryRoot, 'crates/target/release', `crabcode-pure-tui-launcher${extension}`), `crabcode${extension}`],
-    ['native TUI', join(repositoryRoot, 'crates/target/release', `crabcode-tui${extension}`), `crabcode-tui${extension}`],
-    ['cron sidecar', join(repositoryRoot, 'crates/target/release', `crabcode-cron${extension}`), `crabcode-cron${extension}`],
-    ['memory orchestrator', join(repositoryRoot, 'libs/acosmi-memory/target/release', `acosmi-memory-orchestrator${extension}`), `acosmi-memory-orchestrator${extension}`],
+    ['crabcode launcher', join(cratesReleaseDirectory, `crabcode-pure-tui-launcher${extension}`), `crabcode${extension}`],
+    ['native TUI', join(cratesReleaseDirectory, `crabcode-tui${extension}`), `crabcode-tui${extension}`],
+    ['cron sidecar', join(cratesReleaseDirectory, `crabcode-cron${extension}`), `crabcode-cron${extension}`],
+    ['memory orchestrator', join(memoryReleaseDirectory, `acosmi-memory-orchestrator${extension}`), `acosmi-memory-orchestrator${extension}`],
   ]
   for (const [label, source, destination] of buildInputs) {
     ensureRegularSource(source, label)

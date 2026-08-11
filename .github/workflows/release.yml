@@ -107,99 +107,22 @@ jobs:
       - name: Enforce tagged source boundary
         run: node scripts/repository-boundary.mjs --source-only
 
-  x64-darwin-runtime-preflight:
-    name: Preflight complete runtime on native Intel macOS
-    needs: verify-source
-    if: github.repository == 'acosmi/CrabCode-TUI'
-    runs-on: macos-15-intel
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-          fetch-depth: 0
-
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: ${{ env.BUN_VERSION }}
-
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - name: Install exact JavaScript dependency graph
-        run: bun install --frozen-lockfile
-
-      - name: Enforce the complete command lifecycle evidence
-        run: bun run check:tui-command-capabilities
-
-      - name: Exercise terminal ownership, signals, and restoration
-        run: cargo test --locked --manifest-path crates/Cargo.toml -p crabcode-tui --features terminal-lifecycle-tests --test terminal_lifecycle
-
-      - name: Establish cross-language build identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "CRABCODE_BUILD_ID=${{ needs.verify-source.outputs.build_id }}" >> "${GITHUB_ENV}"
-          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
-
-      - name: Build closed TypeScript business runtime
-        run: bun run build:ts
-
-      - name: Enforce complete source and executable boundary
-        run: node scripts/repository-boundary.mjs
-
-      - name: Exercise the pinned runtime before allocating the build matrix
-        run: bun scripts/release-x64-darwin-runtime-preflight.mjs --iterations 10
-
-  x64-win32-process-observer-preflight:
-    name: Preflight retained package observation on Windows
+  # macOS arm64 and x64 archives are assembled, replayed, signed, and uploaded
+  # from the audited local Apple Silicon release host. Keeping the sole hosted
+  # native allocation on Windows avoids duplicate macOS runner consumption.
+  # After this job succeeds, its attested ZIP is downloaded and appended to the
+  # already-public mutable release together with install.ps1 and fresh checksums.
+  build-windows:
+    name: Build and verify x64-win32
     needs: verify-source
     if: github.repository == 'acosmi/CrabCode-TUI'
     runs-on: windows-2025
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-          fetch-depth: 0
-
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: ${{ env.BUN_VERSION }}
-
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - name: Install exact JavaScript dependency graph
-        run: bun install --frozen-lockfile
-
-      - name: Prove native launcher observation survives until explicit finalization
-        run: bun test tests/unit/release-package-process-runner.test.ts
-
-  build:
-    name: Build ${{ matrix.platform }}
-    needs:
-      - verify-source
-      - x64-darwin-runtime-preflight
-      - x64-win32-process-observer-preflight
-    if: github.repository == 'acosmi/CrabCode-TUI'
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeoutMinutes }}
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - platform: arm64-darwin
-            runner: macos-15
-            timeoutMinutes: 120
-          - platform: x64-darwin
-            runner: macos-15-intel
-            timeoutMinutes: 120
-          - platform: x64-win32
-            runner: windows-2025
-            timeoutMinutes: 180
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -223,14 +146,16 @@ jobs:
       - name: Install exact JavaScript dependency graph
         run: bun install --frozen-lockfile
 
-      - name: Parse the public PowerShell installer on Windows
-        if: matrix.platform == 'x64-win32'
+      - name: Parse the public PowerShell installer
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           [void][scriptblock]::Create(
             [System.IO.File]::ReadAllText((Resolve-Path 'scripts/install.ps1'))
           )
+
+      - name: Prove native launcher observation survives until explicit finalization
+        run: bun test tests/unit/release-package-process-runner.test.ts
 
       - name: Establish cross-language build identity
         shell: bash
@@ -263,7 +188,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION='${{ needs.verify-source.outputs.version }}'
-          PLATFORM='${{ matrix.platform }}'
+          PLATFORM='x64-win32'
           bun scripts/assemble-release.mjs \
             --platform "${PLATFORM}" \
             --version "${VERSION}" \
@@ -288,10 +213,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION='${{ needs.verify-source.outputs.version }}'
-          case '${{ matrix.platform }}' in
-            x64-win32) ASSET="dist/release/crabcode-${VERSION}-${{ matrix.platform }}.zip" ;;
-            *) ASSET="dist/release/crabcode-${VERSION}-${{ matrix.platform }}.tar.gz" ;;
-          esac
+          ASSET="dist/release/crabcode-${VERSION}-x64-win32.zip"
           test -s "${ASSET}"
           test "$(find dist/release -maxdepth 1 -type f -name 'crabcode-*' | wc -l | tr -d ' ')" = '1'
 
@@ -300,174 +222,20 @@ jobs:
         run: |
           set -euo pipefail
           VERSION='${{ needs.verify-source.outputs.version }}'
-          case '${{ matrix.platform }}' in
-            x64-win32)
-              ASSET="dist/release/crabcode-${VERSION}-${{ matrix.platform }}.zip"
-              INSTALLER='scripts/install.ps1'
-              ;;
-            *)
-              ASSET="dist/release/crabcode-${VERSION}-${{ matrix.platform }}.tar.gz"
-              INSTALLER='scripts/install.sh'
-              ;;
-          esac
+          ASSET="dist/release/crabcode-${VERSION}-x64-win32.zip"
           bun scripts/release-package-smoke.mjs \
             --archive "${ASSET}" \
-            --installer "${INSTALLER}" \
+            --installer scripts/install.ps1 \
             --iterations 100
+
+      - name: Generate Windows build provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/release/crabcode-*.zip
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-${{ matrix.platform }}
-          path: |
-            dist/release/crabcode-*.tar.gz
-            dist/release/crabcode-*.zip
+          name: release-x64-win32
+          path: dist/release/crabcode-*.zip
           if-no-files-found: error
           retention-days: 14
-
-  publish:
-    name: Publish immutable GitHub Release
-    needs: [verify-source, build]
-    if: github.repository == 'acosmi/CrabCode-TUI'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-      artifact-metadata: write
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: release-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Assemble exact public asset set
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION='${{ needs.verify-source.outputs.version }}'
-          for name in \
-            "crabcode-${VERSION}-arm64-darwin.tar.gz" \
-            "crabcode-${VERSION}-x64-darwin.tar.gz" \
-            "crabcode-${VERSION}-x64-win32.zip"; do
-            test -s "release-assets/${name}" || { echo "::error::missing ${name}"; exit 1; }
-          done
-          cp scripts/install.sh scripts/install.ps1 release-assets/
-          chmod 0755 release-assets/install.sh
-          (
-            cd release-assets
-            sha256sum \
-              "crabcode-${VERSION}-arm64-darwin.tar.gz" \
-              "crabcode-${VERSION}-x64-darwin.tar.gz" \
-              "crabcode-${VERSION}-x64-win32.zip" \
-              install.sh install.ps1 \
-              > checksums-sha256.txt
-          )
-          test "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" = '6'
-
-      - name: Generate GitHub build provenance
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
-        with:
-          subject-path: |
-            release-assets/crabcode-*.tar.gz
-            release-assets/crabcode-*.zip
-            release-assets/checksums-sha256.txt
-            release-assets/install.sh
-            release-assets/install.ps1
-
-      - name: Verify all local release attestations
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          for asset in release-assets/*; do
-            VERIFIED='0'
-            for attempt in 1 2 3 4 5 6; do
-              echo "attestation check ${attempt}/6 for ${asset}"
-              if gh attestation verify "${asset}" \
-                --repo "${GITHUB_REPOSITORY}" \
-                --source-ref "refs/tags/${RELEASE_TAG}" \
-                --signer-workflow "github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml"; then
-                VERIFIED='1'
-                break
-              fi
-              sleep 2
-            done
-            test "${VERIFIED}" = '1' || {
-              echo "::error::attestation verification failed for ${asset}"; exit 1;
-            }
-          done
-
-      - name: Create immutable draft, verify it, then publish
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="${RELEASE_TAG}"
-          VERSION='${{ needs.verify-source.outputs.version }}'
-          NOTES="${RUNNER_TEMP}/release-notes.md"
-          printf '%s\n' \
-            '# CrabCode TUI' \
-            '' \
-            '纯终端开源发行：Rust 核心底层 + TypeScript 业务运行时 + 隔离的 Go OAuth Account Bridge。' \
-            '' \
-            '- macOS arm64 与 x64、Windows x64 完整安装包' \
-            '- 安装器先校验 Release SHA-256，再校验包内逐文件清单' \
-            '- Account Bridge 验证签名来源、平台证据、SBOM 与第三方许可' \
-            '- 包含 Bun、ripgrep、crabcode-browser、Sharp/libvips 的固定版本和许可材料' \
-            '' \
-            '注册赠送 6 个月 GO 订阅会员；邀请好友可获得重置次数；模型与权益以线上服务实际展示为准。' \
-            '' \
-            'GUI 为独立产品：https://acosmi.com/zh/downloads' \
-            '' \
-            'Terminal-only open-source release with three native packages for macOS and Windows, fail-closed installers, per-file manifests, signed Account Bridge provenance, dependency licenses, and GitHub build attestation.' \
-            > "${NOTES}"
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "::error::release ${TAG} already exists; immutable assets cannot be overwritten"
-            exit 1
-          fi
-          if [[ "${VERSION}" == *-* ]]; then
-            gh release create "${TAG}" release-assets/* \
-              --verify-tag --draft --prerelease --title "CrabCode TUI ${VERSION}" --notes-file "${NOTES}"
-          else
-            gh release create "${TAG}" release-assets/* \
-              --verify-tag --draft --title "CrabCode TUI ${VERSION}" --notes-file "${NOTES}"
-          fi
-          EXPECTED="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
-          ACTUAL="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets | length')"
-          test "${ACTUAL}" = "${EXPECTED}" || {
-            echo "::error::release asset count ${ACTUAL} != ${EXPECTED}"; exit 1;
-          }
-          BAD_DIGESTS=""
-          for attempt in 1 2 3 4 5 6; do
-            echo "server-side digest check ${attempt}/6"
-            BAD_DIGESTS="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-              --jq '.assets[] | select(.digest == null or (.digest | startswith("sha256:") | not)) | .name')"
-            [ -z "${BAD_DIGESTS}" ] && break
-            sleep 2
-          done
-          test -z "${BAD_DIGESTS}" || {
-            echo "::error::release assets without server-side SHA-256: ${BAD_DIGESTS}"; exit 1;
-          }
-          while IFS= read -r path; do
-            NAME="$(basename "${path}")"
-            LOCAL="sha256:$(sha256sum "${path}" | cut -d ' ' -f 1)"
-            SERVER="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-              --jq ".assets[] | select(.name == \"${NAME}\") | .digest")"
-            test "${SERVER}" = "${LOCAL}" || {
-              echo "::error::server digest mismatch for ${NAME}"; exit 1;
-            }
-          done < <(find release-assets -maxdepth 1 -type f | sort)
-          if [[ "${VERSION}" == *-* ]]; then
-            gh release edit "${TAG}" --draft=false --prerelease
-          else
-            gh release edit "${TAG}" --draft=false --latest
-          fi

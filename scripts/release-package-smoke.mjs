@@ -486,46 +486,19 @@ function writeIterationPhase(iteration, phase, detail = '') {
   )
 }
 
-function fnv1a32(value) {
-  let hash = 0x811c9dc5
-  for (const byte of new TextEncoder().encode(value)) {
-    hash ^= byte
-    hash = Math.imul(hash, 0x01000193) >>> 0
+export function launcherSelectedMemoryEndpoint(replay, platform = process.platform) {
+  const endpoint = replay?.memory_ipc_endpoint
+  const endpointPrefix = platform === 'win32' ? 'npipe:\\\\.\\pipe\\crabcode-' : 'unix:'
+  if (
+    typeof endpoint !== 'string' ||
+    !endpoint.startsWith(endpointPrefix) ||
+    endpoint.includes('\0') ||
+    endpoint.includes('\r') ||
+    endpoint.includes('\n')
+  ) {
+    fail(`packaged Rust replay returned an invalid Memory IPC endpoint: ${JSON.stringify(endpoint)}`)
   }
-  return hash.toString(16).padStart(8, '0')
-}
-
-function sanitizeWindowsUser(value) {
-  const mapped = [...value]
-    .map(character => (/^[A-Za-z0-9._-]$/u.test(character) ? character : '_'))
-    .join('')
-  return mapped === value ? mapped : `${mapped}-${fnv1a32(value)}`
-}
-
-function memoryEndpoint(stateRoot) {
-  const canonical = realpathSync(stateRoot)
-  if (process.platform === 'win32') {
-    let normalized = canonical.replaceAll('\\', '/').toLowerCase()
-    if (normalized.startsWith('//?/unc/')) normalized = `//${normalized.slice(8)}`
-    else if (normalized.startsWith('//?/')) normalized = normalized.slice(4)
-    const namespace = createHash('sha256')
-      .update('crabcode-memory-pipe-v1\0')
-      .update(normalized)
-      .digest('hex')
-      .slice(0, 32)
-    const user = sanitizeWindowsUser(process.env.USERNAME ?? 'user')
-    return `npipe:\\\\.\\pipe\\crabcode-${user}-${namespace}-memory-orchestrator`
-  }
-  let socket = join(canonical, 'run', 'memory-orchestrator.sock')
-  if (Buffer.byteLength(socket) > 100) {
-    const namespace = createHash('sha256')
-      .update('crabcode-memory-uds-v1\0')
-      .update(canonical)
-      .digest('hex')
-      .slice(0, 32)
-    socket = join('/tmp', `crabcode-memory-${namespace}`, 'memory-orchestrator.sock')
-  }
-  return `unix:${socket}`
+  return endpoint
 }
 
 function shortMemoryNamespace(endpoint) {
@@ -770,7 +743,6 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
   const ownershipRoot = options.ownershipRoot ?? packageRoot
   const packagedBun = join(packageRoot, `bun${extension}`)
   const stateRoot = mkdtempSync(join(scratchRoot, `state-${iteration}-`))
-  const endpoint = memoryEndpoint(stateRoot)
   const baseEnvironment = { ...process.env, ...options.extraEnvironment }
   let packageProcessesExited = false
   let launcherObserverLease = null
@@ -794,6 +766,7 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
       fail('launcher process observer lease was not retained')
     }
     const replay = JSON.parse(launcherResult.stdout.trim())
+    const endpoint = launcherSelectedMemoryEndpoint(replay)
     if (
       replay.incident_sequence !== 6034 ||
       replay.incident_bytes !== 63 ||

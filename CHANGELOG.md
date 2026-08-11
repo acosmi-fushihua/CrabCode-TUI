@@ -1,5 +1,36 @@
 # Changelog / 更新日志
 
+## v1.0.33 — 2026-08-11
+
+- Forward-fixes the failed, unpublished `v1.0.32` tag without moving,
+  deleting, or rerunning it. All source and native preflights passed; Windows
+  then compiled, assembled, and verified its archive before the first packaged
+  replay connected to a different Memory named-pipe hash from the runtime.
+- Removes that duplicated endpoint derivation from the release harness. The
+  private native replay now returns the exact launcher-selected Memory IPC
+  endpoint, and the package test validates and consumes that runtime authority.
+  This keeps Windows 8.3 aliases such as `RUNNER~1` from diverging from Rust's
+  canonical long path such as `runneradmin`.
+- Reduces hosted release allocation to one Windows job after a cheap signed
+  source gate. Both macOS archives are reproducibly cross-checked, replayed,
+  and signed on the audited local Apple Silicon release host, published first,
+  and the attested Windows archive is appended after its single hosted job
+  succeeds. Linux remains outside the public release scope.
+
+---
+
+- 对失败且未公开的 `v1.0.32` 标签执行前滚修复，不移动、不删除、不重跑。源码与
+  原生预检均已通过；Windows 完成编译、装配与归档校验后，第一次成品回放因测试
+  脚本计算出的 Memory 命名管道哈希与运行时实际地址不同而失败。
+- 删除发布测试夹具中重复实现的端点推导。私有原生回放现在直接返回 launcher 已
+  选定的 Memory IPC 地址，成品测试只校验并使用该运行时权威值，避免 Windows
+  `RUNNER~1` 等 8.3 短路径与 Rust 规范化后的 `runneradmin` 长路径产生不同哈希。
+- 托管发版资源收敛为低成本签名源码门禁之后的唯一 Windows job。两个 macOS 包
+  均在已审计的本地 Apple Silicon 发版机上完成可复现装配、成品回放与签名并先行
+  发布；Windows 包在唯一托管任务通过后追加。Linux 仍不属于公开发版范围。
+
+---
+
 ## v1.0.32 — 2026-08-11
 
 - Forward-fixes the failed, unpublished `v1.0.31` tag without moving,

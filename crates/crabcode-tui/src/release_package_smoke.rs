@@ -8,6 +8,7 @@ use crate::sdk_runtime::{RawEnvelope, classify_envelope};
 
 const ARGUMENT: &str = "__release-package-smoke";
 const AUTHORITY_ENV: &str = "CRABCODE_RELEASE_PACKAGE_SMOKE";
+const MEMORY_IPC_ENDPOINT_ENV: &str = "CRABCODE_MEMORY_IPC_ENDPOINT";
 const INCIDENT_FIXTURE: &str =
     include_str!("../../../tests/fixtures/renderer/empty-sources-sequence-6034.jsonl");
 
@@ -25,6 +26,17 @@ pub(crate) fn maybe_run(args: impl IntoIterator<Item = OsString>) -> Option<anyh
 }
 
 fn run() -> anyhow::Result<()> {
+    let memory_ipc_endpoint = std::env::var(MEMORY_IPC_ENDPOINT_ENV)
+        .context("release smoke requires the launcher-selected Memory IPC endpoint")?;
+    run_with_memory_ipc_endpoint(&memory_ipc_endpoint)
+}
+
+fn run_with_memory_ipc_endpoint(memory_ipc_endpoint: &str) -> anyhow::Result<()> {
+    ensure!(
+        memory_ipc_endpoint.starts_with("unix:")
+            || memory_ipc_endpoint.starts_with(r"npipe:\\.\pipe\crabcode-"),
+        "release smoke received an invalid launcher-selected Memory IPC endpoint"
+    );
     let incident = INCIDENT_FIXTURE.trim_end_matches(['\r', '\n']);
     ensure!(
         incident.as_bytes().len() == 63,
@@ -100,7 +112,8 @@ fn run() -> anyhow::Result<()> {
             "incident_bytes": 63,
             "incident_disposition": "presentation_noop",
             "turns_completed": 2,
-            "runtime_stop": false
+            "runtime_stop": false,
+            "memory_ipc_endpoint": memory_ipc_endpoint
         })
     );
     Ok(())
@@ -130,6 +143,18 @@ mod tests {
 
     #[test]
     fn packaged_incident_replay_keeps_two_successor_turns_alive() {
-        run().expect("release package replay");
+        run_with_memory_ipc_endpoint("unix:/tmp/crabcode-release-smoke-memory.sock")
+            .expect("release package replay");
+    }
+
+    #[test]
+    fn packaged_incident_replay_rejects_an_unselected_memory_endpoint() {
+        let error = run_with_memory_ipc_endpoint("stale-memory-endpoint")
+            .expect_err("unselected endpoint must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid launcher-selected Memory IPC endpoint")
+        );
     }
 }
