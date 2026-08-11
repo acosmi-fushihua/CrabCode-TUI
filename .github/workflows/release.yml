@@ -203,7 +203,9 @@ jobs:
     env:
       # MSVC link.exe otherwise writes per-link PE timestamps. /Brepro makes
       # executable linking deterministic across equivalent hosted runners.
-      RUSTFLAGS: -C link-arg=/Brepro
+      # Cargo reads the encoded form directly, so Git Bash cannot reinterpret
+      # /Brepro as an MSYS path before rustc passes it to link.exe.
+      CARGO_ENCODED_RUSTFLAGS: -Clink-arg=/Brepro
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -219,18 +221,29 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Prove deterministic Windows PE linking before native allocation
-        shell: bash
+        shell: powershell
         run: |
-          set -euo pipefail
-          PROBE_DIR="${RUNNER_TEMP}/crabcode-linker-probe"
-          mkdir -p "${PROBE_DIR}"
-          printf 'fn main() {}\n' > "${PROBE_DIR}/main.rs"
-          rustc "${PROBE_DIR}/main.rs" -C debuginfo=0 -C link-arg=/Brepro -o "${PROBE_DIR}/probe.exe"
-          cp "${PROBE_DIR}/probe.exe" "${PROBE_DIR}/baseline.exe"
-          sleep 2
-          rustc "${PROBE_DIR}/main.rs" -C debuginfo=0 -C link-arg=/Brepro -o "${PROBE_DIR}/probe.exe"
-          cmp -s "${PROBE_DIR}/baseline.exe" "${PROBE_DIR}/probe.exe" || {
-            echo "::error::MSVC /Brepro did not produce a byte-identical PE probe"; exit 1;
+          $ErrorActionPreference = 'Stop'
+          $probeDirectory = Join-Path $env:RUNNER_TEMP 'crabcode-linker-probe'
+          $source = Join-Path $probeDirectory 'main.rs'
+          $output = Join-Path $probeDirectory 'probe.exe'
+          $baseline = Join-Path $probeDirectory 'baseline.exe'
+          [void][System.IO.Directory]::CreateDirectory($probeDirectory)
+          [System.IO.File]::WriteAllText(
+            $source,
+            "fn main() {}`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          & rustc $source '-C' 'debuginfo=0' '-C' 'link-arg=/Brepro' '-o' $output
+          if ($LASTEXITCODE -ne 0) { throw "first deterministic PE probe link failed: $LASTEXITCODE" }
+          Copy-Item -LiteralPath $output -Destination $baseline -Force
+          Start-Sleep -Seconds 2
+          & rustc $source '-C' 'debuginfo=0' '-C' 'link-arg=/Brepro' '-o' $output
+          if ($LASTEXITCODE -ne 0) { throw "second deterministic PE probe link failed: $LASTEXITCODE" }
+          $baselineHash = (Get-FileHash -LiteralPath $baseline -Algorithm SHA256).Hash
+          $outputHash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash
+          if ($baselineHash -cne $outputHash) {
+            throw "MSVC /Brepro did not produce a byte-identical PE probe: $baselineHash != $outputHash"
           }
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2

@@ -13,8 +13,10 @@ describe("Windows release recovery quota controls", () => {
     const probe = "Prove deterministic Windows PE linking before native allocation";
     const nativeBuild = "Build native Rust TUI product closure";
 
-    expect(workflow).toContain("RUSTFLAGS: -C link-arg=/Brepro");
-    expect(workflow).toContain("-C link-arg=/Brepro -o");
+    expect(workflow).toContain(
+      "CARGO_ENCODED_RUSTFLAGS: -Clink-arg=/Brepro",
+    );
+    expect(workflow).toContain("'link-arg=/Brepro'");
     expect(workflow.indexOf(probe)).toBeGreaterThan(-1);
     expect(workflow.indexOf(nativeBuild)).toBeGreaterThan(-1);
     expect(workflow.indexOf(probe)).toBeLessThan(workflow.indexOf(nativeBuild));
