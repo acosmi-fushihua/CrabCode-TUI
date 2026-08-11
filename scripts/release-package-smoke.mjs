@@ -50,6 +50,21 @@ function spawnFailure(result) {
     .join('; ') || `status=${String(result.status)}`
 }
 
+export function combinePrimaryAndCleanupFailures(primaryError, cleanupErrors, label) {
+  const secondary = cleanupErrors.filter(Boolean)
+  if (primaryError) {
+    if (primaryError instanceof Error && secondary.length > 0 && primaryError.cause === undefined) {
+      primaryError.cause = secondary.length === 1
+        ? secondary[0]
+        : new AggregateError(secondary, label)
+    }
+    return primaryError
+  }
+  if (secondary.length === 1) return secondary[0]
+  if (secondary.length > 1) return new AggregateError(secondary, label)
+  return null
+}
+
 function parseArguments(values) {
   const parsed = { archive: null, installer: null, iterations: 100 }
   for (let index = 0; index < values.length; index += 1) {
@@ -570,10 +585,11 @@ function executableForPid(pid) {
         ?.slice(1)
       return path ? realpathSync(path) : null
     }
-    const script = `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").ExecutablePath`
+    const script = `(Get-Process -Id ${pid} -ErrorAction Stop).Path`
     const result = spawnSync('powershell', ['-NoProfile', '-Command', script], {
       encoding: 'utf8',
-      timeout: 5_000,
+      timeout: 10_000,
+      windowsHide: true,
     })
     if (result.status !== 0) return null
     const path = spawnText(result.stdout).trim()
@@ -583,37 +599,31 @@ function executableForPid(pid) {
   }
 }
 
-export function parseWindowsProcessInventory(stdout) {
-  const parsed = stdout.trim() ? JSON.parse(stdout) : []
-  return (Array.isArray(parsed) ? parsed : [parsed]).flatMap(item => {
-    const pid = Number(item?.ProcessId)
-    const executable = item?.ExecutablePath
-    if (
-      !Number.isSafeInteger(pid) ||
-      pid <= 0 ||
-      typeof executable !== 'string' ||
-      executable.length === 0 ||
-      !packageProcessNames.has(win32.basename(executable).toLowerCase())
-    ) {
-      return []
-    }
-    return [{ pid, executable }]
+export function parseWindowsTasklistInventory(stdout) {
+  return stdout.split(/\r?\n/u).flatMap(rawLine => {
+    const line = rawLine.trim()
+    const match = /^"((?:[^"]|"")*)","([0-9]+)"(?:,|$)/u.exec(line)
+    if (!match) return []
+    const imageName = match[1].replaceAll('""', '"').toLowerCase()
+    const pid = Number(match[2])
+    if (!packageProcessNames.has(imageName) || !Number.isSafeInteger(pid) || pid <= 0) return []
+    return [{ pid, executable: null }]
   })
 }
 
 function listPackageProcesses(packageRoot) {
   let candidates = []
   if (process.platform === 'win32') {
-    const script = 'Get-CimInstance Win32_Process | Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress'
-    const result = spawnSync('powershell', ['-NoProfile', '-Command', script], {
+    const result = spawnSync('tasklist', ['/FO', 'CSV', '/NH'], {
       encoding: 'utf8',
-      timeout: 15_000,
+      timeout: 10_000,
+      windowsHide: true,
     })
     if (result.status !== 0) fail(`process inventory failed: ${spawnFailure(result)}`)
-    // The single CIM snapshot already contains canonicalization candidates.
-    // Filter it before ownership checks instead of launching one PowerShell
-    // process for every system PID on every replay cleanup probe.
-    candidates = parseWindowsProcessInventory(spawnText(result.stdout))
+    // Native tasklist avoids contending with the PowerShell installer. Resolve
+    // the executable path only for the handful of package-named candidates so
+    // ownership checks remain exact without a full CIM/WMI inventory.
+    candidates = parseWindowsTasklistInventory(spawnText(result.stdout))
   } else {
     // `lsof -p` once for every system PID made one replay take minutes on
     // macOS. Pre-filter by the kernel process command, then resolve and
@@ -746,6 +756,7 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
   const baseEnvironment = { ...process.env, ...options.extraEnvironment }
   let packageProcessesExited = false
   let launcherObserverLease = null
+  let primaryError = null
   try {
     writeIterationPhase(iteration, 'launcher-start')
     const launcherResult = await runProcess(launcher, ['__release-package-smoke'], {
@@ -867,14 +878,20 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
       await lease.finalize()
       writeIterationPhase(iteration, 'launcher-observer-finalized')
     }
+  } catch (error) {
+    primaryError = error
   } finally {
+    const cleanupErrors = []
     try {
       if (!packageProcessesExited) {
         writeIterationPhase(iteration, 'failure-cleanup-start')
         await terminateOwnedProcesses(ownershipRoot)
         writeIterationPhase(iteration, 'failure-cleanup-complete')
       }
-    } finally {
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
+    try {
       if (launcherObserverLease) {
         await launcherObserverLease.cancel(
           new Error(`release package iteration ${iteration} ended before observer finalization`),
@@ -882,8 +899,20 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
         launcherObserverLease = null
         writeIterationPhase(iteration, 'launcher-observer-cancelled')
       }
-      rmSync(stateRoot, { recursive: true, force: true })
+    } catch (error) {
+      cleanupErrors.push(error)
     }
+    try {
+      rmSync(stateRoot, { recursive: true, force: true })
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
+    const failure = combinePrimaryAndCleanupFailures(
+      primaryError,
+      cleanupErrors,
+      `release package iteration ${iteration} cleanup failures`,
+    )
+    if (failure) throw failure
   }
   if (existsSync(stateRoot)) fail(`iteration state root survived cleanup: ${stateRoot}`)
   const lingering = listPackageProcesses(ownershipRoot)
@@ -988,6 +1017,17 @@ async function main() {
   try {
     packageRoot = extractArchive(args.archive, extractRoot)
     const manifest = verifyManifest(packageRoot)
+    // Exercise the public installation path first. A broken installer must
+    // fail before the longer repeated incident gate consumes hosted minutes.
+    if (args.installer) {
+      await runInstallerSmoke(
+        args.archive,
+        args.installer,
+        manifest.version,
+        scratchRoot,
+        isolatedEnvironment,
+      )
+    }
     for (let iteration = 1; iteration <= args.iterations; iteration += 1) {
       process.stderr.write(
         `release package smoke iteration start: ${iteration}/${args.iterations}\n`,
@@ -1001,15 +1041,6 @@ async function main() {
       if (iteration % 10 === 0 || iteration === args.iterations) {
         process.stderr.write(`release package smoke progress: ${iteration}/${args.iterations}\n`)
       }
-    }
-    if (args.installer) {
-      await runInstallerSmoke(
-        args.archive,
-        args.installer,
-        manifest.version,
-        scratchRoot,
-        isolatedEnvironment,
-      )
     }
   } catch (error) {
     primaryError = error
@@ -1035,15 +1066,12 @@ async function main() {
       scratchCleanupError = error
     }
   }
-  const secondaryErrors = [cleanupError, isolationError, scratchCleanupError].filter(Boolean)
-  if (primaryError) {
-    if (primaryError instanceof Error && secondaryErrors.length > 0 && primaryError.cause === undefined) {
-      primaryError.cause = new AggregateError(secondaryErrors, 'release smoke cleanup failures')
-    }
-    throw primaryError
-  }
-  if (secondaryErrors.length === 1) throw secondaryErrors[0]
-  if (secondaryErrors.length > 1) throw new AggregateError(secondaryErrors, 'release smoke cleanup failures')
+  const failure = combinePrimaryAndCleanupFailures(
+    primaryError,
+    [cleanupError, isolationError, scratchCleanupError],
+    'release smoke cleanup failures',
+  )
+  if (failure) throw failure
   process.stdout.write(
     `${JSON.stringify({
       schema_version: 1,
