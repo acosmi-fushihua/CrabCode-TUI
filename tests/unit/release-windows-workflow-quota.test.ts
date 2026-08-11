@@ -14,10 +14,11 @@ describe("Windows release recovery quota controls", () => {
     const nativeBuild = "Build native Rust TUI product closure";
 
     expect(workflow).toContain(
-      "CARGO_ENCODED_RUSTFLAGS: -Clink-arg=/Brepro",
+      "RUSTFLAGS: -C link-arg=/Brepro -C link-arg=/DEBUG:NONE",
     );
     expect(workflow).toContain("'strip=symbols'");
     expect(workflow).toContain("'link-arg=/Brepro'");
+    expect(workflow).toContain("'link-arg=/DEBUG:NONE'");
     expect(workflow.indexOf(probe)).toBeGreaterThan(-1);
     expect(workflow.indexOf(nativeBuild)).toBeGreaterThan(-1);
     expect(workflow.indexOf(probe)).toBeLessThan(workflow.indexOf(nativeBuild));

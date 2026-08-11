@@ -203,9 +203,11 @@ jobs:
     env:
       # MSVC link.exe otherwise writes per-link PE timestamps. /Brepro makes
       # executable linking deterministic across equivalent hosted runners.
-      # Cargo reads the encoded form directly, so Git Bash cannot reinterpret
-      # /Brepro as an MSYS path before rustc passes it to link.exe.
-      CARGO_ENCODED_RUSTFLAGS: -Clink-arg=/Brepro
+      # Rust 1.92 still requests a PDB on MSVC even for stripped release output;
+      # the PDB is not shipped, so suppress its variable CodeView identity.
+      # Cargo reads RUSTFLAGS itself and passes both values directly to rustc,
+      # outside Git Bash argument-path conversion.
+      RUSTFLAGS: -C link-arg=/Brepro -C link-arg=/DEBUG:NONE
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -234,11 +236,11 @@ jobs:
             "fn main() {}`n",
             [System.Text.UTF8Encoding]::new($false)
           )
-          & rustc $source '-C' 'debuginfo=0' '-C' 'strip=symbols' '-C' 'link-arg=/Brepro' '-o' $output
+          & rustc $source '-C' 'debuginfo=0' '-C' 'strip=symbols' '-C' 'link-arg=/Brepro' '-C' 'link-arg=/DEBUG:NONE' '-o' $output
           if ($LASTEXITCODE -ne 0) { throw "first deterministic PE probe link failed: $LASTEXITCODE" }
           Copy-Item -LiteralPath $output -Destination $baseline -Force
           Start-Sleep -Seconds 2
-          & rustc $source '-C' 'debuginfo=0' '-C' 'strip=symbols' '-C' 'link-arg=/Brepro' '-o' $output
+          & rustc $source '-C' 'debuginfo=0' '-C' 'strip=symbols' '-C' 'link-arg=/Brepro' '-C' 'link-arg=/DEBUG:NONE' '-o' $output
           if ($LASTEXITCODE -ne 0) { throw "second deterministic PE probe link failed: $LASTEXITCODE" }
           $baselineHash = (Get-FileHash -LiteralPath $baseline -Algorithm SHA256).Hash
           $outputHash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash
