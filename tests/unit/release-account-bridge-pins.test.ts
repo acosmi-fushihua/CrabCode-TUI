@@ -33,7 +33,7 @@ describe("release Account Bridge pins", () => {
     }
   });
 
-  test("runs the signed-artifact gate before any native preflight or build", async () => {
+  test("runs the signed-artifact gate before the hosted native build", async () => {
     const releaseWorkflow = await readFile(
       join(root, ".github/workflows/release.yml"),
       "utf8",
@@ -43,6 +43,7 @@ describe("release Account Bridge pins", () => {
       "utf8",
     );
     const gate = "bun scripts/verify-release-account-bridge.mjs";
+    const hostedBuild = "  build-windows:";
     expect(releaseWorkflow).toContain(
       `ACCOUNT_BRIDGE_ARTIFACT_PUBLIC_KEY_BASE64URL: ${accountBridgeReleasePins.artifactPublicKeyBase64URL}`,
     );
@@ -50,11 +51,9 @@ describe("release Account Bridge pins", () => {
       `ACCOUNT_BRIDGE_ARTIFACT_PUBLIC_KEY_BASE64URL: ${accountBridgeReleasePins.artifactPublicKeyBase64URL}`,
     );
     expect(releaseWorkflow.indexOf(gate)).toBeGreaterThan(-1);
+    expect(releaseWorkflow.indexOf(hostedBuild)).toBeGreaterThan(-1);
     expect(releaseWorkflow.indexOf(gate)).toBeLessThan(
-      releaseWorkflow.indexOf("  x64-darwin-runtime-preflight:"),
-    );
-    expect(releaseWorkflow.indexOf(gate)).toBeLessThan(
-      releaseWorkflow.indexOf("  build:"),
+      releaseWorkflow.indexOf(hostedBuild),
     );
   });
 });
