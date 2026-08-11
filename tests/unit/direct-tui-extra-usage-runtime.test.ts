@@ -9,6 +9,8 @@ import {
 } from 'bun:test'
 import { getComposerExecutionKind } from '../../src/types/command.js'
 
+const previousApiKey = process.env.ACOSMI_API_KEY
+process.env.ACOSMI_API_KEY = 'direct-tui-catalog-fixture'
 const auth = await import('../../src/utils/auth.js')
 
 // Command discovery loads the complete built-in/skill surface. The normal
@@ -30,6 +32,7 @@ const previousDisable = process.env.DISABLE_EXTRA_USAGE_COMMAND
 beforeEach(() => {
   state.resetStateForTests()
   state.setIsInteractive(true)
+  process.env.ACOSMI_API_KEY = 'direct-tui-catalog-fixture'
   delete process.env.DISABLE_EXTRA_USAGE_COMMAND
   overageSpy.mockReturnValue(true)
   subscriberSpy.mockReturnValue(true)
@@ -44,6 +47,11 @@ afterAll(() => {
     delete process.env.DISABLE_EXTRA_USAGE_COMMAND
   } else {
     process.env.DISABLE_EXTRA_USAGE_COMMAND = previousDisable
+  }
+  if (previousApiKey === undefined) {
+    delete process.env.ACOSMI_API_KEY
+  } else {
+    process.env.ACOSMI_API_KEY = previousApiKey
   }
 })
 

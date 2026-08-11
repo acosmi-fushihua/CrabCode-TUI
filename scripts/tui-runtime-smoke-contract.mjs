@@ -20,6 +20,24 @@ export function expectedTuiRuntimeIdentity(releaseMaterials) {
   }
 }
 
+export function assertTuiRuntimeSmokeSuccess(report) {
+  if (
+    !report ||
+    typeof report !== 'object' ||
+    Array.isArray(report) ||
+    report.rendererContext !== 'received' ||
+    report.initialize !== 'success' ||
+    report.costTurns !== '2/2 success' ||
+    report.endSession !== 'success' ||
+    report.exitCode !== 0
+  ) {
+    throw new Error(
+      `TUI runtime smoke report is not successful: ${JSON.stringify(report)}`,
+    )
+  }
+  return report
+}
+
 function assertExactKeys(value, required, optional, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} must be an object: ${JSON.stringify(value)}`)

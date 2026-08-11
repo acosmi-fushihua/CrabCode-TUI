@@ -1,5 +1,31 @@
 # Changelog / 更新日志
 
+## v1.0.31 — 2026-08-11
+
+- Forward-fixes the failed, unpublished `v1.0.30` tag without moving,
+  deleting, or rerunning it. The corrected release identity passed; its sole
+  canonical workflow then stopped before allocating the three-platform build
+  matrix because two release consumers still expected the retired `turns`
+  smoke-report field. No Release or asset was published.
+- Replaces both stale field checks with one shared, unit-tested runtime-smoke
+  assertion over `rendererContext`, `initialize`, `costTurns`, `endSession`,
+  and `exitCode`. The native Intel preflight and every packaged-platform replay
+  now consume the same report contract, preventing another post-build failure.
+- Product behavior and public scope remain unchanged: macOS arm64, macOS x64,
+  and Windows x64 are the only release archives.
+
+---
+
+- 对失败且未公开的 `v1.0.30` 标签执行前滚修复，不移动、不删除、不重跑。修正后
+  的发布身份绑定已通过；其唯一企业 workflow 随后因两个发布消费者仍读取已废弃
+  的 `turns` 冒烟报告字段，在分配三平台构建矩阵前停止，没有发布 Release 或资产。
+- 将两处旧字段判断统一替换为一个带单测的 runtime-smoke 断言，共同校验
+  `rendererContext`、`initialize`、`costTurns`、`endSession` 与 `exitCode`。
+  原生 Intel 预检和每个平台的打包回放现共享同一报告契约，避免在构建后再次失败。
+- 产品行为与公开范围不变：发布包仍仅包含 macOS arm64、macOS x64 与 Windows x64。
+
+---
+
 ## v1.0.30 — 2026-08-11
 
 - Forward-fixes the failed, unpublished `v1.0.29` tag without moving,

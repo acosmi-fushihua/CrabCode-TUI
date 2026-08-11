@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  assertTuiRuntimeSmokeSuccess,
   assertCommandCatalogChangedRequest,
   commandCatalogChangedAck,
   commandCatalogChangedSubtype,
@@ -43,6 +44,27 @@ describe('TUI runtime smoke private command-catalog contract', () => {
     expect(() => expectedTuiRuntimeIdentity({ version: '1.0.30' })).toThrow(
       'non-empty version and buildId',
     )
+  })
+
+  test('shares the exact successful runtime report fields with release consumers', () => {
+    const successful = {
+      rendererContext: 'received',
+      initialize: 'success',
+      costTurns: '2/2 success',
+      endSession: 'success',
+      exitCode: 0,
+    }
+    expect(assertTuiRuntimeSmokeSuccess(successful)).toBe(successful)
+    expect(() =>
+      assertTuiRuntimeSmokeSuccess({
+        ...successful,
+        costTurns: undefined,
+        turns: '2/2 success',
+      }),
+    ).toThrow('not successful')
+    expect(() =>
+      assertTuiRuntimeSmokeSuccess({ ...successful, exitCode: 1 }),
+    ).toThrow('not successful')
   })
 
   test('matches the production slash parser for ordinary and MCP names', () => {

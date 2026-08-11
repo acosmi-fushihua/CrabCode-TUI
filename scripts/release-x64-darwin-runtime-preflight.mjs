@@ -16,6 +16,7 @@ import { cpus, tmpdir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { unzipSync } from 'fflate'
 import { x64DarwinBunRelease } from './release-bun-pins.mjs'
+import { assertTuiRuntimeSmokeSuccess } from './tui-runtime-smoke-contract.mjs'
 
 const repositoryRoot = resolve(import.meta.dir, '..')
 const smokeScript = join(repositoryRoot, 'scripts', 'tui-runtime-smoke.mjs')
@@ -251,15 +252,13 @@ try {
     } catch {
       fail(`iteration ${iteration} returned non-JSON output: ${smoke.stdout.slice(0, 2_000)}`)
     }
-    if (
-      report.rendererContext !== 'received' ||
-      report.initialize !== 'success' ||
-      report.turns !== '2/2 success' ||
-      report.endSession !== 'success' ||
-      report.exitCode !== 0 ||
-      !new Set(['empty', 'classified-bun-baseline-no-avx-warning']).has(report.stderr)
-    ) {
+    try {
+      assertTuiRuntimeSmokeSuccess(report)
+    } catch {
       fail(`iteration ${iteration} violated the lifecycle contract: ${JSON.stringify(report)}`)
+    }
+    if (!new Set(['empty', 'classified-bun-baseline-no-avx-warning']).has(report.stderr)) {
+      fail(`iteration ${iteration} returned unexpected stderr: ${JSON.stringify(report)}`)
     }
     stderrDispositions.add(report.stderr)
   }

@@ -21,6 +21,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 } fr
 import { spawnSync } from 'node:child_process'
 import { unzipSync } from 'fflate'
 import { comparePortablePaths } from './release-path-order.mjs'
+import { assertTuiRuntimeSmokeSuccess } from './tui-runtime-smoke-contract.mjs'
 
 const repositoryRoot = resolve(import.meta.dir, '..')
 const incidentSchema = 'crabcode-memory-ipc-v1-20260725'
@@ -819,7 +820,9 @@ async function runIteration(packageRoot, scratchRoot, iteration, options = {}) {
       },
     })
     const runtime = JSON.parse(runtimeResult.stdout)
-    if (runtime.turns !== '2/2 success' || runtime.endSession !== 'success') {
+    try {
+      assertTuiRuntimeSmokeSuccess(runtime)
+    } catch {
       fail(`packaged TypeScript runtime did not complete two turns: ${runtimeResult.stdout}`)
     }
     writeIterationPhase(iteration, 'runtime-complete')
