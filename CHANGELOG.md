@@ -1,5 +1,33 @@
 # Changelog / 更新日志
 
+## v1.0.30 — 2026-08-11
+
+- Forward-fixes the failed, unpublished `v1.0.29` tag without moving,
+  deleting, or rerunning it. Its single workflow passed signed-source,
+  Windows process-observer, command-lifecycle, terminal-lifecycle, and source
+  boundary gates, then stopped before allocating the three-platform build
+  matrix; no Release or asset was published.
+- Completes the x64 macOS preflight's synthetic `release-materials.json` with
+  the exact release `version` and `buildId`. The preflight now also binds both
+  values to the built runtime metadata before exercising the pinned Bun
+  runtime, preserving the fail-closed identity check that blocked `v1.0.29`.
+- Product behavior and release scope are otherwise unchanged: the public
+  matrix still contains only macOS arm64, macOS x64, and Windows x64.
+
+---
+
+- 对失败且未公开的 `v1.0.29` 标签执行前滚修复，不移动、不删除、不重跑。
+  其唯一一次 workflow 已通过签名源码、Windows 进程观察、命令生命周期、终端
+  生命周期与源码边界门禁，随后在分配三平台构建矩阵前停止，没有发布 Release
+  或任何资产。
+- 为 x64 macOS 预检临时生成的 `release-materials.json` 补齐精确的发布
+  `version` 与 `buildId`，并在执行固定 Bun runtime 前将两者与已构建 runtime
+  元数据绑定；`v1.0.29` 所触发的 fail-closed 身份校验保持不变。
+- 产品行为与发布范围均无其他变化：公开矩阵仍仅包含 macOS arm64、macOS x64
+  与 Windows x64。
+
+---
+
 ## v1.0.29 — 2026-08-11
 
 - Forward-fixes the failed, unpublished `v1.0.28` tag without moving,

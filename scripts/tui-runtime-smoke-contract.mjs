@@ -2,6 +2,24 @@ export const commandCatalogChangedSubtype =
   'crabcode_tui_command_catalog_changed'
 export const commandCatalogProtocolVersion = 1
 
+export function expectedTuiRuntimeIdentity(releaseMaterials) {
+  if (
+    !releaseMaterials ||
+    typeof releaseMaterials.version !== 'string' ||
+    typeof releaseMaterials.buildId !== 'string' ||
+    releaseMaterials.version.length === 0 ||
+    releaseMaterials.buildId.length === 0
+  ) {
+    throw new Error(
+      'release materials must contain a non-empty version and buildId',
+    )
+  }
+  return {
+    version: releaseMaterials.version,
+    buildId: releaseMaterials.buildId,
+  }
+}
+
 function assertExactKeys(value, required, optional, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} must be an object: ${JSON.stringify(value)}`)

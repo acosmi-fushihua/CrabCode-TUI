@@ -15,6 +15,7 @@ import {
   assertCommandCatalogChangedRequest,
   commandCatalogChangedAck,
   commandCatalogChangedSubtype,
+  expectedTuiRuntimeIdentity,
 } from './tui-runtime-smoke-contract.mjs'
 
 const root = resolve(
@@ -54,12 +55,7 @@ const runtimeMetafilePayload = JSON.parse(
 )
 verifyTuiRuntimeBuildBinding(
   runtimeMetafilePayload,
-  releaseMaterials
-    ? {
-        version: releaseMaterials.version,
-        buildId: releaseMaterials.buildId,
-      }
-    : {},
+  releaseMaterials ? expectedTuiRuntimeIdentity(releaseMaterials) : {},
 )
 verifyTuiRuntimeArtifactBinding(runtime, runtimeMetafilePayload)
 const configDir = await mkdtemp(join(tmpdir(), 'crabcode-tui-smoke-'))

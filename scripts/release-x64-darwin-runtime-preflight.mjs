@@ -166,11 +166,32 @@ if (!isRosettaControl && !isNativeIntel) {
 
 const sourceRuntime = join(repositoryRoot, 'dist', 'tui-runtime', 'index.js')
 const sourceMetafile = join(repositoryRoot, 'dist', 'tui-runtime', 'metafile.json')
+const packageManifestPath = join(repositoryRoot, 'package.json')
 for (const source of [sourceRuntime, sourceMetafile, smokeScript]) {
   const info = lstatSync(source)
   if (!info.isFile() || info.isSymbolicLink() || info.size === 0) {
     fail(`required preflight input is not a non-empty regular file: ${source}`)
   }
+}
+
+const packageManifest = JSON.parse(readFileSync(packageManifestPath, 'utf8'))
+const releaseVersion = packageManifest.version
+const releaseBuildId = process.env.CRABCODE_BUILD_ID?.trim()
+const runtimeMetafile = JSON.parse(readFileSync(sourceMetafile, 'utf8'))
+if (
+  typeof releaseVersion !== 'string' ||
+  !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(releaseVersion) ||
+  !releaseBuildId
+) {
+  fail(
+    'release version and CRABCODE_BUILD_ID must be established before preflight',
+  )
+}
+if (
+  runtimeMetafile.crabcodeTuiBuild?.version !== releaseVersion ||
+  runtimeMetafile.crabcodeTuiBuild?.buildId !== releaseBuildId
+) {
+  fail('built runtime identity differs from the release version or build ID')
 }
 
 const scratch = mkdtempSync(join(tmpdir(), 'crabcode-x64-darwin-preflight-'))
@@ -190,7 +211,9 @@ try {
       {
         schemaVersion: 1,
         product: 'CrabCode TUI',
+        version: releaseVersion,
         platform: 'x64-darwin',
+        buildId: releaseBuildId,
         runtime: {
           bun: {
             version: x64DarwinBunRelease.version,

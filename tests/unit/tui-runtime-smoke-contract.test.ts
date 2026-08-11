@@ -5,6 +5,7 @@ import {
   commandCatalogChangedAck,
   commandCatalogChangedSubtype,
   commandNameRoundTrips,
+  expectedTuiRuntimeIdentity,
 } from '../../scripts/tui-runtime-smoke-contract.mjs'
 import { parseSlashCommand } from '../../src/utils/slashCommandParsing.js'
 
@@ -26,6 +27,24 @@ const frame = (commands: unknown[]) => ({
 })
 
 describe('TUI runtime smoke private command-catalog contract', () => {
+  test('requires an exact non-empty release identity', () => {
+    expect(
+      expectedTuiRuntimeIdentity({
+        version: '1.0.30',
+        buildId: '1.0.30+release-commit',
+      }),
+    ).toEqual({
+      version: '1.0.30',
+      buildId: '1.0.30+release-commit',
+    })
+    expect(() => expectedTuiRuntimeIdentity({ buildId: 'present' })).toThrow(
+      'non-empty version and buildId',
+    )
+    expect(() => expectedTuiRuntimeIdentity({ version: '1.0.30' })).toThrow(
+      'non-empty version and buildId',
+    )
+  })
+
   test('matches the production slash parser for ordinary and MCP names', () => {
     const names = [
       'cost',
