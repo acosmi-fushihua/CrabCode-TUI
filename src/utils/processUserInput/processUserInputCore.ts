@@ -63,6 +63,16 @@ import { parseSlashCommand } from '../slashCommandParsing.js'
 import { processTextPrompt } from './processTextPrompt.js'
 export type ProcessUserInputContext = ToolUseContext & LocalJSXCommandContext
 
+export type LocalCommandTerminalOutcome = {
+  /**
+   * `cancelled` is distinct from an execution error even though the current
+   * SDK result schema represents both with `error_during_execution`.
+   */
+  status: 'error' | 'cancelled'
+  /** Terminal diagnostic text, without any renderer XML wrapper. */
+  message: string
+}
+
 export type ProcessUserInputRuntime = {
   loadSlashCommandProcessor: () => Promise<
     Pick<
@@ -101,6 +111,12 @@ export type ProcessUserInputBaseResult = {
   // Output text for non-interactive mode (e.g., forked commands)
   // When set, this is used as the result in -p mode instead of empty string
   resultText?: string
+  /**
+   * Terminal failure from a slash command that intentionally skipped the
+   * model query. QueryEngine must not report these turns as successful merely
+   * because `shouldQuery` is false.
+   */
+  localCommandOutcome?: LocalCommandTerminalOutcome
   // When set, prefills or submits the next input after command completes
   // Used by /discover to chain into the selected feature's command
   nextInput?: string
@@ -572,6 +588,7 @@ async function processUserInputBase(
         ],
         shouldQuery: false,
         resultText: msg,
+        localCommandOutcome: { status: 'error', message: msg },
       }
     }
     const { processSlashCommand } =

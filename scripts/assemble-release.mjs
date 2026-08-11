@@ -28,6 +28,11 @@ import {
   x64DarwinBunRelease,
 } from './release-bun-pins.mjs'
 import { comparePortablePaths } from './release-path-order.mjs'
+import {
+  verifyTuiRuntimeArtifactBinding,
+  verifyTuiRuntimeReleaseBuildBinding,
+  verifyTuiRuntimeSourceBinding,
+} from './tui-runtime-source-binding.mjs'
 
 const repositoryRoot = resolve(import.meta.dir, '..')
 const sourceRepository = 'https://github.com/acosmi/CrabCode-TUI'
@@ -738,14 +743,16 @@ function verifyPackageContract(packageDirectory, platformToken, version) {
     fail(`invalid build-id ${buildId}`)
   }
   const metafile = jsonFile(join(packageDirectory, 'dist/tui-runtime/metafile.json'))
-  if (
-    metafile.crabcodeTuiBuild?.entryPoint !== 'src/entrypoints/tuiRuntime.ts' ||
-    metafile.crabcodeTuiBuild?.output !== 'dist/tui-runtime/index.js' ||
-    metafile.crabcodeTuiBuild?.version !== version ||
-    metafile.crabcodeTuiBuild?.buildId !== buildId
-  ) {
-    fail('TUI runtime metafile identity does not match the release')
-  }
+  verifyTuiRuntimeReleaseBuildBinding(metafile, process.env, {
+    version,
+    buildId,
+  }, {
+    accountBridgeArtifactPublicKeyBase64url: accountBridgeArtifactKey,
+  })
+  verifyTuiRuntimeArtifactBinding(
+    join(packageDirectory, 'dist/tui-runtime/index.js'),
+    metafile,
+  )
   const output = Object.values(metafile.outputs ?? {})[0]
   if (Object.keys(metafile.outputs ?? {}).length !== 1 || (output?.imports?.length ?? 0) !== 0) {
     fail('TUI runtime bundle is not a closed single-output graph')
@@ -905,6 +912,20 @@ async function main() {
     ensureRegularSource(source, label)
     copyRegular(source, join(packageDirectory, destination), true)
   }
+  const sourceRuntimeMetafile = jsonFile(
+    join(repositoryRoot, 'dist/tui-runtime/metafile.json'),
+  )
+  verifyTuiRuntimeReleaseBuildBinding(sourceRuntimeMetafile, process.env, {
+    version: args.version,
+    buildId,
+  }, {
+    accountBridgeArtifactPublicKeyBase64url: accountBridgeArtifactKey,
+  })
+  verifyTuiRuntimeSourceBinding(repositoryRoot, sourceRuntimeMetafile)
+  verifyTuiRuntimeArtifactBinding(
+    join(repositoryRoot, 'dist/tui-runtime/index.js'),
+    sourceRuntimeMetafile,
+  )
   copyRegular(
     join(repositoryRoot, 'dist/tui-runtime/index.js'),
     join(packageDirectory, 'dist/tui-runtime/index.js'),

@@ -220,6 +220,8 @@ export type MicrocompactResult = {
   }
 }
 
+type MicrocompactExecutionMode = 'production' | 'analysis-only'
+
 /**
  * Walk messages and collect tool_use IDs whose tool name is in
  * COMPACTABLE_TOOLS, in encounter order. Shared by both microcompact paths.
@@ -256,8 +258,50 @@ export async function microcompactMessages(
   toolUseContext?: ToolUseContext,
   querySource?: QuerySource,
 ): Promise<MicrocompactResult> {
-  // Clear suppression flag at start of new microcompact attempt
-  clearCompactWarningSuppression()
+  return microcompactMessagesWithMode(
+    messages,
+    toolUseContext,
+    querySource,
+    'production',
+  )
+}
+
+/**
+ * Project the message view that microcompact would produce without committing
+ * any lifecycle state.
+ *
+ * Inspection callers such as `/context` must be able to mirror the real query
+ * transform without registering tool results in the process-wide cached-MC
+ * state, queuing cache edits, changing compact-warning suppression, notifying
+ * cache-break detection, or emitting compaction telemetry. Cached MC therefore
+ * runs against an isolated state clone while time-based MC applies only its
+ * immutable message projection.
+ */
+export async function microcompactMessagesForAnalysis(
+  messages: Message[],
+  toolUseContext?: ToolUseContext,
+  querySource?: QuerySource,
+): Promise<MicrocompactResult> {
+  return microcompactMessagesWithMode(
+    messages,
+    toolUseContext,
+    querySource,
+    'analysis-only',
+  )
+}
+
+async function microcompactMessagesWithMode(
+  messages: Message[],
+  toolUseContext: ToolUseContext | undefined,
+  querySource: QuerySource | undefined,
+  mode: MicrocompactExecutionMode,
+): Promise<MicrocompactResult> {
+  const analysisOnly = mode === 'analysis-only'
+
+  // Warning state is part of the query lifecycle, not the message projection.
+  if (!analysisOnly) {
+    clearCompactWarningSuppression()
+  }
 
   // Time-based trigger runs first and short-circuits. If the gap since the
   // last assistant message exceeds the threshold, the server cache has expired
@@ -265,7 +309,11 @@ export async function microcompactMessages(
   // tool results now, before the request, to shrink what gets rewritten.
   // Cached MC (cache-editing) is skipped when this fires: editing assumes a
   // warm cache, and we just established it's cold.
-  const timeBasedResult = maybeTimeBasedMicrocompact(messages, querySource)
+  const timeBasedResult = maybeTimeBasedMicrocompact(
+    messages,
+    querySource,
+    analysisOnly,
+  )
   if (timeBasedResult) {
     return timeBasedResult
   }
@@ -275,14 +323,25 @@ export async function microcompactMessages(
   // tool_results in the global cachedMCState, which would cause the main
   // thread to try deleting tools that don't exist in its own conversation.
   if (feature('CACHED_MICROCOMPACT')) {
-    const mod = await getCachedMCModule()
+    // Analysis must not initialize either cachedMCModule or cachedMCState.
+    // Dynamic import itself is stateless; production keeps its existing lazy
+    // module cache for the hot path.
+    const mod = analysisOnly
+      ? await import('./cachedMicrocompact.js')
+      : await getCachedMCModule()
     const model = toolUseContext?.options.mainLoopModel ?? getMainLoopModel()
     if (
       mod.isCachedMicrocompactEnabled() &&
       mod.isModelSupportedForCacheEditing(model) &&
       isMainThreadSource(querySource)
     ) {
-      return await cachedMicrocompactPath(messages, querySource)
+      return await cachedMicrocompactPath(messages, querySource, {
+        analysisOnly,
+        mod,
+        state: analysisOnly
+          ? createAnalysisCachedMCState(mod)
+          : ensureCachedMCState(),
+      })
     }
   }
 
@@ -291,6 +350,36 @@ export async function microcompactMessages(
   // non-ant users, unsupported models, sub-agents), no compaction happens here;
   // autocompact handles context pressure instead.
   return { messages }
+}
+
+function createAnalysisCachedMCState(
+  mod: typeof import('./cachedMicrocompact.js'),
+): import('./cachedMicrocompact.js').CachedMCState {
+  if (!cachedMCState) {
+    return mod.createCachedMCState()
+  }
+
+  // Clone the complete runtime state when possible so analysis reflects the
+  // same registered/deleted/pinned history as the next real query, while every
+  // mutation made by the cached-MC implementation remains isolated.
+  try {
+    return structuredClone(cachedMCState)
+  } catch {
+    // The public state contract is deliberately data-only. Keep a conservative
+    // fallback for host builds that attach a non-cloneable diagnostic field.
+    const isolated = mod.createCachedMCState()
+    isolated.registeredTools = new Set(cachedMCState.registeredTools)
+    isolated.toolOrder = [...cachedMCState.toolOrder]
+    isolated.deletedRefs = new Set(cachedMCState.deletedRefs)
+    isolated.pinnedEdits = cachedMCState.pinnedEdits.map(pinned => ({
+      userMessageIndex: pinned.userMessageIndex,
+      block: {
+        ...pinned.block,
+        edits: [...pinned.block.edits],
+      },
+    }))
+    return isolated
+  }
 }
 
 /**
@@ -306,9 +395,13 @@ export async function microcompactMessages(
 async function cachedMicrocompactPath(
   messages: Message[],
   querySource: QuerySource | undefined,
+  options: {
+    analysisOnly: boolean
+    mod: typeof import('./cachedMicrocompact.js')
+    state: import('./cachedMicrocompact.js').CachedMCState
+  },
 ): Promise<MicrocompactResult> {
-  const mod = await getCachedMCModule()
-  const state = ensureCachedMCState()
+  const { analysisOnly, mod, state } = options
   const config = mod.getCachedMCConfig()
 
   const compactableToolIds = new Set(collectCompactableToolIds(messages))
@@ -335,36 +428,38 @@ async function cachedMicrocompactPath(
   if (toolsToDelete.length > 0) {
     // Create and queue the cache_edits block for the API layer
     const cacheEdits = mod.createCacheEditsBlock(state, toolsToDelete)
-    if (cacheEdits) {
+    if (!analysisOnly && cacheEdits) {
       pendingCacheEdits = cacheEdits
     }
 
-    logForDebugging(
-      `Cached MC deleting ${toolsToDelete.length} tool(s): ${toolsToDelete.join(', ')}`,
-    )
+    if (!analysisOnly) {
+      logForDebugging(
+        `Cached MC deleting ${toolsToDelete.length} tool(s): ${toolsToDelete.join(', ')}`,
+      )
 
-    // Log the event
-    logEvent('tengu_cached_microcompact', {
-      toolsDeleted: toolsToDelete.length,
-      deletedToolIds: toolsToDelete.join(
-        ',',
-      ) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-      activeToolCount: state.toolOrder.length - state.deletedRefs.size,
-      triggerType:
-        'auto' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-      threshold: config.triggerThreshold,
-      keepRecent: config.keepRecent,
-    })
+      // Log the event
+      logEvent('tengu_cached_microcompact', {
+        toolsDeleted: toolsToDelete.length,
+        deletedToolIds: toolsToDelete.join(
+          ',',
+        ) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        activeToolCount: state.toolOrder.length - state.deletedRefs.size,
+        triggerType:
+          'auto' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        threshold: config.triggerThreshold,
+        keepRecent: config.keepRecent,
+      })
 
-    // Suppress warning after successful compaction
-    suppressCompactWarning()
+      // Suppress warning after successful compaction
+      suppressCompactWarning()
 
-    // Notify cache break detection that cache reads will legitimately drop
-    if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
-      // Pass the actual querySource — isMainThreadSource now prefix-matches
-      // so output-style variants enter here, and getTrackingKey keys on the
-      // full source string, not the 'repl_main_thread' prefix.
-      notifyCacheDeletion(querySource ?? 'repl_main_thread')
+      // Notify cache break detection that cache reads will legitimately drop
+      if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
+        // Pass the actual querySource — isMainThreadSource now prefix-matches
+        // so output-style variants enter here, and getTrackingKey keys on the
+        // full source string, not the 'repl_main_thread' prefix.
+        notifyCacheDeletion(querySource ?? 'repl_main_thread')
+      }
     }
 
     // Return messages unchanged - cache_reference and cache_edits are added at API layer
@@ -447,6 +542,7 @@ export function evaluateTimeBasedTrigger(
 function maybeTimeBasedMicrocompact(
   messages: Message[],
   querySource: QuerySource | undefined,
+  analysisOnly = false,
 ): MicrocompactResult | null {
   const trigger = evaluateTimeBasedTrigger(messages, querySource)
   if (!trigger) {
@@ -496,35 +592,37 @@ function maybeTimeBasedMicrocompact(
     return null
   }
 
-  logEvent('tengu_time_based_microcompact', {
-    gapMinutes: Math.round(gapMinutes),
-    gapThresholdMinutes: config.gapThresholdMinutes,
-    toolsCleared: clearSet.size,
-    toolsKept: keepSet.size,
-    keepRecent: config.keepRecent,
-    tokensSaved,
-  })
+  if (!analysisOnly) {
+    logEvent('tengu_time_based_microcompact', {
+      gapMinutes: Math.round(gapMinutes),
+      gapThresholdMinutes: config.gapThresholdMinutes,
+      toolsCleared: clearSet.size,
+      toolsKept: keepSet.size,
+      keepRecent: config.keepRecent,
+      tokensSaved,
+    })
 
-  logForDebugging(
-    `[TIME-BASED MC] gap ${Math.round(gapMinutes)}min > ${config.gapThresholdMinutes}min, cleared ${clearSet.size} tool results (~${tokensSaved} tokens), kept last ${keepSet.size}`,
-  )
+    logForDebugging(
+      `[TIME-BASED MC] gap ${Math.round(gapMinutes)}min > ${config.gapThresholdMinutes}min, cleared ${clearSet.size} tool results (~${tokensSaved} tokens), kept last ${keepSet.size}`,
+    )
 
-  suppressCompactWarning()
-  // Cached-MC state (module-level) holds tool IDs registered on prior turns.
-  // We just content-cleared some of those tools AND invalidated the server
-  // cache by changing prompt content. If cached-MC runs next turn with the
-  // stale state, it would try to cache_edit tools whose server-side entries
-  // no longer exist. Reset it.
-  resetMicrocompactState()
-  // We just changed the prompt content — the next response's cache read will
-  // be low, but that's us, not a break. Tell the detector to expect a drop.
-  // notifyCacheDeletion (not notifyCompaction) because it's already imported
-  // here and achieves the same false-positive suppression — adding the second
-  // symbol to the import was flagged by the circular-deps check.
-  // Pass the actual querySource: getTrackingKey returns the full source string
-  // (e.g. 'repl_main_thread:outputStyle:custom'), not just the prefix.
-  if (feature('PROMPT_CACHE_BREAK_DETECTION') && querySource) {
-    notifyCacheDeletion(querySource)
+    suppressCompactWarning()
+    // Cached-MC state (module-level) holds tool IDs registered on prior turns.
+    // We just content-cleared some of those tools AND invalidated the server
+    // cache by changing prompt content. If cached-MC runs next turn with the
+    // stale state, it would try to cache_edit tools whose server-side entries
+    // no longer exist. Reset it.
+    resetMicrocompactState()
+    // We just changed the prompt content — the next response's cache read will
+    // be low, but that's us, not a break. Tell the detector to expect a drop.
+    // notifyCacheDeletion (not notifyCompaction) because it's already imported
+    // here and achieves the same false-positive suppression — adding the second
+    // symbol to the import was flagged by the circular-deps check.
+    // Pass the actual querySource: getTrackingKey returns the full source string
+    // (e.g. 'repl_main_thread:outputStyle:custom'), not just the prefix.
+    if (feature('PROMPT_CACHE_BREAK_DETECTION') && querySource) {
+      notifyCacheDeletion(querySource)
+    }
   }
 
   return { messages: result }

@@ -27,8 +27,8 @@ pub use bg_task::{BgTaskBlock, BgTaskKind};
 pub use btw::BtwBlock;
 pub use context_info::ContextInfoBlock;
 pub use crabcode_projection::{
-    CrabCodeAdvisorBlock, CrabCodeAdvisorInvocationState, CrabCodeDiagnostic,
-    CrabCodeDiagnosticFile, CrabCodeDiagnosticSeverity, CrabCodeDirectApiError,
+    CrabCodeAdvisorBlock, CrabCodeAdvisorInvocationState, CrabCodeCompactProgressStage,
+    CrabCodeDiagnostic, CrabCodeDiagnosticFile, CrabCodeDiagnosticSeverity, CrabCodeDirectApiError,
     CrabCodeDirectAttachmentBlock, CrabCodeDirectFileContent, CrabCodeDirectNestedProgressBlock,
     CrabCodeDirectProgressBlock, CrabCodeDirectSystemBlock, CrabCodeHookPermissionDecision,
     CrabCodeMessageLevel, CrabCodeProjectionBlock, CrabCodeProjectionKind, CrabCodeRelevantMemory,

@@ -1,45 +1,55 @@
 # Changelog / 更新日志
 
-## v1.0.29 — 2026-08-08
+## v1.0.29 — 2026-08-11
 
 - Forward-fixes the failed, unpublished `v1.0.28` tag without moving,
-  deleting, rerunning, or publishing it. Its only workflow run passed signed
-  source verification and the native Intel runtime preflight, then failed the
-  fast Windows observer preflight; the five-platform matrix and publish job
-  were skipped.
-- Corrects the Windows preflight model rather than weakening the observer.
-  The former Bun-parent/Bun-descendant fixture was not equivalent to the Rust
-  launcher: Windows closed its inherited streams immediately, so six tests
-  measured fixture cleanup instead of the package observer contract.
-- Replaces that fixture with a minimal native Rust launcher compiled by the
-  pinned Rust `1.92.0` toolchain. It starts a native descendant with explicitly
-  inherited stdout/stderr, records the descendant PID, emits the parent
-  contract, and exits, matching the product launcher's cross-platform process
-  semantics.
-- Preserves all eight fail-closed assertions for a complete contract, explicit
-  observer retention after EOF, unauthorized inherited handles, bounded
-  finalization, truncated stdout, non-empty stderr, execution timeout, and
-  late output. Cleanup now also discovers fixture PIDs after assertion failure,
-  kills them, waits for process exit, and fails if any descendant survives.
-- Product runtime, renderer protocol, SDK `2.15.0`, Gateway, Memory IPC,
-  installers, package layout, and user configuration remain unchanged.
+  deleting, rerunning, or publishing it. The Windows observer preflight now
+  uses a minimal native Rust launcher with explicit inherited-stream ownership,
+  bounded finalization, deterministic descendant cleanup, and all eight
+  fail-closed process-contract assertions intact.
+- Completes the authoritative direct-TUI command lifecycle. Runtime-provided
+  catalogs can refresh in place, hidden and gated commands stay hidden,
+  renderer/backend dispatch ownership is explicit, and logout, plugin reload,
+  compact, context, local-model, and structured terminal results close cleanly.
+- Adds the native multi-question `AskUserQuestion` experience with deterministic
+  IDs, single/multi-select validation, recommended choices, bounded free text,
+  previews, keyboard/mouse navigation, and telemetry-safe answers.
+- Strengthens the direct permission bridge across TypeScript and Rust with
+  allow-once, allow-for-session, persistent, and deny decisions; filesystem,
+  shell, and PowerShell mutation checks now preserve configuration-home and
+  workspace boundaries instead of broadening them implicitly.
+- Hardens interrupt, compaction, context analysis, transcript persistence, and
+  progress recovery so terminal state resumes deterministically after local
+  commands, failed controls, and session-memory compaction.
+- Rebinds the generated renderer contract to 378 reviewed capabilities, adds
+  exact runtime-source and command-capability gates, exercises terminal
+  lifecycle tests in CI/release preflight, and exposes the underlying Landlock
+  reason in fail-closed diagnostics.
+- Publishes only three native archives: macOS arm64, macOS x64, and Windows x64.
+  Canonical-repository gating, release-only push suppression, concurrency
+  cancellation, a three-platform incident matrix, and one artifact upload per
+  build prevent duplicate personal/corporate runs and empty uploads.
 
 ---
 
 - 对失败且未公开的 `v1.0.28` 标签执行前滚修复，不移动、不删除、不重跑，也不
-  发布该标签。其唯一一次 workflow 已通过签名源码校验与原生 Intel runtime 预检，
-  随后在快速 Windows observer 前置门禁失败；五平台矩阵与 publish 均被跳过。
-- 修正 Windows 前置门禁的验证模型，而不是放宽观察器。原 Bun 父进程/Bun 后代
-  夹具不等价于 Rust launcher：Windows 会立即关闭该夹具的继承流，导致六项测试
-  实际测到夹具清理语义，而不是发布包观察契约。
-- 改用由固定 Rust `1.92.0` 工具链编译的最小原生 launcher 夹具。它启动显式继承
-  stdout/stderr 的原生后代、记录后代 PID、输出父进程契约后退出，与产品 launcher
-  的跨平台进程语义一致。
-- 完整保留八项 fail-closed 断言：完整契约、EOF 后显式保留 observer、未授权继承
-  句柄、最终化期限、截断 stdout、非空 stderr、执行超时与晚到输出。清理逻辑还会
-  在断言失败后主动发现夹具 PID、终止并等待退出；任何存活后代都会使测试失败。
-- 产品 runtime、renderer 协议、SDK `2.15.0`、Gateway、Memory IPC、安装器、包布局
-  和用户配置均不改变。
+  发布该标签。Windows observer 前置门禁改用最小原生 Rust launcher，显式持有继承
+  流、限定最终化期限、确定性清理后代进程，并完整保留八项 fail-closed 契约断言。
+- 补齐权威 direct-TUI 命令全生命周期：运行时命令目录可原位刷新，隐藏或受门禁
+  命令不会泄漏，renderer/backend 分派归属明确，logout、插件重载、compact、
+  context、local-model 与结构化终端结果均能闭环。
+- 新增原生多问题 `AskUserQuestion` 交互，覆盖确定性 ID、单选/多选校验、推荐项、
+  有界自由文本、预览、键鼠导航，以及不泄漏答案内容的遥测。
+- 加固 TypeScript 与 Rust 之间的权限桥，统一单次允许、会话允许、持久允许和拒绝；
+  文件系统、Shell 与 PowerShell 变更检测不会再隐式放宽配置目录和工作区边界。
+- 加固中断、压缩、上下文分析、转录持久化与进度恢复，使本地命令、控制失败和
+  session-memory 压缩之后的终端状态能够确定性续接。
+- 将生成的 renderer 契约重新绑定到 378 项已审能力，新增 runtime 源码绑定与命令
+  能力门禁，在 CI/发版预检中执行终端生命周期测试，并在 Landlock fail-closed
+  诊断中保留底层失败原因。
+- 正式发布仅生成三个原生包：macOS arm64、macOS x64 与 Windows x64。通过企业
+  主仓门禁、release-only 推送抑制、并发取消、三平台事件回放矩阵和每构建一次
+  artifact 上传，避免个人/企业仓重复执行及空上传。
 
 ---
 

@@ -533,7 +533,7 @@ fn push_user_binding(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -721,7 +721,7 @@ mod tests {
     fn renderer_default_bindings_are_unique_and_extensions_are_explicit() {
         let registrations = crate::tui_actions::crabcode_keybinding_registrations(false);
         let mut observed = BTreeSet::<(String, String, String)>::new();
-        for registration in registrations {
+        for registration in &registrations {
             for chord in registration.default_chords {
                 assert!(
                     observed.insert((
@@ -733,6 +733,90 @@ mod tests {
                 );
             }
         }
+        let mut observed_by_context = BTreeMap::<String, usize>::new();
+        for (context, _, _) in &observed {
+            *observed_by_context.entry(context.clone()).or_default() += 1;
+        }
+        let expected_by_context = BTreeMap::from([
+            ("Attachments".to_string(), 6),
+            ("Autocomplete".to_string(), 4),
+            (
+                "Chat".to_string(),
+                if cfg!(target_os = "windows") { 15 } else { 16 },
+            ),
+            ("Confirmation".to_string(), 11),
+            ("DiffDialog".to_string(), 6),
+            ("Footer".to_string(), 8),
+            ("Global".to_string(), 7),
+            ("GoalConsole".to_string(), 2),
+            ("Help".to_string(), 1),
+            ("HistorySearch".to_string(), 5),
+            ("MessageSelector".to_string(), 15),
+            ("ModelPicker".to_string(), 2),
+            ("Plugin".to_string(), 2),
+            ("Scroll".to_string(), 8),
+            ("Select".to_string(), 8),
+            ("Settings".to_string(), 11),
+            ("Tabs".to_string(), 4),
+            ("Task".to_string(), 1),
+            ("ThemePicker".to_string(), 1),
+            ("Transcript".to_string(), 4),
+        ]);
+        assert_eq!(
+            observed_by_context, expected_by_context,
+            "a fixed default moved across contexts or changed its per-context denominator"
+        );
+
+        let action_context_pairs = registrations
+            .iter()
+            .map(|registration| (registration.context.as_str(), registration.action_name))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            registrations.len(),
+            110,
+            "the complete fixed action plus renderer-extension denominator changed"
+        );
+        assert_eq!(
+            action_context_pairs.len(),
+            registrations.len(),
+            "each registered action/context owner must be unique"
+        );
+        assert_eq!(
+            registrations
+                .iter()
+                .filter(|registration| !registration.default_chords.is_empty())
+                .count(),
+            if cfg!(target_os = "windows") { 88 } else { 89 },
+            "the bound-action denominator changed independently of chord count"
+        );
+        assert_eq!(
+            registrations
+                .iter()
+                .filter(|registration| {
+                    !matches!(
+                        registration.action,
+                        crate::tui_actions::TuiActionId::UnavailableHistorical(_)
+                    )
+                })
+                .map(|registration| registration.default_chords.len())
+                .sum::<usize>(),
+            75,
+            "implemented default-binding denominator changed"
+        );
+        assert_eq!(
+            registrations
+                .iter()
+                .filter(|registration| {
+                    matches!(
+                        registration.action,
+                        crate::tui_actions::TuiActionId::UnavailableHistorical(_)
+                    )
+                })
+                .map(|registration| registration.default_chords.len())
+                .sum::<usize>(),
+            if cfg!(target_os = "windows") { 46 } else { 47 },
+            "explicit fail-closed default-binding denominator changed"
+        );
         assert_eq!(
             observed.len(),
             if cfg!(target_os = "windows") {
@@ -742,6 +826,23 @@ mod tests {
             },
             "renderer default count changed; update this product contract deliberately"
         );
+        if cfg!(target_os = "windows") {
+            assert!(
+                !observed.iter().any(|(context, _, action)| {
+                    context == "Chat" && action == "chat:cycleMode"
+                }),
+                "the renderer lacks the runtime-version fact needed to select Windows' mode-cycle key"
+            );
+        } else {
+            assert!(
+                observed.contains(&(
+                    "Chat".to_string(),
+                    "shift+tab".to_string(),
+                    "chat:cycleMode".to_string(),
+                )),
+                "the fixed non-Windows mode-cycle binding must stay explicit and fail closed"
+            );
+        }
         for extension in [
             ("Chat", "ctrl+x ctrl+g", "app:toggleGoalConsole"),
             ("GoalConsole", "escape", "goalConsole:dismiss"),

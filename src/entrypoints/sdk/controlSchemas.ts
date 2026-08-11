@@ -68,6 +68,18 @@ export const SDKControlInitializeRequestSchema = lazySchema(() =>
       agents: z.record(z.string(), AgentDefinitionSchema()).optional(),
       promptSuggestions: z.boolean().optional(),
       agentProgressSummaries: z.boolean().optional(),
+      askUserQuestion: z
+        .object({
+          version: z.number().int().min(1),
+          previewFormats: z
+            .array(z.enum(['markdown', 'html']))
+            .max(2)
+            .optional(),
+        })
+        .optional()
+        .describe(
+          'Interactive question protocol version and preview formats supported by this SDK host. Multi-select, Other, and structured answers are core version-2 semantics rather than optional flags.',
+        ),
     })
     .describe(
       'Initializes the SDK session with hooks, MCP servers, and agent configuration.',
@@ -102,6 +114,18 @@ export const SDKControlInterruptRequestSchema = lazySchema(() =>
     .describe('Interrupts the currently running conversation turn.'),
 )
 
+export const SDK_PERMISSION_DECISION_REASON_CODES = [
+  'rule',
+  'mode',
+  'subcommand_results',
+  'permission_prompt_tool',
+  'hook',
+  'async_agent',
+  'classifier',
+  'working_directory',
+  'safety_check',
+  'other',
+] as const
 
 export const SDKControlPermissionRequestSchema = lazySchema(() =>
   z
@@ -111,6 +135,9 @@ export const SDKControlPermissionRequestSchema = lazySchema(() =>
       input: z.record(z.string(), z.unknown()),
       permission_suggestions: z.array(PermissionUpdateSchema()).optional(),
       blocked_path: z.string().optional(),
+      decision_reason_code: z
+        .enum(SDK_PERMISSION_DECISION_REASON_CODES)
+        .optional(),
       decision_reason: z.string().optional(),
       title: z.string().optional(),
       display_name: z.string().optional(),

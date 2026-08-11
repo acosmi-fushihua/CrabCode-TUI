@@ -5,7 +5,7 @@ import {
   getSystemPrompt,
   SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 } from 'src/constants/prompts.js'
-import { microcompactMessages } from 'src/services/compact/microCompact.js'
+import { microcompactMessagesForAnalysis } from 'src/services/compact/microCompact.js'
 import { getSdkBetas } from '../bootstrap/state.js'
 import { getCommandName } from '../types/command.js'
 import { getSystemContext } from '../context.js'
@@ -853,8 +853,15 @@ function processAttachment(
 
 async function approximateMessageTokens(
   messages: Message[],
+  mainLoopModel: string,
 ): Promise<MessageBreakdown> {
-  const microcompactResult = await microcompactMessages(messages)
+  // `/context` may reach this after its top-level projection already ran.
+  // Re-analysis must remain pure as well: the production microcompact API can
+  // register cached tools and queue cache edits even though it returns the
+  // message array unchanged.
+  const microcompactResult = await microcompactMessagesForAnalysis(messages, {
+    options: { mainLoopModel },
+  } as ToolUseContext)
 
   // Initialize tracking
   const breakdown: MessageBreakdown = {
@@ -980,7 +987,7 @@ export async function analyzeContextUsage(
     ),
     countCustomAgentTokens(agentDefinitions),
     countSlashCommandTokens(tools, getToolPermissionContext, agentDefinitions),
-    approximateMessageTokens(messages),
+    approximateMessageTokens(messages, model),
   ])
 
   // Count skills separately with error isolation

@@ -5,7 +5,7 @@
   "migrationAuthority": "rustOwner identifies the native module that must reach behavioral parity before the TypeScript family can be removed",
   "typescriptVersion": "5.9.3",
   "tsconfig": "tsconfig.json",
-  "totalCapabilities": 377,
+  "totalCapabilities": 378,
   "families": [
     {
       "id": "query_message_type",
@@ -57,13 +57,14 @@
     {
       "id": "progress_type",
       "source": "src/Tool.ts",
-      "sourceSha256": "fc976e328e976b261329153ecc270f27c0822dd38506cc15a30caa809bcd9527",
+      "sourceSha256": "f2e786911c9ed2c16e1812b8d6a2bca0913cb2acdfdea3f3570c3b051a31a129",
       "symbol": "Progress",
       "discriminator": "type",
       "rustOwner": "crabcode-tui::sdk_projection progress lifecycle",
       "values": [
         "agent_progress",
         "bash_progress",
+        "compact_progress",
         "hook_progress",
         "mcp_progress",
         "powershell_progress",
@@ -74,7 +75,7 @@
         "waiting_for_task",
         "workflow_progress"
       ],
-      "count": 11
+      "count": 12
     },
     {
       "id": "attachment_type",
@@ -657,6 +658,7 @@
         "values": {
           "agent_progress": "recoverable",
           "bash_progress": "recoverable",
+          "compact_progress": "recoverable",
           "hook_progress": "recoverable",
           "mcp_progress": "recoverable",
           "powershell_progress": "recoverable",
@@ -1101,6 +1103,6 @@
       }
     }
   },
-  "contractSha256": "01a6c36628f0f0a553ded6ab31a91bfcf09ca07a83e3aaf2be7fc6822656fead",
+  "contractSha256": "2c38e530608e186e8559392c415e7599990a96a22da55250de0274bafa1cc840",
   "contractHashScope": "canonical JSON excluding contractSha256 and contractHashScope"
 }

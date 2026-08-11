@@ -968,7 +968,9 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
           type: 'asyncAgent',
           reason: 'Permission prompts are not available in this context',
         },
-        message: AUTO_REJECT_MESSAGE(tool.name),
+        message: tool.requiresUserInteraction?.()
+          ? `${tool.name} requires live user interaction, but this execution context has no interactive host. Do not retry this tool until an interactive surface is available.`
+          : AUTO_REJECT_MESSAGE(tool.name),
       }
     }
   }

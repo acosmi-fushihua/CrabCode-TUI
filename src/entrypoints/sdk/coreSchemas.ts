@@ -358,7 +358,7 @@ export const PermissionModeSchema = lazySchema(() =>
       'Permission mode for controlling how tool executions are handled. ' +
         "'default' - Standard behavior, prompts for dangerous operations. " +
         "'acceptEdits' - Auto-accept file edit operations. " +
-        "'bypassPermissions' - Bypass all permission checks (requires allowDangerouslySkipPermissions). " +
+        "'bypassPermissions' - Auto-approve routine operations while preserving explicit deny/ask rules and sensitive-operation safety confirmations (requires allowDangerouslySkipPermissions). " +
         "'plan' - Planning mode, no actual tool execution. " +
         "'dontAsk' - Don't prompt for permissions, deny if not pre-approved.",
     ),

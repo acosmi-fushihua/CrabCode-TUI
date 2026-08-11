@@ -14,6 +14,10 @@ import type { PermissionResult } from '../../utils/permissions/PermissionResult.
 import { createReadRuleSuggestion } from '../../utils/permissions/PermissionUpdate.js'
 import type { PermissionUpdate } from '../../utils/permissions/PermissionUpdateSchema.js'
 import {
+  checkShellMutationSafetyFloor,
+  checkUnparsedShellMutationSafetyFloor,
+} from '../../utils/permissions/shellMutationSafety.js'
+import {
   expandTilde,
   type FileOperationType,
   formatDirectoryList,
@@ -1003,6 +1007,42 @@ function validateOutputRedirections(
 }
 
 /**
+ * Argv-level bypass-immune floor for commands whose write targets are hidden
+ * from the ordinary PATH_EXTRACTORS catalog (tee/curl/git/awk/etc.). Exported
+ * so sandbox auto-allow can run the same check before its early allow.
+ */
+export function checkBashMutationSafetyConstraints(
+  input: z.infer<typeof BashTool.inputSchema>,
+  cwd: string,
+  toolPermissionContext: ToolPermissionContext,
+  astCommands?: readonly SimpleCommand[],
+): PermissionResult {
+  const commands = astCommands
+    ? astCommands.map(command => ({
+        argv: stripWrappersFromArgv([...command.argv]),
+        inspectUnknownArguments: true,
+      }))
+    : splitCommand_DEPRECATED(input.command).map(command => ({
+        argv: stripWrappersFromArgv(parseCommandArguments(command)),
+        inspectUnknownArguments: true,
+      }))
+
+  return checkShellMutationSafetyFloor(commands, cwd, toolPermissionContext)
+}
+
+export function checkUnparsedBashMutationSafetyConstraints(
+  input: z.infer<typeof BashTool.inputSchema>,
+  cwd: string,
+  toolPermissionContext: ToolPermissionContext,
+): PermissionResult {
+  return checkUnparsedShellMutationSafetyFloor(
+    input.command,
+    cwd,
+    toolPermissionContext,
+  )
+}
+
+/**
  * Checks path constraints for commands that access the filesystem (cd, ls, find).
  * Also validates output redirections to ensure they're within allowed directories.
  *
@@ -1067,6 +1107,16 @@ export function checkPathConstraints(
   )
   if (redirectionResult.behavior !== 'passthrough') {
     return redirectionResult
+  }
+
+  const mutationSafetyResult = checkBashMutationSafetyConstraints(
+    input,
+    cwd,
+    toolPermissionContext,
+    astCommands,
+  )
+  if (mutationSafetyResult.behavior !== 'passthrough') {
+    return mutationSafetyResult
   }
 
   // SECURITY: When AST-derived commands are available, iterate them with

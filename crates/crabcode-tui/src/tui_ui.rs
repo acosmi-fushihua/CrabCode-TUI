@@ -57,8 +57,9 @@ use crate::text_safety::MAX_RENDER_FIELD_BYTES;
 use crate::text_safety::{sanitize_bounded_terminal_text, sanitize_terminal_text};
 use crate::tui_app::{
     GoalTaskState, GoalVerdict, GoalVerificationState, McpMenuAction, McpSettingsView,
-    OAuthBrowserNotice, OverlayKind, RequestDialog, TuiApp, UiLanguage,
-    canonical_goal_phase_ordinal, localized_permission_mode_label,
+    OAuthBrowserNotice, OverlayKind, QuestionDialogAction, QuestionFocus, RequestDialog, TuiApp,
+    UiLanguage, canonical_goal_phase_ordinal, localized_permission_mode_label,
+    question_dialog_actions,
 };
 #[cfg(test)]
 use crate::tui_app::{
@@ -2146,6 +2147,18 @@ fn minimal_dialog_rows(dialog: &RequestDialog, content_width: u16) -> u16 {
                 .saturating_add(wrapped_text_rows(&input_body, content_width))
                 .saturating_add(u16::from(!choices.is_empty()))
         }
+        RequestDialog::Question(dialog) => {
+            let question = dialog.current_question();
+            wrapped_text_rows(&question.header, content_width)
+                .saturating_add(wrapped_text_rows(&question.question, content_width))
+                .saturating_add(2)
+                .saturating_add(
+                    u16::try_from(question.options.len().saturating_add(1)).unwrap_or(u16::MAX),
+                )
+                .saturating_add(3)
+                .saturating_add(u16::from(dialog.current_answer().other_selected) * 4)
+                .saturating_add(u16::from(dialog.validation_error.is_some()))
+        }
         RequestDialog::Elicitation {
             server_name,
             message,
@@ -2913,15 +2926,17 @@ fn permission_mode_label(mode: &str, language: UiLanguage, compact: bool) -> &'s
     match (language, mode, compact) {
         (UiLanguage::ZhCn, "default", true) => "标准",
         (UiLanguage::ZhCn, "acceptEdits", true) => "自动编辑",
-        (UiLanguage::ZhCn, "bypassPermissions", true) => "无审批",
+        (UiLanguage::ZhCn, "bypassPermissions", true) => "常规免审",
         (UiLanguage::ZhCn, "plan", true) => "只规划",
         (UiLanguage::ZhCn, "dontAsk", true) => "已批准",
+        (UiLanguage::ZhCn, "auto", true) => "自动",
         (UiLanguage::ZhCn, _, _) => "自定义",
         (UiLanguage::EnUs, "default", true) => "standard",
         (UiLanguage::EnUs, "acceptEdits", true) => "auto edits",
-        (UiLanguage::EnUs, "bypassPermissions", true) => "no approval",
+        (UiLanguage::EnUs, "bypassPermissions", true) => "routine auto",
         (UiLanguage::EnUs, "plan", true) => "plan only",
         (UiLanguage::EnUs, "dontAsk", true) => "approved",
+        (UiLanguage::EnUs, "auto", true) => "auto",
         (UiLanguage::EnUs, _, _) => "custom",
     }
 }
@@ -9141,6 +9156,25 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp, theme: Cr
     frame.render_widget(Paragraph::new(lines), chrome.content);
 }
 
+fn question_preview_lines(preview: &str, theme: CrabCodeTheme, width: usize) -> Vec<Line<'static>> {
+    let safe_preview = sanitize_bounded_terminal_text(preview);
+    let expanded = expand_pinned_markdown_tabs(&safe_preview);
+    let mut renderer = crabcode_markdown_renderer::StreamingMarkdownRenderer::new(
+        crabcode_markdown_style(theme),
+        true,
+    );
+    renderer.push(&expanded);
+    renderer.finish(Some(crabcode_markdown_syntax_highlighter(
+        CrabCodeSyntaxTheme::MonokaiExtended,
+    )));
+    renderer
+        .view()
+        .lines
+        .iter()
+        .flat_map(|line| wrap_line(line, width.max(1)))
+        .collect()
+}
+
 fn render_dialog(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -9169,8 +9203,11 @@ fn render_dialog(
                     crate::tui_app::PermissionChoice::AllowOnce => {
                         language.text("仅允许一次", "Allow once")
                     }
+                    crate::tui_app::PermissionChoice::AllowSession => {
+                        language.text("本次会话按规则允许", "Allow by rule for session")
+                    }
                     crate::tui_app::PermissionChoice::AllowAlways => {
-                        language.text("始终允许", "Always allow")
+                        language.text("保存规则并允许", "Save rule and allow")
                     }
                     crate::tui_app::PermissionChoice::Deny => language.text("拒绝", "Deny"),
                 })
@@ -9262,6 +9299,303 @@ fn render_dialog(
                     &labels,
                 ));
             None
+        }
+        Some(RequestDialog::Question(dialog)) => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.warning))
+                .style(Style::default().bg(theme.bg_dark))
+                .title(if response_inflight {
+                    language.text(
+                        " 问题 · 正在提交回答… ",
+                        " Question · delivering response… ",
+                    )
+                } else {
+                    language.text(
+                        " 问题 · ↑/↓ 选择 · Space 切换 · Tab 操作 · PgUp/PgDn 预览 · Esc 跳过 ",
+                        " Question · ↑/↓ choose · Space toggle · Tab actions · PgUp/PgDn preview · Esc decline ",
+                    )
+                });
+            let inner = block.inner(modal).inner(Margin {
+                horizontal: 1,
+                vertical: 1,
+            });
+            frame.render_widget(block, modal);
+
+            let current = dialog.current;
+            let focus = dialog.focus;
+            let action_index = dialog.action_index;
+            let question_count = dialog.questions.len();
+            let actions = question_dialog_actions(dialog);
+            let question = &dialog.questions[current];
+            let answer = &mut dialog.answers[current];
+            let other_height = if answer.other_selected { 4 } else { 0 };
+            let error_height = u16::from(dialog.validation_error.is_some());
+            let [
+                heading_area,
+                body_area,
+                other_area,
+                error_area,
+                actions_area,
+            ] = Layout::vertical([
+                Constraint::Length(3.min(inner.height)),
+                Constraint::Min(3),
+                Constraint::Length(other_height),
+                Constraint::Length(error_height),
+                Constraint::Length(2.min(inner.height)),
+            ])
+            .areas(inner);
+
+            let mut heading = vec![Line::from(vec![
+                Span::styled(
+                    format!(" {} ", sanitize_bounded_terminal_text(&question.header)),
+                    Style::default()
+                        .fg(theme.bg_base)
+                        .bg(theme.accent_assistant)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}/{}", current + 1, question_count),
+                    Style::default().fg(theme.gray),
+                ),
+            ])];
+            if let Some(agent_id) = dialog.agent_id.as_deref() {
+                heading[0].spans.push(Span::styled(
+                    format!(
+                        "  {}: {}",
+                        language.text("来自", "from"),
+                        sanitize_bounded_terminal_text(agent_id)
+                    ),
+                    Style::default().fg(theme.text_secondary),
+                ));
+            }
+            heading.push(Line::styled(
+                sanitize_bounded_terminal_text(&question.question).into_owned(),
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            frame.render_widget(
+                Paragraph::new(heading).wrap(Wrap { trim: false }),
+                heading_area,
+            );
+
+            let selected_preview = question
+                .options
+                .get(answer.cursor)
+                .and_then(|option| option.preview.as_deref());
+            let option_rows = u16::try_from(question.options.len().saturating_add(1))
+                .unwrap_or(u16::MAX)
+                .min(body_area.height);
+            let (options_area, preview_area) = if selected_preview.is_some() {
+                if body_area.width >= 72 {
+                    let [options, _, preview] = Layout::horizontal([
+                        Constraint::Percentage(43),
+                        Constraint::Length(1),
+                        Constraint::Min(20),
+                    ])
+                    .areas(body_area);
+                    (options, Some(preview))
+                } else {
+                    let [options, preview] =
+                        Layout::vertical([Constraint::Length(option_rows), Constraint::Min(2)])
+                            .areas(body_area);
+                    (options, Some(preview))
+                }
+            } else {
+                (body_area, None)
+            };
+
+            let mut pointer_areas = Vec::new();
+            for index in 0..question.options.len().saturating_add(1) {
+                if index >= usize::from(options_area.height) {
+                    break;
+                }
+                let row = Rect::new(
+                    options_area.x,
+                    options_area.y.saturating_add(index as u16),
+                    options_area.width,
+                    1,
+                );
+                pointer_areas.push(row);
+                let (label, description, selected) =
+                    if let Some(option) = question.options.get(index) {
+                        let mut label = sanitize_bounded_terminal_text(&option.label).into_owned();
+                        if option.recommended {
+                            label.push_str(language.text(" · 推荐", " · Recommended"));
+                        }
+                        (
+                            label,
+                            sanitize_bounded_terminal_text(&option.description).into_owned(),
+                            answer.selected.get(index).copied().unwrap_or(false),
+                        )
+                    } else {
+                        (
+                            language
+                                .text("其他（自行输入）", "Other (type your own)")
+                                .to_string(),
+                            language
+                                .text("输入上述选项之外的答案", "Provide a custom answer")
+                                .to_string(),
+                            answer.other_selected,
+                        )
+                    };
+                let marker = if question.multi_select {
+                    if selected { "[x]" } else { "[ ]" }
+                } else if selected {
+                    "(●)"
+                } else {
+                    "( )"
+                };
+                let active = focus == QuestionFocus::Options && answer.cursor == index;
+                let line = Line::from(vec![
+                    Span::styled(
+                        if active { "> " } else { "  " },
+                        Style::default().fg(theme.accent_assistant),
+                    ),
+                    Span::styled(
+                        format!("{marker} {label}"),
+                        Style::default()
+                            .fg(if active {
+                                theme.text_primary
+                            } else {
+                                theme.gray_bright
+                            })
+                            .add_modifier(if active {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(format!(" — {description}"), Style::default().fg(theme.gray)),
+                ]);
+                frame.render_widget(
+                    Paragraph::new(fit_line_to_width(line, usize::from(row.width))),
+                    row,
+                );
+            }
+
+            if let (Some(preview), Some(preview_area)) = (selected_preview, preview_area) {
+                let preview_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.gray_dim))
+                    .title(language.text(" 预览 ", " Preview "));
+                let preview_inner = preview_block.inner(preview_area).inner(Margin {
+                    horizontal: 1,
+                    vertical: 0,
+                });
+                frame.render_widget(preview_block, preview_area);
+                let width = usize::from(preview_inner.width.max(1));
+                let preview_lines = question_preview_lines(preview, theme, width);
+                dialog.preview_page_rows = usize::from(preview_inner.height.max(1));
+                dialog.preview_max_scroll =
+                    preview_lines.len().saturating_sub(dialog.preview_page_rows);
+                dialog.preview_scroll = dialog.preview_scroll.min(dialog.preview_max_scroll);
+                let visible_preview_lines = preview_lines
+                    .into_iter()
+                    .skip(dialog.preview_scroll)
+                    .take(dialog.preview_page_rows)
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(visible_preview_lines), preview_inner);
+                app.dialog_pointer.set_preview_area(preview_inner);
+            } else {
+                dialog.preview_scroll = 0;
+                dialog.preview_max_scroll = 0;
+                dialog.preview_page_rows = 1;
+            }
+
+            let cursor = if answer.other_selected && other_area.area() > 0 {
+                let other_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if focus == QuestionFocus::OtherInput {
+                        theme.prompt_border_active
+                    } else {
+                        theme.gray_dim
+                    }))
+                    .title(language.text(" 其他答案 ", " Other answer "));
+                let other_inner = other_block.inner(other_area).inner(Margin {
+                    horizontal: 1,
+                    vertical: 0,
+                });
+                frame.render_widget(other_block, other_area);
+                app.dialog_pointer.set_input_area(other_inner);
+                frame.render_stateful_widget_ref(
+                    answer.other_input.as_ref(),
+                    other_inner,
+                    &mut answer.other_input_state,
+                );
+                (focus == QuestionFocus::OtherInput && !response_inflight)
+                    .then(|| {
+                        answer
+                            .other_input
+                            .cursor_pos_with_state(other_inner, answer.other_input_state)
+                    })
+                    .flatten()
+            } else {
+                None
+            };
+
+            if let Some(error) = dialog.validation_error.as_deref() {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        sanitize_bounded_terminal_text(error).into_owned(),
+                        Style::default().fg(theme.accent_error),
+                    )),
+                    error_area,
+                );
+            }
+
+            let action_labels = actions
+                .iter()
+                .map(|action| match action {
+                    QuestionDialogAction::Previous => language.text("上一题", "Previous"),
+                    QuestionDialogAction::Next => language.text("下一题", "Next"),
+                    QuestionDialogAction::Submit => language.text("提交", "Submit"),
+                    QuestionDialogAction::Decline => language.text("跳过回答", "Decline"),
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                Paragraph::new(Line::from(
+                    action_labels
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(index, label)| {
+                            let active = focus == QuestionFocus::Actions && index == action_index;
+                            [
+                                Span::styled(
+                                    if active { " [" } else { "  " },
+                                    Style::default().fg(theme.accent_assistant),
+                                ),
+                                Span::styled(
+                                    (*label).to_string(),
+                                    Style::default()
+                                        .fg(if active {
+                                            theme.text_primary
+                                        } else {
+                                            theme.gray
+                                        })
+                                        .add_modifier(if active {
+                                            Modifier::BOLD
+                                        } else {
+                                            Modifier::empty()
+                                        }),
+                                ),
+                                Span::styled(
+                                    if active { "]" } else { " " },
+                                    Style::default().fg(theme.accent_assistant),
+                                ),
+                            ]
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                actions_area,
+            );
+            pointer_areas.extend(crate::dialog_interaction::inline_choice_areas(
+                actions_area,
+                &action_labels,
+            ));
+            app.dialog_pointer.set_choice_areas(pointer_areas);
+            cursor
         }
         Some(RequestDialog::Elicitation {
             server_name,
@@ -11355,14 +11689,17 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         let compact = rendered.replace(' ', "");
-        assert!(compact.contains("审批跳过所有审批"), "{rendered}");
+        assert!(
+            compact.contains("审批常规操作自动批准（敏感操作仍确认）"),
+            "{rendered}"
+        );
         assert!(compact.contains("基础上下文12.4k/128k·10%"), "{rendered}");
         assert!(compact.contains("模型deepseek-v4-flash"), "{rendered}");
         assert!(!rendered.contains("bypassPermissions"), "{rendered}");
         assert!(!rendered.contains("SDK"), "{rendered}");
         assert!(
             buffer.content.iter().any(|cell| {
-                cell.symbol() == "跳" && cell.bg == app.renderer_theme().accent_error
+                cell.symbol() == "常" && cell.bg == app.renderer_theme().accent_error
             }),
             "dangerous approval mode must use the error-color chip"
         );
@@ -11517,9 +11854,10 @@ mod tests {
         let cases = [
             ("default", "标准审批"),
             ("acceptEdits", "自动接受编辑"),
-            ("bypassPermissions", "跳过所有审批"),
+            ("bypassPermissions", "常规操作自动批准（敏感操作仍确认）"),
             ("plan", "只规划"),
             ("dontAsk", "仅执行已批准"),
+            ("auto", "自动模式"),
         ];
         for (mode, expected) in cases {
             assert_eq!(
@@ -11868,6 +12206,137 @@ mod tests {
         assert!(text_compact.contains("仅允许一次"), "{text}");
     }
 
+    fn open_question_dialog_for_ui(app: &mut TuiApp, multi_select: bool) {
+        let preview = (1..=40)
+            .map(|line| format!("preview line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut first_option = json!({
+            "label":"Native TUI",
+            "description":"Render directly in Ratatui",
+            "recommended":true
+        });
+        if !multi_select {
+            first_option["preview"] =
+                Value::String(format!("**Markdown preview**\n\n```text\n{preview}\n```"));
+        }
+        app.handle_runtime_event(RuntimeEvent::Envelope(RawEnvelope {
+            sequence: 1,
+            encoded_len: 1,
+            value: json!({
+                "type":"control_request",
+                "request_id":"question-ui",
+                "request":{
+                    "subtype":"can_use_tool",
+                    "tool_name":"AskUserQuestion",
+                    "tool_use_id":"question-tool-ui",
+                    "agent_id":"worker-ui",
+                    "input":{
+                        "questions":[{
+                            "question":"Which rendering approach should be used?",
+                            "header":"Rendering",
+                            "multiSelect":multi_select,
+                            "options":[
+                                first_option,
+                                {
+                                    "label":"Plain text",
+                                    "description":"Use a simple fallback"
+                                }
+                            ]
+                        }]
+                    }
+                }
+            }),
+            classification: EnvelopeClass::ControlRequest {
+                request_id: "question-ui".to_string(),
+                subtype: "can_use_tool".to_string(),
+            },
+            correlation: None,
+        }));
+        assert!(matches!(app.dialog, Some(RequestDialog::Question(_))));
+    }
+
+    #[test]
+    fn question_dialog_renders_recommendation_without_preselection_and_scrollable_preview() {
+        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        app.release_startup_barrier_for_test();
+        open_question_dialog_for_ui(&mut app, false);
+
+        let text = render_buffer(&mut app, 110, 32);
+        let compact = text.replace(' ', "");
+        assert!(text.contains("Rendering"), "{text}");
+        assert!(text.contains("worker-ui"), "{text}");
+        assert!(compact.contains("推荐"), "{text}");
+        assert!(compact.contains("其他（自行输入）"), "{text}");
+        assert!(compact.contains("预览"), "{text}");
+        assert!(compact.contains("Markdownpreview"), "{text}");
+        assert!(
+            !text.contains("**Markdown preview**"),
+            "the advertised markdown preview format must be consumed by the renderer: {text}"
+        );
+        assert!(compact.contains("提交"), "{text}");
+        assert!(compact.contains("跳过回答"), "{text}");
+        assert!(
+            text.contains("( ) Native TUI"),
+            "recommended metadata must not preselect an option: {text}"
+        );
+        assert!(app.dialog_pointer.preview_area().is_some());
+        assert_eq!(app.dialog_pointer.choice_areas().len(), 5);
+
+        let before = match app.dialog.as_ref() {
+            Some(RequestDialog::Question(dialog)) => {
+                assert!(dialog.preview_max_scroll > 0);
+                dialog.preview_scroll
+            }
+            _ => unreachable!(),
+        };
+        let outcome = app.handle_event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageDown,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+        assert!(outcome.is_empty());
+        assert!(matches!(
+            app.dialog.as_ref(),
+            Some(RequestDialog::Question(dialog)) if dialog.preview_scroll > before
+        ));
+    }
+
+    #[test]
+    fn question_dialog_pointer_double_click_uses_keyboard_toggle_authority() {
+        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        app.release_startup_barrier_for_test();
+        open_question_dialog_for_ui(&mut app, true);
+        let _ = render_buffer(&mut app, 110, 32);
+        let option_area = app.dialog_pointer.choice_areas()[0];
+        let mut pointer = |at| {
+            app.handle_event_at(
+                crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: option_area.x,
+                    row: option_area.y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                }),
+                at,
+            )
+        };
+        let start = std::time::Instant::now();
+        assert!(pointer(start).actions.is_empty());
+        assert!(
+            pointer(start + std::time::Duration::from_millis(100))
+                .actions
+                .is_empty()
+        );
+        assert!(matches!(
+            app.dialog.as_ref(),
+            Some(RequestDialog::Question(dialog))
+                if dialog.current_answer().selected == vec![true, false]
+        ));
+    }
+
     #[test]
     fn request_dialog_pointer_hover_and_double_click_reuse_existing_response_authority() {
         let suggestions = json!([{
@@ -11886,7 +12355,7 @@ mod tests {
             suggestions: Some(suggestions.clone()),
             choices: vec![
                 crate::tui_app::PermissionChoice::AllowOnce,
-                crate::tui_app::PermissionChoice::AllowAlways,
+                crate::tui_app::PermissionChoice::AllowSession,
                 crate::tui_app::PermissionChoice::Deny,
             ],
             selected: 0,
@@ -11940,7 +12409,7 @@ mod tests {
         assert_eq!(request_id, "permission-pointer");
         assert_eq!(response["behavior"], "allow");
         assert_eq!(response["updatedInput"]["file_path"], "a");
-        assert_eq!(response["decisionClassification"], "user_permanent");
+        assert_eq!(response["decisionClassification"], "user_temporary");
         assert_eq!(response["updatedPermissions"], suggestions);
         assert!(app.dialog_response_inflight());
     }
@@ -13976,6 +14445,75 @@ mod tests {
                 .iter()
                 .any(|cell| { cell.symbol() == "⛁" && cell.fg == expected_cyan })
         );
+    }
+
+    #[test]
+    fn context_overlay_narrow_pixels_remain_visible_and_scroll_to_the_measured_end() {
+        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        app.release_startup_barrier_for_test();
+        let mut payload = crate::context_visualization::minimal_test_control_response();
+        payload["response"]["memoryFiles"] = json!(
+            (0..14)
+                .map(|index| json!({
+                    "path":format!("memory-{index:02}.md"),
+                    "type":"project",
+                    "tokens":100
+                }))
+                .collect::<Vec<_>>()
+        );
+        let context =
+            crate::context_visualization::ContextVisualization::from_control_response(&payload)
+                .expect("valid long context response");
+        app.overlay = Some(crate::tui_app::Overlay::context(context, app.ui_language()));
+
+        let first = render_test_buffer(&mut app, 56, 18);
+        let first_rows = buffer_row_texts(&first);
+        let first_pixels = first_rows.join("\n");
+        let first_compact = first_pixels.replace(' ', "");
+        assert!(first_compact.contains("上下文用量"), "{first_rows:#?}");
+        assert!(first_compact.contains("⛁⛶"), "{first_rows:#?}");
+        assert!(
+            first_compact.contains("model-from-sdk·20k/100k词元（20%"),
+            "{first_rows:#?}"
+        );
+        assert!(!first_pixels.contains("\"categories\""), "{first_rows:#?}");
+
+        let (viewport_height, total_lines) = {
+            let overlay = app.overlay.as_ref().expect("context overlay");
+            (
+                overlay
+                    .body_viewport_height
+                    .expect("production renderer measured body rows"),
+                overlay
+                    .context_visualization
+                    .as_ref()
+                    .expect("typed context projection")
+                    .line_count(),
+            )
+        };
+        assert!(total_lines > usize::from(viewport_height));
+        app.overlay.as_mut().expect("context overlay").scroll = usize::MAX;
+
+        let last = render_test_buffer(&mut app, 56, 18);
+        let last_rows = buffer_row_texts(&last);
+        let last_pixels = last_rows.join("\n");
+        assert!(last_pixels.contains("memory-13.md"), "{last_rows:#?}");
+        assert!(last_pixels.replace(' ', "").contains("上下文用量"));
+        assert_eq!(
+            app.overlay.as_ref().expect("context overlay").scroll,
+            total_lines.saturating_sub(usize::from(viewport_height)),
+            "scroll must clamp against the same measured pixel viewport used for painting"
+        );
+        for row in 0..last.area.height {
+            for column in 0..last.area.width {
+                let symbol_width =
+                    unicode_width::UnicodeWidthStr::width(last[(column, row)].symbol());
+                assert!(
+                    symbol_width <= usize::from(last.area.width - column),
+                    "wide context glyph starts outside the remaining terminal cells at ({column},{row})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -30,27 +30,35 @@ export function parseSlashCommand(input: string): ParsedSlashCommand | null {
     return null
   }
 
-  // Remove the leading '/' and split by spaces
+  // Remove the leading slash and split at the first ECMAScript whitespace
+  // code point. The Rust direct-TUI router uses the same whitespace family;
+  // accepting only ASCII space here made `/command\targ` and Unicode-space
+  // variants route to the runtime and then fail as an unknown command.
   const withoutSlash = trimmedInput.slice(1)
-  const words = withoutSlash.split(' ')
+  const separatorIndex = withoutSlash.search(/\s/u)
+  const firstWord =
+    separatorIndex === -1
+      ? withoutSlash
+      : withoutSlash.slice(0, separatorIndex)
 
-  if (!words[0]) {
+  if (!firstWord) {
     return null
   }
 
-  let commandName = words[0]
+  let commandName = firstWord
   let isMcp = false
-  let argsStartIndex = 1
+  let args =
+    separatorIndex === -1 ? '' : withoutSlash.slice(separatorIndex + 1)
 
-  // Check for MCP commands (second word is '(MCP)')
-  if (words.length > 1 && words[1] === '(MCP)') {
+  // Check for MCP commands (second token is '(MCP)'). Preserve the historical
+  // argument tail after consuming one separator while accepting every
+  // whitespace separator supported by the direct renderer.
+  const mcpRest = args.replace(/^\s+/u, '')
+  if (mcpRest === '(MCP)' || /^\(MCP\)\s/u.test(mcpRest)) {
     commandName = commandName + ' (MCP)'
     isMcp = true
-    argsStartIndex = 2
+    args = mcpRest.slice('(MCP)'.length).replace(/^\s/u, '')
   }
-
-  // Extract arguments (everything after command name)
-  const args = words.slice(argsStartIndex).join(' ')
 
   return {
     commandName,

@@ -225,6 +225,10 @@ mod tests {
             r##"printf '%s' '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20" viewBox="0 0 40 20"><rect width="40" height="20" fill="#445566"/></svg>' > "$4""##,
         );
         let out = MmdcEngine::new(bin)
+            // This fixture proves output/raster semantics, not the production
+            // latency budget. A full workspace test can briefly starve the
+            // shell child while other native test binaries are linking.
+            .with_timeout(Duration::from_secs(10))
             .render("flowchart LR; A-->B", &RenderParams::default())
             .expect("fake mmdc output should rasterize");
         assert!(out.width_px > 0 && out.height_px > 0);
@@ -237,6 +241,7 @@ mod tests {
         // Exits 0 but writes nothing → the "no readable SVG output" Layout error.
         let (_dir, bin) = fake_mmdc("exit 0");
         let err = MmdcEngine::new(bin)
+            .with_timeout(Duration::from_secs(10))
             .render("flowchart LR; A-->B", &RenderParams::default())
             .expect_err("missing output must error");
         assert!(matches!(err, MermaidError::Layout(_)), "got {err:?}");
@@ -249,6 +254,7 @@ mod tests {
         // timeout or a missing binary.
         let (_dir, bin) = fake_mmdc("exit 3");
         let err = MmdcEngine::new(bin)
+            .with_timeout(Duration::from_secs(10))
             .render("flowchart LR; A-->B", &RenderParams::default())
             .expect_err("non-zero exit must error");
         assert!(matches!(err, MermaidError::Layout(_)), "got {err:?}");

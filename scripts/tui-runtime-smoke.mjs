@@ -7,11 +7,21 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createPersistentStreamPoller } from './persistent-stream-poller.mjs'
 import { classifyRuntimeStderr } from './release-runtime-stderr.mjs'
+import {
+  verifyTuiRuntimeArtifactBinding,
+  verifyTuiRuntimeBuildBinding,
+} from './tui-runtime-source-binding.mjs'
+import {
+  assertCommandCatalogChangedRequest,
+  commandCatalogChangedAck,
+  commandCatalogChangedSubtype,
+} from './tui-runtime-smoke-contract.mjs'
 
 const root = resolve(
   process.env.CRABCODE_SMOKE_PACKAGE_ROOT ?? resolve(import.meta.dir, '..'),
 )
 const runtime = join(root, 'dist/tui-runtime/index.js')
+const runtimeMetafile = join(root, 'dist/tui-runtime/metafile.json')
 const runtimeExecutable = resolve(
   process.env.CRABCODE_SMOKE_BUN ?? process.execPath,
 )
@@ -38,8 +48,20 @@ const rendererThemeSettings = new Set([
   'light-ansi',
   'dark-ansi',
 ])
-
 await stat(runtime)
+const runtimeMetafilePayload = JSON.parse(
+  readFileSync(runtimeMetafile, 'utf8'),
+)
+verifyTuiRuntimeBuildBinding(
+  runtimeMetafilePayload,
+  releaseMaterials
+    ? {
+        version: releaseMaterials.version,
+        buildId: releaseMaterials.buildId,
+      }
+    : {},
+)
+verifyTuiRuntimeArtifactBinding(runtime, runtimeMetafilePayload)
 const configDir = await mkdtemp(join(tmpdir(), 'crabcode-tui-smoke-'))
 const child = Bun.spawn({
   cmd: [
@@ -102,6 +124,7 @@ process.once('SIGINT', () => process.exit(130))
 process.once('SIGTERM', () => process.exit(143))
 
 const initializeId = 'tui-runtime-smoke-initialize'
+const contextUsageId = 'tui-runtime-smoke-context-usage'
 const endId = 'tui-runtime-smoke-end'
 const writeFrame = async value => {
   child.stdin.write(`${JSON.stringify(value)}\n`)
@@ -139,10 +162,64 @@ const deadline = Date.now() + timeoutMs
 const frameTypes = []
 let buffer = ''
 let initializePayload
+let contextUsagePayload
+let compactFailureResult
+let compactFailureRendered = false
+let compactProgressFrames = 0
 const turnResults = []
 let endAcknowledged = false
 let rendererContextAcknowledged = false
-let turnSubmitted = false
+let compactSubmitted = false
+let costTurnsSubmitted = 0
+let commandCatalogRefreshesAcknowledged = 0
+let latestCommandCatalogSize = null
+
+const submitUserText = async content => {
+  await writeFrame({
+    type: 'user',
+    message: { role: 'user', content },
+    parent_tool_use_id: null,
+  })
+}
+
+const assertContextUsagePayload = payload => {
+  if (
+    !payload ||
+    typeof payload !== 'object' ||
+    !Number.isFinite(payload.totalTokens) ||
+    payload.totalTokens < 0 ||
+    !Number.isFinite(payload.rawMaxTokens) ||
+    payload.rawMaxTokens <= 0 ||
+    !Number.isFinite(payload.maxTokens) ||
+    payload.maxTokens <= 0 ||
+    !Number.isFinite(payload.percentage) ||
+    payload.percentage < 0 ||
+    !Array.isArray(payload.categories) ||
+    payload.categories.some(
+      category =>
+        !category ||
+        typeof category !== 'object' ||
+        typeof category.name !== 'string' ||
+        !Number.isFinite(category.tokens) ||
+        category.tokens < 0 ||
+        typeof category.color !== 'string' ||
+        (category.isDeferred !== undefined &&
+          typeof category.isDeferred !== 'boolean'),
+    ) ||
+    !Array.isArray(payload.gridRows) ||
+    payload.gridRows.some(row => !Array.isArray(row)) ||
+    typeof payload.model !== 'string' ||
+    !Array.isArray(payload.memoryFiles) ||
+    !Array.isArray(payload.mcpTools) ||
+    !Array.isArray(payload.agents) ||
+    typeof payload.isAutoCompactEnabled !== 'boolean' ||
+    !Object.hasOwn(payload, 'apiUsage')
+  ) {
+    throw new Error(
+      `get_context_usage returned an invalid payload: ${JSON.stringify(payload)}`,
+    )
+  }
+}
 
 // Rust emits the existing SDK initialize exactly once as soon as its writer is
 // available. The renderer-session router must stash this exact line until the
@@ -220,11 +297,42 @@ while (Date.now() < deadline && !endAcknowledged) {
       }
       initializePayload = frame.response.response
       await writeFrame({
-        type: 'user',
-        message: { role: 'user', content: '/cost' },
-        parent_tool_use_id: null,
+        type: 'control_request',
+        request_id: contextUsageId,
+        request: { subtype: 'get_context_usage' },
       })
-      turnSubmitted = true
+      continue
+    }
+
+    if (
+      frame.type === 'control_response' &&
+      frame.response?.request_id === contextUsageId
+    ) {
+      if (frame.response.subtype !== 'success') {
+        throw new Error(`get_context_usage rejected: ${line}`)
+      }
+      if (contextUsagePayload || compactSubmitted) {
+        throw new Error(`duplicate get_context_usage response: ${line}`)
+      }
+      assertContextUsagePayload(frame.response.response)
+      contextUsagePayload = frame.response.response
+      await submitUserText('/compact')
+      compactSubmitted = true
+      continue
+    }
+
+    if (
+      frame.type === 'control_request' &&
+      frame.request?.subtype === commandCatalogChangedSubtype
+    ) {
+      if (!initializePayload) {
+        throw new Error(
+          `command-catalog refresh arrived before initialize completed: ${line}`,
+        )
+      }
+      latestCommandCatalogSize = assertCommandCatalogChangedRequest(frame)
+      await writeReverseControlSuccess(frame, commandCatalogChangedAck())
+      commandCatalogRefreshesAcknowledged += 1
       continue
     }
 
@@ -234,17 +342,52 @@ while (Date.now() < deadline && !endAcknowledged) {
       )
     }
 
+    if (
+      frame.type === 'system' &&
+      frame.subtype === 'local_command' &&
+      typeof frame.content === 'string' &&
+      frame.content.includes('<local-command-stderr>')
+    ) {
+      compactFailureRendered = true
+    }
+
+    if (
+      frame.type === 'progress' &&
+      frame.data?.type === 'compact_progress'
+    ) {
+      compactProgressFrames += 1
+    }
+
     if (frame.type === 'result') {
-      if (frame.subtype !== 'success') {
-        throw new Error(`fixture turn failed: ${line}`)
+      if (!compactFailureResult) {
+        if (
+          frame.subtype !== 'error_during_execution' ||
+          frame.is_error !== true ||
+          frame.stop_reason !== null ||
+          !Array.isArray(frame.errors) ||
+          !frame.errors.some(error =>
+            ['没有可压缩的消息', 'No messages to compact'].some(expected =>
+              String(error).includes(expected),
+            ),
+          ) ||
+          !compactFailureRendered
+        ) {
+          throw new Error(
+            `empty-history /compact did not preserve its failure lifecycle: ${line}`,
+          )
+        }
+        compactFailureResult = frame
+        await submitUserText('/cost')
+        costTurnsSubmitted += 1
+        continue
+      }
+      if (frame.subtype !== 'success' || frame.is_error !== false) {
+        throw new Error(`fixture /cost turn failed: ${line}`)
       }
       turnResults.push(frame)
       if (turnResults.length === 1) {
-        await writeFrame({
-          type: 'user',
-          message: { role: 'user', content: '/cost' },
-          parent_tool_use_id: null,
-        })
+        await submitUserText('/cost')
+        costTurnsSubmitted += 1
       } else if (turnResults.length === 2) {
         await writeFrame({
           type: 'control_request',
@@ -277,7 +420,12 @@ while (Date.now() < deadline && !endAcknowledged) {
 if (
   !rendererContextAcknowledged ||
   !initializePayload ||
-  !turnSubmitted ||
+  !contextUsagePayload ||
+  !compactSubmitted ||
+  !compactFailureResult ||
+  !compactFailureRendered ||
+  compactProgressFrames !== 0 ||
+  costTurnsSubmitted !== 2 ||
   turnResults.length !== 2 ||
   !endAcknowledged
 ) {
@@ -301,8 +449,13 @@ if (
     `runtime smoke timed out: ${JSON.stringify({
       rendererContextAcknowledged,
       initialized: Boolean(initializePayload),
-      turnSubmitted,
-      turnsCompleted: turnResults.length,
+      contextUsage: Boolean(contextUsagePayload),
+      compactSubmitted,
+      compactFailure: Boolean(compactFailureResult),
+      compactFailureRendered,
+      compactProgressFrames,
+      costTurnsSubmitted,
+      costTurnsCompleted: turnResults.length,
       endAcknowledged,
       frameTypes,
       exitAfterKill,
@@ -339,11 +492,16 @@ process.stdout.write(
       rendererContext: 'received',
       workspaceTrust: 'skipped-by-established-demo-authority',
       initialize: 'success',
-      turns: '2/2 success',
+      contextUsage: 'renderer-owned /context control: typed success',
+      compactEmptyHistory: 'rendered error + terminal failure',
+      compactProgressFrames,
+      costTurns: '2/2 success',
       endSession: 'success',
       commands: Array.isArray(initializePayload.commands)
         ? initializePayload.commands.length
         : null,
+      commandCatalogRefreshesAcknowledged,
+      latestCommandCatalogSize,
       agents: Array.isArray(initializePayload.agents)
         ? initializePayload.agents.length
         : null,

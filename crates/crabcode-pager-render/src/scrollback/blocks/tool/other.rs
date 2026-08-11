@@ -489,6 +489,45 @@ impl BlockContent for OtherToolCallBlock {
 /// Returns `Vec<(question, answer)>`. Empty vec means the output is not a
 /// recognized Q&A format and should be rendered generically.
 fn parse_ask_user_qa_pairs(output: &str) -> Vec<(String, String)> {
+    // Canonical v2: a JSON array follows a stable prefix. Parsing JSON avoids
+    // the quote/comma ambiguity of the legacy sentence format while the old
+    // branches below remain as compatibility adapters for historical turns.
+    if let Some(body) = output.strip_prefix("User submitted the following structured answers:\n") {
+        let Ok(serde_json::Value::Array(answers)) = serde_json::from_str(body) else {
+            return Vec::new();
+        };
+        return answers
+            .into_iter()
+            .filter_map(|answer| {
+                let answer = answer.as_object()?;
+                let question = answer
+                    .get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| answer.get("questionId").and_then(serde_json::Value::as_str))?
+                    .to_string();
+                let mut values = answer
+                    .get("selectedOptions")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|option| {
+                        option
+                            .get("label")
+                            .and_then(serde_json::Value::as_str)
+                            .or_else(|| option.get("id").and_then(serde_json::Value::as_str))
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if let Some(custom_text) =
+                    answer.get("customText").and_then(serde_json::Value::as_str)
+                {
+                    values.push(custom_text.to_string());
+                }
+                Some((question, values.join(" · ")))
+            })
+            .collect();
+    }
+
     // Path A: "User has answered your questions: "Q"="A", "Q"="A". You can now..."
     if let Some(rest) = output.strip_prefix("User has answered your questions: ") {
         // Strip the trailing ". You can now continue with the user's answers in mind."
@@ -622,6 +661,21 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn structured_question_result_parses_ids_labels_and_comma_text_losslessly() {
+        let output = concat!(
+            "User submitted the following structured answers:\n",
+            r#"[{"questionId":"q1","question":"Which targets?","selectedOptions":[{"id":"o1","label":"Web, API"},{"id":"o2","label":"CLI"}],"customText":"Desktop, too"}]"#,
+        );
+        assert_eq!(
+            parse_ask_user_qa_pairs(output),
+            vec![(
+                "Which targets?".to_string(),
+                "Web, API · CLI · Desktop, too".to_string(),
+            )]
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import { projectCommandCatalogEntries } from '../../src/cli/commandCatalogProjection.js'
 import type { Command } from '../../src/types/command.js'
 import { parseFrontmatter } from '../../src/utils/frontmatterParser.js'
+import { installBuiltInCommandNamesProvider } from '../../src/utils/builtInCommandNamesProvider.js'
 
 function command(
   name: string,
@@ -12,6 +13,7 @@ function command(
     description?: string
     userFacingName?: () => string
     userInvocable?: boolean
+    isHidden?: boolean
   } = {},
 ): Command {
   return {
@@ -22,6 +24,7 @@ function command(
     argumentHint: options.argumentHint,
     userFacingName: options.userFacingName,
     userInvocable: options.userInvocable,
+    isHidden: options.isHidden,
   } as unknown as Command
 }
 
@@ -191,5 +194,47 @@ describe('slash-command control catalog projection', () => {
     expect(
       Object.values(entry!).every(value => typeof value === 'string'),
     ).toBe(true)
+  })
+
+  test('preserves hidden dispatch and builtin help metadata per invocation token', () => {
+    installBuiltInCommandNamesProvider(
+      () => new Set(['builtin-command', 'builtin-alias']),
+    )
+    try {
+      const entries = projectCommandCatalogEntries(
+        [
+          command('builtin-command', {
+            aliases: ['builtin-alias'],
+            isHidden: true,
+          }),
+          command('custom-command'),
+        ],
+        item => item.description,
+      )
+
+      expect(entries).toEqual([
+        {
+          name: 'builtin-command',
+          description: 'builtin-command description',
+          argumentHint: '',
+          hidden: true,
+          builtin: true,
+        },
+        {
+          name: 'builtin-alias',
+          description: 'builtin-command description',
+          argumentHint: '',
+          hidden: true,
+          builtin: true,
+        },
+        {
+          name: 'custom-command',
+          description: 'custom-command description',
+          argumentHint: '',
+        },
+      ])
+    } finally {
+      installBuiltInCommandNamesProvider(() => new Set())
+    }
   })
 })

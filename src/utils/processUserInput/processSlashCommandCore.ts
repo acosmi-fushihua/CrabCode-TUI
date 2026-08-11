@@ -56,10 +56,20 @@ import { buildPluginCommandTelemetryFields } from '../telemetry/pluginTelemetry.
 import { getAssistantMessageContentLength } from '../tokens.js';
 import { createAgentId } from '../uuid.js';
 import { getWorkload } from '../workloadContext.js';
-import type { ProcessUserInputBaseResult, ProcessUserInputContext } from './processUserInputCore.js';
+import type { LocalCommandTerminalOutcome, ProcessUserInputBaseResult, ProcessUserInputContext } from './processUserInputCore.js';
 type SlashCommandResult = ProcessUserInputBaseResult & {
   command: Command;
 };
+
+function terminalOutcomeForLocalCommand(
+  error: unknown,
+  context: ProcessUserInputContext,
+): LocalCommandTerminalOutcome {
+  return {
+    status: context.abortController.signal.aborted ? 'cancelled' : 'error',
+    message: String(error),
+  }
+}
 
 export type SlashCommandRuntime = {
   isBuiltInCommandName: (name: string) => boolean
@@ -436,6 +446,7 @@ export async function processSlashCommandCore(inputString: string, precedingInpu
     effort,
     command: returnedCommand,
     resultText,
+    localCommandOutcome,
     nextInput,
     submitNextInput
   } = await getMessagesForSlashCommand(commandName, parsedArgs, setToolJSX, context, precedingInputBlocks, imageContentBlocks, isAlreadyProcessing, canUseTool, uuid, runtime);
@@ -509,6 +520,7 @@ export async function processSlashCommandCore(inputString: string, precedingInpu
       messages: [],
       shouldQuery: false,
       model,
+      localCommandOutcome,
       nextInput,
       submitNextInput
     };
@@ -527,7 +539,8 @@ export async function processSlashCommandCore(inputString: string, precedingInpu
       messages: [createSyntheticUserCaveatMessage(), ...newMessages],
       shouldQuery: messageShouldQuery,
       allowedTools,
-      model
+      model,
+      localCommandOutcome,
     };
   }
 
@@ -583,6 +596,7 @@ export async function processSlashCommandCore(inputString: string, precedingInpu
     model,
     effort,
     resultText,
+    localCommandOutcome,
     nextInput,
     submitNextInput
   };
@@ -648,6 +662,7 @@ function localJsxOutcomeToSlashResult(
     messages,
     shouldQuery: outcome.shouldQuery ?? false,
     command,
+    resultText: outcome.result,
     nextInput: outcome.nextInput,
     submitNextInput: outcome.submitNextInput,
   }
@@ -695,6 +710,7 @@ async function getMessagesForSlashCommand(commandName: string, args: string, set
         shouldQuery: false,
         command,
         resultText: message,
+        localCommandOutcome: { status: 'error', message },
       }
     }
   }
@@ -713,6 +729,7 @@ async function getMessagesForSlashCommand(commandName: string, args: string, set
               shouldQuery: false,
               command,
               resultText: message,
+              localCommandOutcome: { status: 'error', message },
             }
           }
           return new Promise<SlashCommandResult>(resolve => {
@@ -767,10 +784,22 @@ async function getMessagesForSlashCommand(commandName: string, args: string, set
                 shouldHidePromptInput: false,
                 clearLocalJSX: true
               });
+              const localCommandOutcome: LocalCommandTerminalOutcome =
+                e instanceof AbortError
+                  ? { status: 'cancelled', message: String(e) }
+                  : terminalOutcomeForLocalCommand(e, context);
+              const displayArgs = command.isSensitive && args.trim() ? '***' : args;
               void resolve({
-                messages: [],
+                messages: [
+                  createCommandInputMessage(formatCommandInput(command, displayArgs)),
+                  createCommandInputMessage(
+                    `<local-command-stderr>${localCommandOutcome.message}</local-command-stderr>`,
+                  ),
+                ],
                 shouldQuery: false,
-                command
+                command,
+                resultText: localCommandOutcome.message,
+                localCommandOutcome,
               });
             });
           });
@@ -840,10 +869,13 @@ async function getMessagesForSlashCommand(commandName: string, args: string, set
             };
           } catch (e) {
             logError(e);
+            const localCommandOutcome = terminalOutcomeForLocalCommand(e, context);
             return {
-              messages: [userMessage, createCommandInputMessage(`<local-command-stderr>${String(e)}</local-command-stderr>`)],
+              messages: [userMessage, createCommandInputMessage(`<local-command-stderr>${localCommandOutcome.message}</local-command-stderr>`)],
               shouldQuery: false,
-              command
+              command,
+              resultText: localCommandOutcome.message,
+              localCommandOutcome
             };
           }
         }
@@ -858,6 +890,10 @@ async function getMessagesForSlashCommand(commandName: string, args: string, set
           } catch (e) {
             // Handle abort errors specially to show proper "Interrupted" message
             if (e instanceof AbortError) {
+              const localCommandOutcome: LocalCommandTerminalOutcome = {
+                status: 'cancelled',
+                message: String(e),
+              };
               return {
                 messages: [createUserMessage({
                   content: prepareUserContent({
@@ -868,9 +904,12 @@ async function getMessagesForSlashCommand(commandName: string, args: string, set
                   toolUse: false
                 })],
                 shouldQuery: false,
-                command
+                command,
+                resultText: localCommandOutcome.message,
+                localCommandOutcome
               };
             }
+            const localCommandOutcome = terminalOutcomeForLocalCommand(e, context);
             return {
               messages: [createUserMessage({
                 content: prepareUserContent({
@@ -878,10 +917,12 @@ async function getMessagesForSlashCommand(commandName: string, args: string, set
                   precedingInputBlocks
                 })
               }), createUserMessage({
-                content: `<local-command-stderr>${String(e)}</local-command-stderr>`
+                content: `<local-command-stderr>${localCommandOutcome.message}</local-command-stderr>`
               })],
               shouldQuery: false,
-              command
+              command,
+              resultText: localCommandOutcome.message,
+              localCommandOutcome
             };
           }
         }
@@ -1023,6 +1064,8 @@ async function getMessagesForPromptSlashCommand(command: CommandBase & PromptCom
       ],
       shouldQuery: false,
       command,
+      resultText: emptySkillError,
+      localCommandOutcome: { status: 'error', message: emptySkillError },
     };
   }
 

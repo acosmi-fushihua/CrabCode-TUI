@@ -14,6 +14,10 @@ import { isCurrentDirectoryBareGitRepo } from '../../utils/git.js'
 import type { PermissionRule } from '../../utils/permissions/PermissionRule.js'
 import type { PermissionUpdate } from '../../utils/permissions/PermissionUpdateSchema.js'
 import {
+  checkShellMutationSafetyFloor,
+  checkUnparsedShellMutationSafetyFloor,
+} from '../../utils/permissions/shellMutationSafety.js'
+import {
   createPermissionRequestMessage,
   getRuleByContentsForToolName,
 } from '../../utils/permissions/permissions.js'
@@ -657,6 +661,13 @@ export async function powershellToolHasPermission(
 
   // Parse the command once and thread through all sub-functions
   const parsed = await parsePowerShellCommand(command)
+  const degradedMutationSafety = parsed.valid
+    ? null
+    : checkUnparsedShellMutationSafetyFloor(
+        command,
+        getCwd(),
+        toolPermissionContext,
+      )
 
   // SECURITY: Check deny/ask rules BEFORE parse validity check.
   // Deny rules operate on the raw command string and don't need the parsed AST.
@@ -751,6 +762,7 @@ export async function powershellToolHasPermission(
     exactMatchResult.behavior === 'allow' &&
     !parsed.valid &&
     preParseAskDecision === null &&
+    degradedMutationSafety?.behavior === 'passthrough' &&
     classifyCommandName(command.split(/\s+/)[0] ?? '') !== 'application'
   ) {
     return exactMatchResult
@@ -858,6 +870,12 @@ export async function powershellToolHasPermission(
     if (preParseAskDecision !== null) {
       return preParseAskDecision
     }
+    if (
+      degradedMutationSafety !== null &&
+      degradedMutationSafety.behavior !== 'passthrough'
+    ) {
+      return degradedMutationSafety
+    }
     const decisionReason = {
       type: 'other' as const,
       reason: `Command contains malformed syntax that cannot be parsed: ${parsed.errors[0]?.message ?? 'unknown error'}`,
@@ -904,6 +922,23 @@ export async function powershellToolHasPermission(
   // but the reduce ensures any deny in decisions[] still beats it.
   if (preParseAskDecision !== null) {
     decisions.push(preParseAskDecision)
+  }
+
+  // Native applications share the same hidden-output/delegation grammar as
+  // Bash (curl/git/tar/awk/etc.). Cmdlets stay with the parameter-aware
+  // PowerShell path validator; unknown/application commands get the narrow
+  // explicit-sensitive-argument fallback. Collecting here preserves the
+  // global deny > ask > allow reduction below.
+  const mutationSafetyResult = checkShellMutationSafetyFloor(
+    allSubCommands.map(({ element }) => ({
+      argv: [element.name, ...element.args],
+      inspectUnknownArguments: element.nameType !== 'cmdlet',
+    })),
+    getCwd(),
+    toolPermissionContext,
+  )
+  if (mutationSafetyResult.behavior !== 'passthrough') {
+    decisions.push(mutationSafetyResult)
   }
 
   // Decision: security check — was step 3 (:630-650).

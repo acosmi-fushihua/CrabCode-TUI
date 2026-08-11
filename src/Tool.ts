@@ -482,6 +482,18 @@ export type Tool<
     },
   ): Promise<string>
   readonly inputSchema: Input
+  /**
+   * Optional schema for a fresh `updatedInput` returned by the trusted
+   * interactive permission host. It is deliberately separate from
+   * `inputSchema`, which is model-visible.
+   *
+   * PreToolUse and PermissionRequest hooks are not trusted interaction hosts;
+   * their `updatedInput` is always validated with `inputSchema`. Keeping the
+   * two boundaries separate prevents a hook from manufacturing user answers
+   * or another host-only field. When omitted, permission-host input is also
+   * revalidated with `inputSchema`.
+   */
+  readonly permissionUpdatedInputSchema?: AnyObject
   // Type for MCP tools that can specify their input schema directly in JSON Schema format
   // rather than converting from Zod schema
   readonly inputJSONSchema?: ToolInputJSONSchema

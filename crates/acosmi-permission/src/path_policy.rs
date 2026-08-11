@@ -17,6 +17,9 @@
 
 use crate::constants;
 use crate::types::{FileOperationType, PathCheckResult, PermissionDecisionReason};
+use std::ffi::OsString;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 // ─── Path Validation Entry ───
 
@@ -80,9 +83,107 @@ pub fn validate_path(raw_path: &str, cwd: &str, op: FileOperationType) -> PathCh
         return is_path_allowed(&base_dir, cwd, op, &[], &[]);
     }
 
-    // 7. 路径解析和权限检查
+    // 7. 词法路径解析和权限检查
     let resolved = resolve_path(&expanded, cwd);
-    is_path_allowed(&resolved, cwd, op, &[], &[])
+    let lexical_result = is_path_allowed(&resolved, cwd, op, &[], &[]);
+    if !lexical_result.allowed
+        || !matches!(op, FileOperationType::Write | FileOperationType::Create)
+    {
+        return lexical_result;
+    }
+
+    // 8. 文件系统身份检查。词法 containment 不能发现
+    // `<cwd>/link -> /outside` 或指向 `.crabcode` 的链接。对目标与 cwd
+    // 都解析现有祖先；最终目标不存在时，从最近的已存在父级
+    // realpath 后追加未存在后缀。任何解析错误都 fail closed。
+    validate_real_filesystem_target(&resolved, cwd, op)
+}
+
+/// Validate the filesystem identity reached through symlinks.
+///
+/// This closes policy bypasses through symlinks that already exist at check
+/// time, including when the final file itself does not exist. There remains an
+/// unavoidable TOCTOU window between this check and a later process opening
+/// the path. Eliminating that race requires execution-time `openat`/dirfd
+/// confinement or an OS sandbox; permission policy alone cannot provide it.
+fn validate_real_filesystem_target(
+    resolved_path: &str,
+    cwd: &str,
+    op: FileOperationType,
+) -> PathCheckResult {
+    let canonical_cwd = match canonicalize_nearest_existing(cwd) {
+        Ok(path) => path,
+        Err(reason) => return symlink_resolution_failure(cwd, &reason),
+    };
+    let canonical_target = match canonicalize_nearest_existing(resolved_path) {
+        Ok(path) => path,
+        Err(reason) => return symlink_resolution_failure(resolved_path, &reason),
+    };
+
+    is_path_allowed(&canonical_target, &canonical_cwd, op, &[], &[])
+}
+
+/// Resolve every existing path component, then append a suffix whose
+/// components do not exist yet. `std::fs::canonicalize` resolves the complete
+/// symlink chain in the existing prefix.
+fn canonicalize_nearest_existing(path: &str) -> Result<String, String> {
+    let input = Path::new(path);
+    let absolute = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("cannot resolve current directory: {error}"))?
+            .join(input)
+    };
+
+    let mut probe = absolute;
+    let mut missing_suffix: Vec<OsString> = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&probe) {
+            Ok(_) => break,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let Some(name) = probe.file_name().map(OsString::from) else {
+                    return Err(format!(
+                        "no existing ancestor could be resolved for {}",
+                        probe.display()
+                    ));
+                };
+                missing_suffix.push(name);
+                if !probe.pop() {
+                    return Err(format!(
+                        "no existing ancestor could be resolved for {}",
+                        path
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect path component {}: {error}",
+                    probe.display()
+                ));
+            }
+        }
+    }
+
+    let mut canonical: PathBuf = std::fs::canonicalize(&probe)
+        .map_err(|error| format!("cannot resolve {}: {error}", probe.display()))?;
+    for component in missing_suffix.iter().rev() {
+        canonical.push(component);
+    }
+    let canonical = canonical
+        .to_str()
+        .ok_or_else(|| "resolved path is not valid UTF-8".to_string())?;
+    Ok(normalize_path(canonical))
+}
+
+fn symlink_resolution_failure(path: &str, reason: &str) -> PathCheckResult {
+    PathCheckResult {
+        allowed: false,
+        reason: Some(PermissionDecisionReason::SafetyCheck {
+            reason: format!("Unable to verify symlink-safe path '{path}': {reason}"),
+            classifier_approvable: false,
+        }),
+    }
 }
 
 // ─── 7-Layer Path Permission Check ───
@@ -209,10 +310,24 @@ pub fn validate_path_basic(path: &str, cwd: &str, op: FileOperationType) -> Path
 /// 路径安全检查（Layer 2.5）
 fn check_path_safety(normalized_path: &str) -> Option<PermissionDecisionReason> {
     let filename = normalized_path.rsplit('/').next().unwrap_or("");
+    let filename_lower = filename.to_ascii_lowercase();
+
+    // CrabCode configuration is executable policy, not ordinary state. Keep
+    // these paths behind an explicit approval even when they live below the
+    // resolved config-home (which otherwise contains auto-editable plans and
+    // scratchpad data). Match case-insensitively and after lexical
+    // normalization so case changes and `./` / `..` segments cannot bypass
+    // the check.
+    if is_sensitive_crabcode_config_path(normalized_path) {
+        return Some(PermissionDecisionReason::SafetyCheck {
+            reason: format!("CrabCode configuration requires explicit approval: {normalized_path}"),
+            classifier_approvable: false,
+        });
+    }
 
     // 危险文件
     let dangerous_files = constants::dangerous_files();
-    if dangerous_files.contains(filename) {
+    if dangerous_files.contains(filename_lower.as_str()) {
         return Some(PermissionDecisionReason::SafetyCheck {
             reason: format!("Dangerous file: {filename}"),
             classifier_approvable: false,
@@ -230,7 +345,8 @@ fn check_path_safety(normalized_path: &str) -> Option<PermissionDecisionReason> 
     // 仍被危险文件检查拦截，`/tmp/x/.crabcode/.bashrc`（未锚定）则被危险目录拦截。
     let dangerous_dirs = constants::dangerous_directories();
     let is_anchored_internal = is_internal_editable_path(normalized_path);
-    let parts: Vec<&str> = normalized_path.split('/').collect();
+    let lower_path = normalized_path.to_ascii_lowercase();
+    let parts: Vec<&str> = lower_path.split('/').collect();
     for part in &parts {
         if dangerous_dirs.contains(*part) {
             if *part == ".crabcode" && is_anchored_internal {
@@ -254,21 +370,85 @@ fn check_path_safety(normalized_path: &str) -> Option<PermissionDecisionReason> 
     None
 }
 
-/// 内部可编辑路径 (.crabcode/ 下的计划文件、scratchpad 等)
+/// Whether a config-home path must remain behind explicit approval.
 ///
-/// SECURITY (A17 / P2-2 #16): 必须 **锚定** 到解析后的 config-home（§硬约束 #4
-/// 解析器 `acosmi_config::paths::resolve_state_dir`，遵循
-/// `CRABCODE_CONFIG_DIR` → `CRABCODE_HOME` → `~/.crabcode` 优先级），而不是对
-/// `/.crabcode/` 做无锚点子串匹配。无锚点匹配会让任意含 `.crabcode` 段的路径
-/// （如 `/etc/evil/.crabcode/../.bashrc` 或 `/tmp/x/.crabcode/.bashrc`）被误判为
-/// 内部路径并自动放行，绕过 Layer 2.5 危险文件/目录检查。
+/// The state directory contains executable/reloadable policy and credentials,
+/// so it is deny-by-default for automatic writes. Only the small positive
+/// allowlist in `is_safe_internal_editable_relative_path` is exempt.
+fn is_sensitive_crabcode_config_path(normalized_path: &str) -> bool {
+    let lower = normalized_path.to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split('/').filter(|part| !part.is_empty()).collect();
+
+    // Protect by identity relative to the resolved state-directory anchor,
+    // not merely by a literal `.crabcode` path segment. `CRABCODE_CONFIG_DIR`
+    // is a full override and may be named anything. Include both the resolver
+    // anchor and its canonical filesystem identity so a symlink cannot hide
+    // policy-bearing entries.
+    if let Some(relative) = resolved_config_home_anchors()
+        .iter()
+        .find_map(|anchor| relative_path_under_anchor(normalized_path, anchor))
+    {
+        return is_sensitive_config_relative_path(relative);
+    }
+
+    // An unanchored `.crabcode` tree gets no internal-write carve-out. This
+    // includes project-local lookalikes and aliases whose filesystem identity
+    // could not be proven against the resolver-selected anchor.
+    parts.contains(&".crabcode")
+}
+
+fn is_sensitive_config_relative_path(relative: &str) -> bool {
+    !is_safe_internal_editable_relative_path(relative)
+}
+
+/// Internal config-home paths proven safe for automatic writes.
+///
+/// This is intentionally a positive allowlist. Plugins, hooks, output styles,
+/// workflows, templates, credentials, marketplaces, caches, and future state
+/// directories may be loaded or executed and therefore must not inherit a
+/// blanket write carve-out merely because they live under config-home.
 fn is_internal_editable_path(path: &str) -> bool {
-    is_under_resolved_config_home(path)
+    resolved_config_home_anchors().iter().any(|anchor| {
+        relative_path_under_anchor(path, anchor)
+            .is_some_and(is_safe_internal_editable_relative_path)
+    })
+}
+
+fn is_safe_internal_editable_relative_path(relative: &str) -> bool {
+    let first = relative.split('/').next().unwrap_or_default();
+    matches!(first, "plans" | "scratchpad")
+}
+
+/// Check whether one argv token, interpreted as a path, names protected
+/// config-home state. Unlike `validate_path`, this does not reject arbitrary
+/// outside-workspace paths: it is used as a command-agnostic sensitive-target
+/// floor where an argv token may also be a URL or literal.
+pub(crate) fn is_sensitive_config_write_target(raw_path: &str, cwd: &str) -> bool {
+    let stripped = strip_surrounding_quotes(raw_path);
+    let expanded = expand_tilde(&stripped);
+    if expanded.is_empty()
+        || is_unc_path(&expanded)
+        || has_unexpanded_tilde_variant(&stripped)
+        || has_shell_expansion(&expanded)
+        || has_glob_chars(&expanded)
+    {
+        return false;
+    }
+
+    let resolved = resolve_path(&expanded, cwd);
+    if is_sensitive_crabcode_config_path(&resolved) {
+        return true;
+    }
+
+    canonicalize_nearest_existing(&resolved)
+        .is_ok_and(|canonical| is_sensitive_crabcode_config_path(&canonical))
 }
 
 /// 内部可读路径
 fn is_internal_readable_path(path: &str) -> bool {
-    is_internal_editable_path(path)
+    // Preserve the existing broad read behavior independently from the much
+    // narrower write allowlist above.
+    is_under_resolved_config_home(path)
 }
 
 /// 路径是否位于解析后的 config-home（`.crabcode` 状态目录）之内。
@@ -280,15 +460,44 @@ fn is_internal_readable_path(path: &str) -> bool {
 /// 路径在比较前经 `normalize_path` 折叠 `.` / `..`（防 `.crabcode/../.bashrc`
 /// 这类遍历绕过）。匹配条件：path == anchor 或 path 以 `anchor/` 为前缀。
 fn is_under_resolved_config_home(normalized_path: &str) -> bool {
+    resolved_config_home_anchors()
+        .iter()
+        .any(|anchor| relative_path_under_anchor(normalized_path, anchor).is_some())
+}
+
+/// Return both the resolver-selected state-directory anchor and its nearest-
+/// existing canonical filesystem identity. The latter matters for a relative
+/// or not-yet-created override and keeps internal plans/scratchpad paths usable
+/// after the write-path validator canonicalizes a target.
+fn resolved_config_home_anchors() -> Vec<String> {
     let anchor_raw = acosmi_config::paths::resolve_state_dir();
     let Some(anchor_str) = anchor_raw.to_str() else {
-        return false;
+        return Vec::new();
     };
     let anchor = normalize_path(anchor_str);
     if anchor.is_empty() {
-        return false;
+        return Vec::new();
     }
-    normalized_path == anchor || normalized_path.starts_with(&format!("{anchor}/"))
+
+    let mut anchors = vec![anchor];
+    if let Ok(canonical) = canonicalize_nearest_existing(anchor_str)
+        && !anchors.contains(&canonical)
+    {
+        anchors.push(canonical);
+    }
+    anchors
+}
+
+/// Return the path relative to an anchor, with exact component-boundary
+/// matching. An empty string means the anchor directory itself.
+fn relative_path_under_anchor<'a>(path: &'a str, anchor: &str) -> Option<&'a str> {
+    if path == anchor {
+        return Some("");
+    }
+    if anchor == "/" {
+        return path.strip_prefix('/');
+    }
+    path.strip_prefix(anchor)?.strip_prefix('/')
 }
 
 /// 路径是否匹配规则（简单前缀匹配）
@@ -689,6 +898,91 @@ mod tests {
         assert_eq!(get_glob_base_directory("/home/*/file"), "/home");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_through_workspace_symlink_to_outside_is_blocked() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, workspace.join("escape")).unwrap();
+
+        // The final file does not exist: the nearest existing parent must
+        // still be resolved through the symlink to the outside directory.
+        let result = validate_path(
+            "escape/new/deep/file.txt",
+            workspace.to_str().unwrap(),
+            FileOperationType::Create,
+        );
+        assert!(
+            !result.allowed,
+            "outside symlink target must require approval"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_through_workspace_symlink_to_sensitive_config_is_blocked() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let config = tmp.path().join(".crabcode");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        symlink(&config, workspace.join("policy-link")).unwrap();
+
+        let result = validate_path(
+            "policy-link/settings.json",
+            workspace.to_str().unwrap(),
+            FileOperationType::Write,
+        );
+        assert!(
+            !result.allowed,
+            "symlink alias must not hide protected CrabCode configuration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_resolution_allows_inside_target_and_fails_closed_on_dangling_link() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let inside = workspace.join("generated");
+        std::fs::create_dir_all(&inside).unwrap();
+        symlink(&inside, workspace.join("inside-link")).unwrap();
+        symlink(
+            tmp.path().join("missing-target"),
+            workspace.join("dangling"),
+        )
+        .unwrap();
+
+        let safe = validate_path(
+            "inside-link/new.txt",
+            workspace.to_str().unwrap(),
+            FileOperationType::Create,
+        );
+        assert!(
+            safe.allowed,
+            "symlink that remains inside cwd should be allowed"
+        );
+
+        let dangling = validate_path(
+            "dangling/new.txt",
+            workspace.to_str().unwrap(),
+            FileOperationType::Create,
+        );
+        assert!(
+            !dangling.allowed,
+            "unresolvable symlink chain must fail closed"
+        );
+    }
+
     // ─── A17 / P2-2 #16: anchored .crabcode + safety-before-allow regression ───
 
     /// Save+restore an env var across a test body (so #[serial] tests don't leak).
@@ -740,6 +1034,29 @@ mod tests {
         ]
     }
 
+    /// Pin the full state-directory override to a name that deliberately does
+    /// not contain a `.crabcode` component.
+    fn pin_custom_config_dir(path: &std::path::Path) -> Vec<EnvGuard> {
+        let state_dir = path.to_str().unwrap().to_string();
+        vec![
+            EnvGuard::clear("CRABCODE_STATE_DIR"),
+            EnvGuard::clear("CRABCODE_CONFIG_PATH"),
+            EnvGuard::clear("CRABCODE_PROFILE"),
+            EnvGuard::clear("CRABCODE_HOME"),
+            EnvGuard::set("CRABCODE_CONFIG_DIR", &state_dir),
+        ]
+    }
+
+    fn pin_custom_state_dir(path: &std::path::Path) -> Vec<EnvGuard> {
+        let state_dir = path.to_str().unwrap().to_string();
+        vec![
+            EnvGuard::clear("CRABCODE_CONFIG_DIR"),
+            EnvGuard::clear("CRABCODE_HOME"),
+            EnvGuard::clear("CRABCODE_PROFILE"),
+            EnvGuard::set("CRABCODE_STATE_DIR", &state_dir),
+        ]
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_a17_legit_internal_plan_file_still_allowed() {
@@ -754,11 +1071,245 @@ mod tests {
             "legit internal plan file under resolved config-home must be allowed: {result:?}"
         );
 
-        // settings.json / scratchpad under the real .crabcode also pass.
-        let settings = format!("{}/.crabcode/settings.json", tmp.path().display());
-        assert!(is_path_allowed(&settings, "/", FileOperationType::Write, &[], &[]).allowed);
+        // Everything else under config-home is approval-only because it may
+        // be loaded, executed, or contain credentials.
+        let config_root = format!("{}/.crabcode", tmp.path().display());
+        for relative in [
+            "",
+            "settings.json",
+            "settings.local.json",
+            "commands/release.md",
+            "agents/reviewer.md",
+            "skills/reviewer/SKILL.md",
+            "plugins/demo/hooks/hooks.json",
+            "plugins/demo/.codex-plugin/plugin.json",
+            "output-styles/reviewer.md",
+            "workflows/release.md",
+            "templates/report.md",
+            "plugins/known_marketplaces.json",
+            "known_marketplaces.json",
+            ".credentials.json",
+            "cache/artifact.bin",
+        ] {
+            let path = if relative.is_empty() {
+                config_root.clone()
+            } else {
+                format!("{config_root}/{relative}")
+            };
+            assert!(
+                !is_path_allowed(&path, &config_root, FileOperationType::Write, &[], &[]).allowed,
+                "non-allowlisted config-home write must require approval: {path}"
+            );
+        }
         let scratch = format!("{}/.crabcode/scratchpad/notes.txt", tmp.path().display());
         assert!(is_path_allowed(&scratch, "/", FileOperationType::Write, &[], &[]).allowed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn symlink_to_resolved_config_root_is_blocked_after_canonicalization() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guards = pin_config_home(&tmp);
+        let workspace = tmp.path().join("workspace");
+        let config_root = tmp.path().join(".crabcode");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_root).unwrap();
+        symlink(&config_root, workspace.join("hidden-policy")).unwrap();
+
+        let result = validate_path(
+            "hidden-policy",
+            workspace.to_str().unwrap(),
+            FileOperationType::Write,
+        );
+        assert!(
+            !result.allowed,
+            "a workspace alias must not make the complete configuration root auto-editable"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn custom_config_dir_protects_relative_policy_identity_without_crabcode_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("custom-state-store");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let _guards = pin_custom_config_dir(&state_dir);
+        let resolved_state_dir = acosmi_config::paths::resolve_state_dir();
+        assert_eq!(
+            resolved_state_dir,
+            std::fs::canonicalize(&state_dir).unwrap()
+        );
+        assert!(is_under_resolved_config_home(
+            resolved_state_dir.join("plans/plan.md").to_str().unwrap()
+        ));
+
+        for relative in [
+            "",
+            "settings.json",
+            "settings.local.json",
+            "settings.team.json",
+            "commands/release.md",
+            "agents/reviewer.md",
+            "skills/reviewer/SKILL.md",
+            "plugins/demo/hooks/hooks.json",
+            "plugins/demo/.codex-plugin/plugin.json",
+            "output-styles/reviewer.md",
+            "workflows/release.md",
+            "templates/report.md",
+            "plugins/known_marketplaces.json",
+            "known_marketplaces.json",
+            ".credentials.json",
+            "cache/artifact.bin",
+        ] {
+            let path = if relative.is_empty() {
+                resolved_state_dir.clone()
+            } else {
+                resolved_state_dir.join(relative)
+            };
+            let result = is_path_allowed(
+                path.to_str().unwrap(),
+                resolved_state_dir.to_str().unwrap(),
+                FileOperationType::Write,
+                &[],
+                &[],
+            );
+            assert!(
+                !result.allowed,
+                "custom config policy identity must require approval: {} => {result:?}",
+                path.display()
+            );
+        }
+
+        for relative in ["plans/plan.md", "scratchpad/notes.txt"] {
+            let path = resolved_state_dir.join(relative);
+            let result = is_path_allowed(
+                path.to_str().unwrap(),
+                resolved_state_dir.to_str().unwrap(),
+                FileOperationType::Write,
+                &[],
+                &[],
+            );
+            assert!(
+                result.allowed,
+                "ordinary internal state must remain auto-editable: {} => {result:?}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn custom_state_dir_uses_same_identity_protection_and_preserves_plans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state-override-without-brand-name");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let _guards = pin_custom_state_dir(&state_dir);
+        let resolved = acosmi_config::paths::resolve_state_dir();
+
+        for path in [resolved.clone(), resolved.join("settings.json")] {
+            let result = is_path_allowed(
+                path.to_str().unwrap(),
+                resolved.to_str().unwrap(),
+                FileOperationType::Write,
+                &[],
+                &[],
+            );
+            assert!(
+                !result.allowed,
+                "CRABCODE_STATE_DIR policy identity must require approval: {} => {result:?}",
+                path.display()
+            );
+        }
+
+        let plan = resolved.join("plans/plan.md");
+        let result = is_path_allowed(
+            plan.to_str().unwrap(),
+            resolved.to_str().unwrap(),
+            FileOperationType::Write,
+            &[],
+            &[],
+        );
+        assert!(
+            result.allowed,
+            "CRABCODE_STATE_DIR plans must remain auto-editable: {} => {result:?}",
+            plan.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn custom_config_dir_symlink_uses_canonical_anchor_and_preserves_state_carveouts() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let real_state_dir = tmp.path().join("opaque-policy-store");
+        let configured_alias = tmp.path().join("configured-state-alias");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&real_state_dir).unwrap();
+        symlink(&real_state_dir, &configured_alias).unwrap();
+        symlink(&real_state_dir, workspace.join("hidden-config")).unwrap();
+        let _guards = pin_custom_config_dir(&configured_alias);
+
+        for relative in [
+            "hidden-config",
+            "hidden-config/settings.preview.json",
+            "hidden-config/commands/release.md",
+            "hidden-config/agents/reviewer.md",
+            "hidden-config/skills/reviewer/SKILL.md",
+            "hidden-config/plugins/demo/hooks/hooks.json",
+            "hidden-config/plugins/demo/.codex-plugin/plugin.json",
+            "hidden-config/output-styles/reviewer.md",
+            "hidden-config/workflows/release.md",
+            "hidden-config/templates/report.md",
+            "hidden-config/plugins/known_marketplaces.json",
+            "hidden-config/.credentials.json",
+            "hidden-config/cache/artifact.bin",
+        ] {
+            let result = validate_path(
+                relative,
+                workspace.to_str().unwrap(),
+                FileOperationType::Write,
+            );
+            assert!(
+                !result.allowed,
+                "canonical config identity must survive a workspace symlink: {relative} => {result:?}"
+            );
+        }
+
+        for relative in [
+            "hidden-config/plans/new.md",
+            "hidden-config/scratchpad/notes.txt",
+        ] {
+            let result = validate_path(
+                relative,
+                workspace.to_str().unwrap(),
+                FileOperationType::Create,
+            );
+            assert!(
+                result.allowed,
+                "non-policy internal state must retain its carve-out through canonicalization: {relative} => {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_crabcode_config_protection_is_case_and_traversal_resistant() {
+        for path in [
+            "/work/.CrAbCoDe/Settings.JSON",
+            "/work/tmp/../.crabcode/settings.local.json",
+            "/work/.crabcode/commands/release.md",
+            "/work/.crabcode/skills/reviewer/SKILL.md",
+            "/work/.GIT/config",
+            "/work/.CrAbCoDe.JSON",
+        ] {
+            let result = validate_path(path, "/work", FileOperationType::Write);
+            assert!(!result.allowed, "protected config path must ask: {path}");
+        }
     }
 
     #[test]

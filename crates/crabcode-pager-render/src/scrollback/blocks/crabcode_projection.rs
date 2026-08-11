@@ -769,10 +769,7 @@ impl CrabCodeDirectSystemBlock {
 
     fn is_hidden(&self) -> bool {
         match self {
-            Self::ApiMetrics
-            | Self::CompactBoundary
-            | Self::MicrocompactBoundary
-            | Self::Thinking => true,
+            Self::ApiMetrics | Self::MicrocompactBoundary | Self::Thinking => true,
             Self::StopHookSummary {
                 hook_errors,
                 prevented_continuation,
@@ -797,6 +794,7 @@ impl CrabCodeDirectSystemBlock {
             | Self::AwaySummary { .. }
             | Self::MemorySaved { .. }
             | Self::AgentsKilled
+            | Self::CompactBoundary
             | Self::CommandInput { .. }
             | Self::FileSnapshot { .. } => false,
         }
@@ -878,10 +876,8 @@ impl CrabCodeDirectSystemBlock {
             Self::AgentsKilled => {
                 join_searchable([Some("All background agents stopped".to_string())])
             }
-            Self::ApiMetrics
-            | Self::CompactBoundary
-            | Self::MicrocompactBoundary
-            | Self::Thinking => None,
+            Self::CompactBoundary => join_searchable([Some("Conversation compacted".to_string())]),
+            Self::ApiMetrics | Self::MicrocompactBoundary | Self::Thinking => None,
         }
     }
 }
@@ -920,6 +916,17 @@ pub enum CrabCodeDirectProgressBlock {
         in_progress_count: usize,
         resolved_count: usize,
     },
+    Compact {
+        stage: CrabCodeCompactProgressStage,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrabCodeCompactProgressStage {
+    PreCompactHooks,
+    Summarizing,
+    SessionStartHooks,
+    PostCompactHooks,
 }
 
 impl CrabCodeDirectProgressBlock {
@@ -970,6 +977,19 @@ impl CrabCodeDirectProgressBlock {
                 ..
             } if *in_progress_count > 0 => join_searchable([Some(hook_event.clone())]),
             Self::Hook { .. } => None,
+            Self::Compact { stage } => Some(
+                match stage {
+                    CrabCodeCompactProgressStage::PreCompactHooks => "Running pre-compaction hooks",
+                    CrabCodeCompactProgressStage::Summarizing => "Summarizing conversation",
+                    CrabCodeCompactProgressStage::SessionStartHooks => {
+                        "Running session-start hooks"
+                    }
+                    CrabCodeCompactProgressStage::PostCompactHooks => {
+                        "Running post-compaction hooks"
+                    }
+                }
+                .to_string(),
+            ),
         }
     }
 }
@@ -1800,8 +1820,14 @@ fn direct_system_lines(
                 theme.muted(),
             ),
         ])],
+        CrabCodeDirectSystemBlock::CompactBoundary => vec![Line::from(vec![
+            Span::styled("✻ ", theme.fg(theme.accent_success)),
+            Span::styled(
+                language.text("对话已压缩", "Conversation compacted"),
+                theme.muted().add_modifier(Modifier::BOLD),
+            ),
+        ])],
         CrabCodeDirectSystemBlock::ApiMetrics
-        | CrabCodeDirectSystemBlock::CompactBoundary
         | CrabCodeDirectSystemBlock::MicrocompactBoundary
         | CrabCodeDirectSystemBlock::Thinking => Vec::new(),
     }
@@ -2278,6 +2304,38 @@ fn direct_progress_lines(
                 ),
             ]));
             lines
+        }
+        CrabCodeDirectProgressBlock::Compact { stage } => {
+            let (marker, marker_color, text, text_style) = match stage {
+                CrabCodeCompactProgressStage::PreCompactHooks => (
+                    "✻ ",
+                    theme.accent_running,
+                    language.text("正在运行压缩前钩子…", "Running pre-compaction hooks…"),
+                    theme.muted(),
+                ),
+                CrabCodeCompactProgressStage::Summarizing => (
+                    "✻ ",
+                    theme.accent_running,
+                    language.text("正在总结对话…", "Summarizing conversation…"),
+                    theme.muted(),
+                ),
+                CrabCodeCompactProgressStage::SessionStartHooks => (
+                    "✻ ",
+                    theme.accent_running,
+                    language.text("正在运行会话启动钩子…", "Running session-start hooks…"),
+                    theme.muted(),
+                ),
+                CrabCodeCompactProgressStage::PostCompactHooks => (
+                    "✻ ",
+                    theme.accent_running,
+                    language.text("正在运行压缩后钩子…", "Running post-compaction hooks…"),
+                    theme.muted(),
+                ),
+            };
+            vec![Line::from(vec![
+                Span::styled(marker, theme.fg(marker_color)),
+                Span::styled(text, text_style),
+            ])]
         }
         CrabCodeDirectProgressBlock::Hook {
             hook_event,
@@ -3215,6 +3273,55 @@ mod tests {
     }
 
     #[test]
+    fn compact_boundary_has_visible_localized_pixels_and_copy_semantics() {
+        let block = CrabCodeProjectionBlock::new(CrabCodeProjectionKind::DirectSystem(
+            CrabCodeDirectSystemBlock::CompactBoundary,
+        ));
+
+        assert_eq!(
+            plain_in_language(&block, DisplayMode::Expanded, RendererLanguage::ZhCn),
+            "✻ 对话已压缩"
+        );
+        assert_eq!(
+            plain_in_language(&block, DisplayMode::Expanded, RendererLanguage::EnUs),
+            "✻ Conversation compacted"
+        );
+
+        let output = block.output(&context_in_language(
+            DisplayMode::Expanded,
+            RendererLanguage::ZhCn,
+        ));
+        assert_eq!(output.lines.len(), 1);
+        let spans = &output.lines[0].content.spans;
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "✻ ");
+        assert_eq!(
+            spans[0].style,
+            Theme::current().fg(Theme::current().accent_success)
+        );
+        assert_eq!(spans[1].content, "对话已压缩");
+        assert_eq!(
+            spans[1].style,
+            Theme::current().muted().add_modifier(Modifier::BOLD)
+        );
+
+        assert!(!block.is_hidden());
+        assert!(block.is_selectable());
+        assert!(!block.is_foldable());
+        assert_eq!(
+            block.searchable_text().as_deref(),
+            Some("Conversation compacted")
+        );
+        assert_eq!(block.copy_text().as_deref(), Some("Conversation compacted"));
+
+        let micro = CrabCodeProjectionBlock::new(CrabCodeProjectionKind::DirectSystem(
+            CrabCodeDirectSystemBlock::MicrocompactBoundary,
+        ));
+        assert!(micro.is_hidden());
+        assert!(micro.output(&context(DisplayMode::Expanded)).is_empty());
+    }
+
+    #[test]
     fn advisor_feedback_uses_fixed_collapsed_and_expanded_payloads() {
         let block = CrabCodeProjectionBlock::new(CrabCodeProjectionKind::Advisor(
             CrabCodeAdvisorBlock::Feedback {
@@ -3272,6 +3379,71 @@ mod tests {
         assert_eq!(
             plain(&block, DisplayMode::Expanded),
             "Reading\n███████████████      75%"
+        );
+    }
+
+    #[test]
+    fn compact_progress_has_localized_pixels_only_for_running_stages() {
+        let cases = [
+            (
+                CrabCodeCompactProgressStage::PreCompactHooks,
+                "✻ 正在运行压缩前钩子…",
+                "✻ Running pre-compaction hooks…",
+            ),
+            (
+                CrabCodeCompactProgressStage::Summarizing,
+                "✻ 正在总结对话…",
+                "✻ Summarizing conversation…",
+            ),
+            (
+                CrabCodeCompactProgressStage::SessionStartHooks,
+                "✻ 正在运行会话启动钩子…",
+                "✻ Running session-start hooks…",
+            ),
+            (
+                CrabCodeCompactProgressStage::PostCompactHooks,
+                "✻ 正在运行压缩后钩子…",
+                "✻ Running post-compaction hooks…",
+            ),
+        ];
+
+        for (stage, expected_zh, expected_en) in cases {
+            let block = CrabCodeProjectionBlock::new(CrabCodeProjectionKind::DirectProgress(
+                CrabCodeDirectProgressBlock::Compact { stage },
+            ));
+            assert_eq!(
+                plain_in_language(&block, DisplayMode::Expanded, RendererLanguage::ZhCn),
+                expected_zh
+            );
+            assert_eq!(
+                plain_in_language(&block, DisplayMode::Expanded, RendererLanguage::EnUs),
+                expected_en
+            );
+            assert!(!block.is_hidden());
+            assert!(block.is_selectable());
+            assert!(!block.is_foldable());
+            assert!(block.searchable_text().is_some());
+        }
+
+        let running = CrabCodeProjectionBlock::new(CrabCodeProjectionKind::DirectProgress(
+            CrabCodeDirectProgressBlock::Compact {
+                stage: CrabCodeCompactProgressStage::Summarizing,
+            },
+        ));
+        let mut running_context = context(DisplayMode::Expanded);
+        running_context.is_running = true;
+        let running_accent = running
+            .accent(&running_context)
+            .expect("running compaction has an accent");
+        assert!(running_accent.animated);
+        assert_eq!(running_accent.color, Theme::current().accent_running);
+        let running_output = running.output(&running_context);
+        assert_eq!(running_output.lines.len(), 1);
+        assert_eq!(running_output.lines[0].content.spans.len(), 2);
+        assert_eq!(running_output.lines[0].content.spans[0].content, "✻ ");
+        assert_eq!(
+            running_output.lines[0].content.spans[0].style,
+            Theme::current().fg(Theme::current().accent_running)
         );
     }
 

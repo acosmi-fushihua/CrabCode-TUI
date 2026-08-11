@@ -15,8 +15,8 @@ use crabcode_pager_render::scrollback::blocks::tool::{
     WebFetchToolCallBlock, WebSearchResult, WebSearchToolCallBlock, parse_memory_results,
 };
 use crabcode_pager_render::scrollback::blocks::{
-    CrabCodeAdvisorBlock, CrabCodeAdvisorInvocationState, CrabCodeDiagnostic,
-    CrabCodeDiagnosticFile, CrabCodeDiagnosticSeverity, CrabCodeDirectApiError,
+    CrabCodeAdvisorBlock, CrabCodeAdvisorInvocationState, CrabCodeCompactProgressStage,
+    CrabCodeDiagnostic, CrabCodeDiagnosticFile, CrabCodeDiagnosticSeverity, CrabCodeDirectApiError,
     CrabCodeDirectAttachmentBlock, CrabCodeDirectFileContent, CrabCodeDirectProgressBlock,
     CrabCodeDirectSystemBlock, CrabCodeHookPermissionDecision, CrabCodeMessageLevel,
     CrabCodeProjectionBlock, CrabCodeProjectionKind, CrabCodeRelevantMemory, CrabCodeSdkImageBlock,
@@ -31,12 +31,12 @@ use thiserror::Error;
 
 use crate::sdk_projection::{
     AdvisorInvocationState, AdvisorPresentation, AdvisorResultPresentation, AssistantBlockType,
-    DirectAttachmentData, DirectDiagnosticSeverity, DirectFileAttachmentContent,
-    DirectHookPermissionDecision, DirectNestedMessageKind, DirectProgressPresentation,
-    DirectSystemData, DirectTaskStatus, DirectTaskType, DirectUserBlockType,
-    DirectWorkflowPhaseState, DirectWorkflowStatus, ImageMediaType, ImageProvenance, ProjectedItem,
-    ProjectedKind, ProjectedSystemSubtype, ProjectionItemRemoval, SystemLevel, ThinkingKind,
-    ToolPresentation,
+    DirectAttachmentData, DirectCompactHookType, DirectCompactProgressPhase,
+    DirectDiagnosticSeverity, DirectFileAttachmentContent, DirectHookPermissionDecision,
+    DirectNestedMessageKind, DirectProgressPresentation, DirectSystemData, DirectTaskStatus,
+    DirectTaskType, DirectUserBlockType, DirectWorkflowPhaseState, DirectWorkflowStatus,
+    ImageMediaType, ImageProvenance, ProjectedItem, ProjectedKind, ProjectedSystemSubtype,
+    ProjectionItemRemoval, SystemLevel, ThinkingKind, ToolPresentation,
 };
 use crate::sdk_runtime::SystemSubtype;
 
@@ -3743,6 +3743,46 @@ fn map_direct_progress(item: &ProjectedItem) -> Result<RenderBlock, ProjectionSc
                 },
             )
         }
+        DirectProgressPresentation::Compact { phase, hook_type } => {
+            require_progress_kind(item)?;
+            if item.tool_use_id.as_deref() != Some(identity.parent_tool_use_id.as_str())
+                || !item.raw_sequences.contains(&identity.raw_sequence)
+            {
+                return inconsistent(
+                    item,
+                    "compact progress identity correlated to its lifecycle and source row",
+                    "compact progress parent tool or raw-sequence identity mismatch",
+                );
+            }
+            let stage = match (phase, hook_type) {
+                (
+                    DirectCompactProgressPhase::HooksStart,
+                    Some(DirectCompactHookType::PreCompact),
+                ) => CrabCodeCompactProgressStage::PreCompactHooks,
+                (DirectCompactProgressPhase::CompactStart, None) => {
+                    CrabCodeCompactProgressStage::Summarizing
+                }
+                (
+                    DirectCompactProgressPhase::HooksStart,
+                    Some(DirectCompactHookType::SessionStart),
+                ) => CrabCodeCompactProgressStage::SessionStartHooks,
+                (
+                    DirectCompactProgressPhase::HooksStart,
+                    Some(DirectCompactHookType::PostCompact),
+                ) => CrabCodeCompactProgressStage::PostCompactHooks,
+                _ => {
+                    return inconsistent(
+                        item,
+                        "compact progress phase/hookType union agreement",
+                        "compact progress phase/hookType mismatch",
+                    );
+                }
+            };
+            (
+                "compact_progress",
+                CrabCodeDirectProgressBlock::Compact { stage },
+            )
+        }
         DirectProgressPresentation::Workflow { .. } => {
             unreachable!("workflow progress returned through its native lifecycle above")
         }
@@ -5931,6 +5971,111 @@ mod tests {
             render_block_for(&progress),
             Err(ProjectionScrollbackError::InconsistentPresentation {
                 expected: "MCP progress identity correlated to its parent invocation and source row",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn compact_progress_maps_only_running_lifecycle_stages() {
+        let cases = [
+            (
+                DirectCompactProgressPhase::HooksStart,
+                Some(DirectCompactHookType::PreCompact),
+                true,
+                CrabCodeCompactProgressStage::PreCompactHooks,
+            ),
+            (
+                DirectCompactProgressPhase::CompactStart,
+                None,
+                true,
+                CrabCodeCompactProgressStage::Summarizing,
+            ),
+            (
+                DirectCompactProgressPhase::HooksStart,
+                Some(DirectCompactHookType::SessionStart),
+                true,
+                CrabCodeCompactProgressStage::SessionStartHooks,
+            ),
+            (
+                DirectCompactProgressPhase::HooksStart,
+                Some(DirectCompactHookType::PostCompact),
+                true,
+                CrabCodeCompactProgressStage::PostCompactHooks,
+            ),
+        ];
+
+        for (index, (phase, hook_type, streaming, expected_stage)) in cases.into_iter().enumerate()
+        {
+            let key = format!("compact-{index}");
+            let mut progress = direct_progress(
+                &key,
+                ProjectedKind::Progress,
+                "typed compact progress",
+                "compact_progress",
+                DirectProgressPresentation::Compact { phase, hook_type },
+            );
+            progress.raw_sequences = vec![2];
+            progress.tool_use_id = Some(format!("{key}-parent-tool"));
+            assert!(streaming);
+            progress.streaming = true;
+            assert!(matches!(
+                render_block_for(&progress),
+                Ok(RenderBlock::CrabCodeProjection(CrabCodeProjectionBlock {
+                    kind: CrabCodeProjectionKind::DirectProgress(
+                        CrabCodeDirectProgressBlock::Compact { stage },
+                    ),
+                })) if stage == expected_stage
+            ));
+        }
+    }
+
+    #[test]
+    fn compact_progress_rejects_streaming_phase_hook_and_identity_mismatches() {
+        let mut progress = direct_progress(
+            "compact-invalid",
+            ProjectedKind::Progress,
+            "typed compact progress",
+            "compact_progress",
+            DirectProgressPresentation::Compact {
+                phase: DirectCompactProgressPhase::CompactStart,
+                hook_type: None,
+            },
+        );
+        progress.raw_sequences = vec![2];
+        progress.tool_use_id = Some("compact-invalid-parent-tool".to_string());
+
+        progress.streaming = false;
+        assert!(matches!(
+            render_block_for(&progress),
+            Err(ProjectionScrollbackError::InconsistentPresentation {
+                expected: "streaming historical direct progress row",
+                ..
+            })
+        ));
+
+        progress.streaming = true;
+        progress.presentation.direct_progress = Some(DirectProgressPresentation::Compact {
+            phase: DirectCompactProgressPhase::CompactStart,
+            hook_type: Some(DirectCompactHookType::PreCompact),
+        });
+        assert!(matches!(
+            render_block_for(&progress),
+            Err(ProjectionScrollbackError::InconsistentPresentation {
+                expected: "compact progress phase/hookType union agreement",
+                ..
+            })
+        ));
+
+        progress.presentation.direct_progress = Some(DirectProgressPresentation::Compact {
+            phase: DirectCompactProgressPhase::CompactStart,
+            hook_type: None,
+        });
+        progress.tool_use_id = Some("wrong-parent".to_string());
+        assert!(matches!(
+            render_block_for(&progress),
+            Err(ProjectionScrollbackError::InconsistentPresentation {
+                expected: "compact progress identity correlated to its lifecycle and source row",
                 ..
             })
         ));

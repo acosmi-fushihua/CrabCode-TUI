@@ -1,5 +1,7 @@
 await import('../setup.js')
 
+import { spyOn } from 'bun:test'
+
 const [
   { QueryEngine },
   state,
@@ -15,6 +17,22 @@ const [
 state.resetStateForTests()
 state.setSessionPersistenceDisabled(true)
 state.setIsInteractive(true)
+
+const abortController = new AbortController()
+if (process.env.DIRECT_TUI_CLEAR_PREABORT === '1') {
+  abortController.abort(new DOMException('fixture pre-abort', 'AbortError'))
+}
+
+let clearConversationSpy: { mockRestore(): void } | undefined
+if (process.env.DIRECT_TUI_CLEAR_FAILURE === '1') {
+  const transaction = await import(
+    '../../src/commands/clear/conversation.js'
+  )
+  clearConversationSpy = spyOn(
+    transaction,
+    'clearConversation',
+  ).mockRejectedValue(new Error('fixture clear transaction failed'))
+}
 
 let appState = getDefaultAppState()
 const commands = await catalog.getDirectTuiCommands(process.cwd())
@@ -37,6 +55,7 @@ const engine = new QueryEngine({
   readFileCache: new Map(),
   interactive: true,
   querySource: 'repl_main_thread',
+  abortController,
   onQueryEvent: event => {
     directEvents.push(event)
   },
@@ -56,3 +75,5 @@ console.log(
     envelopes,
   }),
 )
+
+clearConversationSpy?.mockRestore()

@@ -28,6 +28,7 @@ pub(crate) enum DialogPointerOutcome {
 pub(crate) struct DialogPointerState {
     choice_areas: Vec<Rect>,
     input_area: Option<Rect>,
+    preview_area: Option<Rect>,
     hovered_choice: Option<usize>,
     last_click: Option<(Instant, usize)>,
 }
@@ -42,6 +43,7 @@ impl DialogPointerState {
     pub(crate) fn begin_frame(&mut self) {
         self.choice_areas.clear();
         self.input_area = None;
+        self.preview_area = None;
         self.hovered_choice = None;
     }
 
@@ -67,6 +69,14 @@ impl DialogPointerState {
 
     pub(crate) fn input_area(&self) -> Option<Rect> {
         self.input_area
+    }
+
+    pub(crate) fn set_preview_area(&mut self, area: Rect) {
+        self.preview_area = (area.area() != 0).then_some(area);
+    }
+
+    pub(crate) fn preview_area(&self) -> Option<Rect> {
+        self.preview_area
     }
 
     #[cfg(test)]

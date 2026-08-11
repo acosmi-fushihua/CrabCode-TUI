@@ -3,6 +3,7 @@ import { resolve } from 'node:path'
 import uniqBy from 'lodash-es/uniqBy.js'
 
 import type { TuiRuntimeOptions } from './tuiRuntimeOptions.js'
+import { DIRECT_TUI_PERMISSION_PROMPT_TOOL_NAME } from './directTuiPermissionBridge.js'
 import { runHeadlessDirectTui } from './print/queryExecutionCore.js'
 import {
   getDirectTuiCommands,
@@ -619,7 +620,7 @@ export async function runTuiRuntime(
   setQuestionPreviewFormat(
     previewFormat === 'html' || previewFormat === 'markdown'
       ? previewFormat
-      : 'markdown',
+      : undefined,
   )
   installDirectTuiManagedSettingsSecurityReview()
   eagerLoadSettings()
@@ -1005,7 +1006,7 @@ export async function runTuiRuntime(
       verbose: true,
       outputFormat: 'stream-json',
       jsonSchema,
-      permissionPromptToolName: options.permissionPromptTool,
+      permissionPromptToolName: DIRECT_TUI_PERMISSION_PROMPT_TOOL_NAME,
       allowedTools,
       thinkingConfig: resolveThinkingConfig(options),
       maxTurns: options.maxTurns,

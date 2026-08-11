@@ -2,7 +2,7 @@
 // Do not edit by hand. Regenerate from the current TypeScript unions.
 
 pub(crate) const GENERATED_RENDERER_CAPABILITY_CONTRACT_SHA256: &str =
-    "01a6c36628f0f0a553ded6ab31a91bfcf09ca07a83e3aaf2be7fc6822656fead";
+    "2c38e530608e186e8559392c415e7599990a96a22da55250de0274bafa1cc840";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +71,7 @@ pub(crate) const GENERATED_DIRECT_SYSTEM_SUBTYPES: &[&str] = &[
 pub(crate) const GENERATED_DIRECT_PROGRESS_TYPES: &[&str] = &[
     "agent_progress",
     "bash_progress",
+    "compact_progress",
     "hook_progress",
     "mcp_progress",
     "powershell_progress",

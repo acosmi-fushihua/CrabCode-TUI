@@ -32,6 +32,11 @@
 /contracts/renderer-protocol/v1/*
 !/contracts/renderer-protocol/v1/event-policy.json
 !/contracts/renderer-protocol/v1/renderer-contract.json
+!/contracts/direct-tui-command-capabilities/
+/contracts/direct-tui-command-capabilities/*
+!/contracts/direct-tui-command-capabilities/v1/
+/contracts/direct-tui-command-capabilities/v1/*
+!/contracts/direct-tui-command-capabilities/v1/command-capabilities.json
 /docs/
 /e2e/
 /frontend/

@@ -1245,7 +1245,9 @@ export function getQuestionPreviewFormat(): 'markdown' | 'html' | undefined {
   return STATE.questionPreviewFormat
 }
 
-export function setQuestionPreviewFormat(format: 'markdown' | 'html'): void {
+export function setQuestionPreviewFormat(
+  format: 'markdown' | 'html' | undefined,
+): void {
   STATE.questionPreviewFormat = format
 }
 

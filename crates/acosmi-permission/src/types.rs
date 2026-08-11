@@ -16,7 +16,7 @@ pub enum PermissionMode {
     Plan,
     /// 自动批准编辑
     AcceptEdits,
-    /// 跳过所有权限检查
+    /// 自动批准常规操作；显式规则和安全检查仍然生效
     BypassPermissions,
     /// 拒绝所有操作
     DontAsk,

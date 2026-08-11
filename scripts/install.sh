@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # SECURITY NOTICE: piping this bootstrap from a mutable URL does not authenticate its source.
-# CrabCode TUI fail-closed installer for macOS and Linux.
+# CrabCode TUI fail-closed installer for macOS.
 set -eu
 
 REPOSITORY="acosmi/CrabCode-TUI"
@@ -33,8 +33,8 @@ fi
 
 case "$(uname -s)" in
   Darwin) OS="darwin" ;;
-  Linux) OS="linux" ;;
-  *) die "仅支持 macOS 和 Linux；Windows 请使用 install.ps1" ;;
+  Linux) die "当前 GitHub Release 仅提供 macOS 和 Windows 安装包；Linux 请从源码构建" ;;
+  *) die "仅支持 macOS；Windows 请使用 install.ps1" ;;
 esac
 case "$(uname -m)" in
   arm64|aarch64) ARCH="arm64" ;;

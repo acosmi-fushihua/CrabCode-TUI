@@ -1,7 +1,10 @@
 // ANT-ONLY import markers must not be reordered
 import { feature } from '../../utils/featurePolyfill.js'
 import type { Command } from 'src/types/command.js'
-import { formatHeadlessCommandDescription } from 'src/cli/headlessCommands.js'
+import {
+  clearHeadlessCommandMemoizationCaches,
+  formatHeadlessCommandDescription,
+} from 'src/cli/headlessCommands.js'
 import { projectCommandCatalogEntries } from 'src/cli/commandCatalogProjection.js'
 import type { ToolPermissionContext } from 'src/Tool.js'
 import {
@@ -27,6 +30,7 @@ import type {
 } from 'src/services/analytics/index.js'
 import { logEvent } from 'src/services/analytics/index.js'
 import { logMCPDebug } from 'src/utils/log.js'
+import { logForDebugging } from 'src/utils/debug.js'
 import {
   getSettings_DEPRECATED,
 } from 'src/utils/settings/settings.js'
@@ -62,6 +66,7 @@ import {
   setMainThreadAgentType,
   getAllowedChannels,
   setAllowedChannels,
+  setQuestionPreviewFormat,
   type ChannelEntry,
 } from 'src/bootstrap/state.js'
 import {
@@ -75,6 +80,8 @@ import type { HookCallbackMatcher } from 'src/types/hooks.js'
 import type { HookEvent } from 'src/entrypoints/agentSdkTypes.js'
 import { AwsAuthStatusManager } from 'src/utils/awsAuthStatusManager.js'
 import { errorMessage } from 'src/utils/errors.js'
+import { performLogout } from 'src/services/auth/logout.js'
+import { AcosmiAccountRemovalCommittedCleanupError } from 'src/services/auth/localAuthState.js'
 import {
   ChannelMessageNotificationSchema,
   gateChannelServer,
@@ -92,6 +99,249 @@ import {
 
 type StdoutMessageSink = {
   enqueue(message: StdoutMessage): void
+}
+
+export type SDKControlAuthCatalogResponse = Pick<
+  SDKControlInitializeResponse,
+  'account' | 'commands'
+>
+
+type AuthCatalogRefreshDependencies = {
+  clearCommandCaches: () => void
+  getAccount: typeof getAccountInformation
+  getProvider: typeof getAPIProvider
+}
+
+type DirectTuiLogoutDependencies = AuthCatalogRefreshDependencies & {
+  logout: typeof performLogout
+}
+
+type AuthCatalogSnapshot = {
+  commands: Command[]
+  response: SDKControlAuthCatalogResponse
+}
+
+const AUTH_CATALOG_REFRESH_DEPENDENCIES: AuthCatalogRefreshDependencies = {
+  clearCommandCaches: clearHeadlessCommandMemoizationCaches,
+  getAccount: getAccountInformation,
+  getProvider: getAPIProvider,
+}
+
+const DIRECT_TUI_LOGOUT_DEPENDENCIES: DirectTuiLogoutDependencies = {
+  ...AUTH_CATALOG_REFRESH_DEPENDENCIES,
+  logout: performLogout,
+}
+
+/**
+ * Rebuild the command projection after an authentication transition.
+ *
+ * The command loader is memoized, while availability checks such as
+ * `crabcode-ai` depend on the active account. Clearing that memoization before
+ * loading is therefore part of the auth-control response contract rather than
+ * an optional presentation refresh.
+ */
+export async function refreshControlAuthCatalog(
+  commandLoader: (cwd: string) => Promise<Command[]>,
+  currentCwd: string,
+  dependencies: AuthCatalogRefreshDependencies =
+    AUTH_CATALOG_REFRESH_DEPENDENCIES,
+): Promise<AuthCatalogSnapshot> {
+  dependencies.clearCommandCaches()
+  const commands = await commandLoader(currentCwd)
+  const accountInfo = dependencies.getAccount()
+  return {
+    commands,
+    response: {
+      commands: projectCommandCatalogEntries(
+        commands,
+        formatHeadlessCommandDescription,
+      ),
+      account: {
+        email: accountInfo?.email,
+        organization: accountInfo?.organization,
+        subscriptionType: accountInfo?.subscription,
+        tokenSource: accountInfo?.tokenSource,
+        apiKeySource: accountInfo?.apiKeySource,
+        apiProvider: dependencies.getProvider(),
+      },
+    },
+  }
+}
+
+/**
+ * Empty is the only catalog that is safe after credentials were cleared but
+ * discovery could not be rebuilt. In particular, retaining the previous
+ * snapshot would leave account-gated commands executable in TypeScript even
+ * if the renderer had already presented a signed-out state.
+ */
+export function conservativeControlAuthCatalog(): AuthCatalogSnapshot {
+  return {
+    commands: [],
+    response: {
+      commands: [],
+      account: {},
+    },
+  }
+}
+
+/**
+ * Rebuild the post-logout snapshot without ever copying identity fields back
+ * into the response. `getAccount` is still evaluated so a broken auth cache is
+ * treated as a refresh failure, but a successful read is used only to detect
+ * stale identity remnants. The renderer must observe a signed-out account
+ * even if a lower layer briefly retains old profile data.
+ */
+async function refreshSignedOutControlAuthCatalog(
+  commandLoader: (cwd: string) => Promise<Command[]>,
+  currentCwd: string,
+  dependencies: AuthCatalogRefreshDependencies,
+): Promise<AuthCatalogSnapshot> {
+  dependencies.clearCommandCaches()
+  const commands = await commandLoader(currentCwd)
+  const accountInfo = dependencies.getAccount()
+  if (
+    accountInfo?.email !== undefined ||
+    accountInfo?.organization !== undefined ||
+    accountInfo?.subscription !== undefined ||
+    (accountInfo?.tokenSource !== undefined &&
+      accountInfo.tokenSource !== 'none') ||
+    (accountInfo?.apiKeySource !== undefined &&
+      accountInfo.apiKeySource !== 'none')
+  ) {
+    throw new Error('logout refresh retained account identity')
+  }
+  const apiProvider = dependencies.getProvider()
+  return {
+    commands,
+    response: {
+      commands: projectCommandCatalogEntries(
+        commands,
+        formatHeadlessCommandDescription,
+      ),
+      account: { apiProvider },
+    },
+  }
+}
+
+/**
+ * Own the process-private native-TUI logout handshake without terminating the
+ * StructuredIO child. Ordinary print/SDK sessions are rejected before any
+ * credential mutation, preserving their existing command lifecycle.
+ */
+export async function handleDirectTuiLogoutRequest(
+  requestId: string,
+  output: StdoutMessageSink,
+  commandLoader: (cwd: string) => Promise<Command[]>,
+  currentCwd: string,
+  interactiveProductSession: boolean,
+  dependencies: DirectTuiLogoutDependencies =
+    DIRECT_TUI_LOGOUT_DEPENDENCIES,
+  commitCommands?: (commands: readonly Command[]) => unknown,
+): Promise<Command[] | null> {
+  if (!interactiveProductSession) {
+    output.enqueue({
+      type: 'control_response',
+      response: {
+        subtype: 'error',
+        request_id: requestId,
+        error: 'crabcode_tui_logout is available only to the direct TUI runtime',
+      },
+    })
+    return null
+  }
+
+  // Phase one is the only fallible phase allowed to report logout failure.
+  // Once this resolves (or the typed secure-storage commit signal is caught),
+  // Acosmi account removal is authoritative and must never be misrepresented
+  // as a failed logout merely because later projection/output work fails.
+  let committedCleanupWarning: AcosmiAccountRemovalCommittedCleanupError | null =
+    null
+  try {
+    await dependencies.logout({ clearOnboarding: true })
+  } catch (error) {
+    if (error instanceof AcosmiAccountRemovalCommittedCleanupError) {
+      committedCleanupWarning = error
+    } else {
+      output.enqueue({
+        type: 'control_response',
+        response: {
+          subtype: 'error',
+          request_id: requestId,
+          error: errorMessage(error),
+        },
+      })
+      return null
+    }
+  }
+
+  let refreshed: AuthCatalogSnapshot
+  if (committedCleanupWarning) {
+    // Secure storage proved the credential mutation committed, but one of the
+    // later local cleanup steps rejected. Do not consult any potentially stale
+    // account/cache projection in this state.
+    refreshed = conservativeControlAuthCatalog()
+    logForDebugging(
+      `[direct-tui] Acosmi account removal committed but later logout cleanup degraded safely: ${committedCleanupWarning.message}`,
+      { level: 'warn' },
+    )
+  } else {
+    try {
+      refreshed = await refreshSignedOutControlAuthCatalog(
+        commandLoader,
+        currentCwd,
+        dependencies,
+      )
+    } catch (error) {
+      refreshed = conservativeControlAuthCatalog()
+      logForDebugging(
+        `[direct-tui] credentials were cleared but the signed-out auth/catalog refresh degraded safely: ${errorMessage(error)}`,
+        { level: 'warn' },
+      )
+    }
+  }
+
+  // Commit before publishing the correlated response. The production
+  // lifecycle replacement is synchronous and non-throwing; violating that
+  // internal invariant must fail closed instead of acknowledging signed-out
+  // state while TypeScript can still dispatch the old catalog.
+  commitCommands?.(refreshed.commands)
+
+  try {
+    output.enqueue({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: requestId,
+        response: refreshed.response,
+      },
+    })
+  } catch (error) {
+    // Do not enqueue an error response here: credentials are already gone and
+    // claiming otherwise could prompt the user to continue relying on a stale
+    // authenticated UI. A broken response lane is diagnosed, while the query
+    // registry remains committed to the signed-out snapshot above.
+    logForDebugging(
+      `[direct-tui] Acosmi account removal committed but the logout response could not be queued: ${errorMessage(error)}`,
+      { level: 'warn' },
+    )
+  }
+  return refreshed.commands
+}
+
+/**
+ * Select the one preview dialect this process will advertise to the model.
+ * Version 1 has no preview contract; version 2 and future versions negotiate
+ * only the small capability subset understood here. Markdown wins when a host
+ * lists both so the choice is stable across list ordering.
+ */
+export function negotiateQuestionPreviewFormat(
+  capability: SDKControlInitializeRequest['askUserQuestion'],
+): 'markdown' | 'html' | undefined {
+  if (!capability || capability.version < 2) return undefined
+  const formats = capability.previewFormats ?? []
+  if (formats.includes('markdown')) return 'markdown'
+  if (formats.includes('html')) return 'html'
+  return undefined
 }
 
 export async function handleInitializeRequest(
@@ -137,6 +387,9 @@ export async function handleInitializeRequest(
   if (request.promptSuggestions !== undefined) {
     options.promptSuggestions = request.promptSuggestions
   }
+  setQuestionPreviewFormat(
+    negotiateQuestionPreviewFormat(request.askUserQuestion),
+  )
 
   // Merge agents from stdin to avoid ARG_MAX limits
   if (request.agents) {

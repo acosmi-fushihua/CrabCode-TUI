@@ -4,6 +4,7 @@
 
 import type { AgentId } from '../../types/ids.js'
 import type { HookResultMessage, Message } from '../../types/message.js'
+import type { ToolUseContext } from '../../Tool.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
 import { errorMessage } from '../../utils/errors.js'
@@ -515,10 +516,20 @@ export async function trySessionMemoryCompaction(
   messages: Message[],
   agentId?: AgentId,
   autoCompactThreshold?: number,
+  progressContext?: Pick<
+    ToolUseContext,
+    'onCompactProgress' | 'setSDKStatus'
+  >,
 ): Promise<CompactionResult | null> {
   if (!shouldUseSessionMemoryCompaction()) {
     return null
   }
+
+  // The session-memory probe and any subsequent legacy fallback belong to
+  // one renderer lifecycle. The manual /compact caller supplies a deduping
+  // reporter and owns the final compact_end cleanup.
+  progressContext?.setSDKStatus?.('compacting')
+  progressContext?.onCompactProgress?.({ type: 'compact_start' })
 
   // Initialize config from remote (only fetches once)
   await initSessionMemoryCompactConfig()
@@ -580,7 +591,11 @@ export async function trySessionMemoryCompaction(
       .slice(startIndex)
       .filter(m => !isCompactBoundaryMessage(m))
 
-    // Run session start hooks to restore CRABCODE.md and other context
+    // Run session start hooks to restore CRABCODE.md and other context.
+    progressContext?.onCompactProgress?.({
+      type: 'hooks_start',
+      hookType: 'session_start',
+    })
     const hookResults = await processSessionStartHooks('compact', {
       model: getMainLoopModel(),
     })

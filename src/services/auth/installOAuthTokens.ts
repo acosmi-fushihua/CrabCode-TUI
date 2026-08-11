@@ -23,10 +23,37 @@ import { latNow, latTrace } from '../../utils/latencyTrace.js'
 import { invalidateCredentialsCache } from '../../utils/model/providers.js'
 import type { SecureStorageWriteResult } from '../../utils/secureStorage/types.js'
 import {
+  AcosmiAccountRemovalCommittedCleanupError,
   clearAuthRelatedCaches,
   clearLocalAuthState,
 } from './localAuthState.js'
 import { shouldUseAcosmiAuth } from '../oauth/client.js'
+
+/**
+ * Token replacement first removes the prior account. A typed rejection after
+ * that secure-storage commit is a cleanup warning, not evidence that the old
+ * account survived; continuing lets the new authoritative token replace it.
+ * Every uncommitted or merely structural lookalike error still fails closed.
+ */
+export async function clearPriorAuthForOAuthInstall(
+  clearPriorAuth: () => Promise<void> = () =>
+    clearLocalAuthState({
+      clearOnboarding: false,
+      flushTelemetry: true,
+    }),
+): Promise<void> {
+  try {
+    await clearPriorAuth()
+  } catch (error) {
+    if (!(error instanceof AcosmiAccountRemovalCommittedCleanupError)) {
+      throw error
+    }
+    logForDebugging(
+      `[auth] prior Acosmi account removal committed before OAuth install; continuing after cleanup warning: ${error.message}`,
+      { level: 'warn' },
+    )
+  }
+}
 
 /**
  * Shared post-token-acquisition backend operation.
@@ -53,10 +80,7 @@ export async function installOAuthTokens(
   }
 
   const clearStart = latNow()
-  await clearLocalAuthState({
-    clearOnboarding: false,
-    flushTelemetry: true,
-  })
+  await clearPriorAuthForOAuthInstall()
   latTrace('installOAuthTokens.clearLocalAuthState', {
     dur_ms: latNow() - clearStart,
   })

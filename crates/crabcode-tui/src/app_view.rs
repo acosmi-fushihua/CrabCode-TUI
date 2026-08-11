@@ -1407,7 +1407,10 @@ mod tests {
             (
                 "login wait",
                 OutboundPurpose::LoginWait,
-                Some(json!({"account": {"email": "fixture@example.invalid"}})),
+                Some(json!({
+                    "account": {"email": "fixture@example.invalid"},
+                    "commands": []
+                })),
             ),
             (
                 "MCP status",

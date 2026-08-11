@@ -9,6 +9,12 @@ import {
   drainSdkEvents,
   enqueueSdkEvent,
 } from '../../src/utils/sdkEventQueue.js'
+import {
+  assertInteractivePermissionDecisionResolved,
+  DIRECT_TUI_PERMISSION_PROMPT_TOOL_NAME,
+  UNRESOLVED_DIRECT_TUI_PERMISSION_MESSAGE,
+  withDirectTuiPermissionBridge,
+} from '../../src/cli/directTuiPermissionBridge.js'
 
 afterEach(() => {
   drainSdkEvents()
@@ -16,6 +22,58 @@ afterEach(() => {
 })
 
 describe('StructuredIO transport state', () => {
+  test('native TUI permission transport is fixed and cannot be overridden by caller options', () => {
+    expect(withDirectTuiPermissionBridge({}).permissionPromptToolName).toBe(
+      DIRECT_TUI_PERMISSION_PROMPT_TOOL_NAME,
+    )
+    expect(
+      withDirectTuiPermissionBridge({
+        permissionPromptToolName: 'mcp__host__prompt',
+      }).permissionPromptToolName,
+    ).toBe('stdio')
+  })
+
+  test('interactive StructuredIO fails closed if an unresolved ask reaches execution', () => {
+    const ask = {
+      behavior: 'ask' as const,
+      message: 'requires approval',
+      decisionReason: {
+        type: 'safetyCheck' as const,
+        reason: 'protected configuration',
+        classifierApprovable: true,
+      },
+    }
+
+    expect(() =>
+      assertInteractivePermissionDecisionResolved(ask, {
+        interactive: true,
+        structuredIo: true,
+      }),
+    ).toThrow(UNRESOLVED_DIRECT_TUI_PERMISSION_MESSAGE)
+    expect(() =>
+      assertInteractivePermissionDecisionResolved(ask, {
+        interactive: false,
+        structuredIo: true,
+      }),
+    ).not.toThrow()
+    expect(() =>
+      assertInteractivePermissionDecisionResolved(ask, {
+        interactive: true,
+        structuredIo: false,
+      }),
+    ).not.toThrow()
+    expect(() =>
+      assertInteractivePermissionDecisionResolved(
+        {
+          behavior: 'deny',
+          message: 'denied',
+          decisionReason: { type: 'other', reason: 'denied' },
+        },
+        { interactive: true, structuredIo: true },
+      ),
+    ).not.toThrow()
+  })
+
   test('SDK lifecycle delivery follows the transport, not product interactivity', () => {
     const cases = [
       { interactive: true, structured: false, delivered: false },

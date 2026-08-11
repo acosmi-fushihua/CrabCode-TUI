@@ -1,15 +1,21 @@
 import type { Command } from 'src/types/command.js'
 import { parseSlashCommand } from 'src/utils/slashCommandParsing.js'
+import { getActiveBuiltInCommandNames } from 'src/utils/builtInCommandNamesProvider.js'
 
 export type CommandCatalogEntry = {
   name: string
   description: string
   argumentHint: string
+  hidden?: true
+  builtin?: true
 }
 
 /**
- * Project the ordered command registry onto the existing three-field control
- * catalog without adding a second routing protocol.
+ * Project the ordered command registry onto the existing control catalog.
+ * `hidden` and `builtin` are additive presentation metadata: hidden commands
+ * retain exact typed dispatch ownership but stay out of renderer discovery,
+ * while builtin lets Help partition runtime commands without guessing from a
+ * second stale token list.
  *
  * The backend resolves slash invocations with `Array.find`, so the first
  * visible command whose canonical name or alias matches a token owns that
@@ -27,6 +33,7 @@ export function projectCommandCatalogEntries(
 ): CommandCatalogEntry[] {
   const claimedInvocationNames = new Set<string>()
   const entries: CommandCatalogEntry[] = []
+  const builtInNames = getActiveBuiltInCommandNames()
 
   for (const command of commands) {
     if (command.userInvocable === false) continue
@@ -52,7 +59,13 @@ export function projectCommandCatalogEntries(
       if (!parsed || parsed.commandName !== name || parsed.args !== '') continue
       if (claimedInvocationNames.has(name)) continue
       claimedInvocationNames.add(name)
-      entries.push({ name, description, argumentHint })
+      entries.push({
+        name,
+        description,
+        argumentHint,
+        ...(command.isHidden === true ? { hidden: true as const } : {}),
+        ...(builtInNames.has(name) ? { builtin: true as const } : {}),
+      })
     }
   }
 

@@ -4,13 +4,14 @@
 //! 检测 `PowerShell` 命令中的危险模式。
 //!
 //! **生产可达性（P2-1 诚实声明 2026-06-05）**：本扫描器是 TS `powershellSecurity.ts`
-//! 的 **Rust 镜像参考实现，当前不在生产 agent 执行路径上**。面向 agent 的 PowerShell
-//! 工具（`src/tools/PowerShellTool`，`powershellPermissions.ts::powershellCommandIsSafe`）
-//! 在 **TS 侧自行扫描**并经 `LocalShellTask` 执行，不经 Rust supervisor ExecBridge；
-//! ExecBridge 仅跑固定内部 bash-shaped 命令（git/worktree/LSP），不跑 PowerShell。
-//! 因此 `powershell_command_is_safe` / `check_powershell_permission` 在生产无调用方
-//! 属**设计如此**（非缺陷）；若未来确有可达路径需接通，须经新审计立项，勿擅自接 ExecBridge
-//! （会改变 Windows 既有 exec 判定 = 回归面）。
+//! 的 **Rust 镜像参考实现，当前不在生产 agent PowerShellTool 执行路径上**。面向 agent
+//! 的 PowerShell 工具（`src/tools/PowerShellTool`，
+//! `powershellPermissions.ts::powershellCommandIsSafe`）在 **TS 侧自行扫描**并经
+//! `LocalShellTask` 执行。Supervisor `exec.spawnManaged` 的 wire API 可以选择
+//! PowerShell/cmd；该入口在 `acosmi-supervisor::ipc` 按解析后的真实 shell 使用独立的
+//! 保守 pre-spawn 门禁，而不是把 PowerShell 语法错误地送进 Bash 审计器，也不会为
+//! 静态审计额外启动 pwsh。若未来要在该入口复用本 AST 扫描器，须先审计解析子进程、
+//! 超时和平台 fallback，再扩大其自动允许集合。
 //!
 //! 安全模式:
 //! - 解析失败 → ask (fail-open: 无法静态验证时请求用户确认)

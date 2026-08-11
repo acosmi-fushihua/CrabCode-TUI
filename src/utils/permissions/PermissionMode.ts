@@ -64,8 +64,8 @@ const PERMISSION_MODE_CONFIG: Partial<
     external: 'acceptEdits',
   },
   bypassPermissions: {
-    title: 'Bypass Permissions',
-    shortTitle: 'Bypass',
+    title: 'Auto-approve routine operations',
+    shortTitle: 'Routine auto',
     symbol: '⏵⏵',
     color: 'error',
     external: 'bypassPermissions',

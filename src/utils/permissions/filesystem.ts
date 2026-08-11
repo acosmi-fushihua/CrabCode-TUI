@@ -4,7 +4,12 @@ import ignore from 'ignore'
 import memoize from 'lodash-es/memoize.js'
 import { homedir, tmpdir } from 'os'
 import { join, normalize, posix, sep } from 'path'
-import { hasAutoMemPathOverride, isAutoMemPath } from 'src/memdir/paths.js'
+import {
+  getAutoMemPath,
+  getMemoryBaseDir,
+  hasAutoMemPathOverride,
+  isAutoMemPath,
+} from 'src/memdir/paths.js'
 import { isAgentMemoryPath } from 'src/tools/AgentTool/agentMemory.js'
 import {
   CRABCODE_FOLDER_PERMISSION_PATTERN,
@@ -197,6 +202,41 @@ function getSettingsPaths(): string[] {
   ).filter(path => path !== undefined)
 }
 
+function normalizePermissionPathForms(
+  path: string,
+  precomputedPathsToCheck?: readonly string[],
+): string[] {
+  return Array.from(
+    new Set(
+      (precomputedPathsToCheck ?? getPathsForPermissionCheck(path)).map(value =>
+        normalize(expandPath(value)),
+      ),
+    ),
+  )
+}
+
+function getResolvedRootForms(root: string): string[] {
+  return normalizePermissionPathForms(root)
+}
+
+function allPathFormsStayWithinRoot(
+  pathForms: readonly string[],
+  root: string,
+): boolean {
+  const rootForms = getResolvedRootForms(root)
+  return pathForms.every(pathForm =>
+    rootForms.some(rootForm => pathInTrustedRoot(pathForm, rootForm)),
+  )
+}
+
+// Do not memoize the canonical identity of config home. Unlike ordinary
+// working-directory allowlists, this is a deny boundary: if a symlinked config
+// root is retargeted during a long-lived process, a stale cached realpath could
+// silently stop recognizing the new sensitive target.
+function getResolvedConfigHomePaths(configHome: string): string[] {
+  return getResolvedRootForms(configHome)
+}
+
 export function isCrabCodeSettingsPath(filePath: string): boolean {
   // SECURITY: Normalize path structure first to prevent bypass via redundant ./
   // sequences like `./.crabcode/./settings.json` which would evade the endsWith() check
@@ -223,6 +263,24 @@ export function isCrabCodeSettingsPath(filePath: string): boolean {
 
 // Always ask when CrabCode tries to edit its own config files
 function isCrabCodeConfigFilePath(filePath: string): boolean {
+  // SECURITY: Treat the selected config home as sensitive by identity, not by
+  // the literal directory name ".crabcode". CRABCODE_CONFIG_DIR (or a
+  // CRABCODE_HOME-derived root) may have an arbitrary physical name, and many descendants
+  // (plugins, hooks, workflows, output styles, credentials, MCP state) can
+  // affect future code execution or disclose secrets. Narrow, proven-safe
+  // internal write carve-outs (plans/scratchpad/memory/job state) run before
+  // this check and remain explicitly allowlisted.
+  const configHomePaths = getResolvedConfigHomePaths(
+    getCrabCodeConfigHomeDir(),
+  )
+  if (
+    configHomePaths.some(configHomePath =>
+      pathInWorkingPath(filePath, configHomePath),
+    )
+  ) {
+    return true
+  }
+
   if (isCrabCodeSettingsPath(filePath)) {
     return true
   }
@@ -242,15 +300,37 @@ function isCrabCodeConfigFilePath(filePath: string): boolean {
 }
 
 // Check if file is the plan file for the current session
-function isSessionPlanFile(absolutePath: string): boolean {
-  // Check if path is a plan file for this session (main or agent-specific)
-  // Main plan file: {plansDir}/{planSlug}.md
-  // Agent plan file: {plansDir}/{planSlug}-agent-{agentId}.md
-  const expectedPrefix = join(getPlansDirectory(), getPlanSlug())
-  // SECURITY: Normalize to prevent path traversal bypasses via .. segments
-  const normalizedPath = normalize(absolutePath)
-  return (
-    normalizedPath.startsWith(expectedPrefix) && normalizedPath.endsWith('.md')
+function isSessionPlanFile(
+  absolutePath: string,
+  precomputedPathsToCheck?: readonly string[],
+): boolean {
+  // Check every lexical/canonical form. A symlink nested below the plans
+  // directory must not turn this internal carve-out into a write/read outside
+  // the directory.
+  const pathForms = normalizePermissionPathForms(
+    absolutePath,
+    precomputedPathsToCheck,
+  )
+  const planRootForms = getResolvedRootForms(getPlansDirectory())
+  const slug = normalizeCaseForComparison(getPlanSlug())
+
+  return pathForms.every(pathForm =>
+    planRootForms.some(rootForm => {
+      if (!pathInTrustedRoot(pathForm, rootForm)) return false
+      const relative = normalizeCaseForComparison(
+        relativePath(rootForm, pathForm),
+      )
+      if (!relative || relative.includes('/') || relative.includes('\\')) {
+        return false
+      }
+      if (relative === `${slug}.md`) return true
+      const agentPrefix = `${slug}-agent-`
+      return (
+        relative.startsWith(agentPrefix) &&
+        relative.endsWith('.md') &&
+        relative.length > agentPrefix.length + '.md'.length
+      )
+    }),
   )
 }
 
@@ -271,22 +351,27 @@ export function getSessionMemoryPath(): string {
 }
 
 // Check if file is within the session memory directory
-function isSessionMemoryPath(absolutePath: string): boolean {
-  // SECURITY: Normalize to prevent path traversal bypasses via .. segments
-  const normalizedPath = normalize(absolutePath)
-  return normalizedPath.startsWith(getSessionMemoryDir())
+function isSessionMemoryPath(
+  absolutePath: string,
+  precomputedPathsToCheck?: readonly string[],
+): boolean {
+  return allPathFormsStayWithinRoot(
+    normalizePermissionPathForms(absolutePath, precomputedPathsToCheck),
+    getSessionMemoryDir(),
+  )
 }
 
 /**
  * Check if file is within the current project's directory.
  * Path format: ~/.crabcode/projects/{sanitized-cwd}/...
  */
-function isProjectDirPath(absolutePath: string): boolean {
-  const projectDir = getProjectDir(getCwd())
-  // SECURITY: Normalize to prevent path traversal bypasses via .. segments
-  const normalizedPath = normalize(absolutePath)
-  return (
-    normalizedPath === projectDir || normalizedPath.startsWith(projectDir + sep)
+function isProjectDirPath(
+  absolutePath: string,
+  precomputedPathsToCheck?: readonly string[],
+): boolean {
+  return allPathFormsStayWithinRoot(
+    normalizePermissionPathForms(absolutePath, precomputedPathsToCheck),
+    getProjectDir(getCwd()),
   )
 }
 
@@ -407,19 +492,101 @@ export async function ensureScratchpadDir(): Promise<string> {
 }
 
 // Check if file is within the scratchpad directory
-function isScratchpadPath(absolutePath: string): boolean {
+function isScratchpadPath(
+  absolutePath: string,
+  precomputedPathsToCheck?: readonly string[],
+): boolean {
   if (!isScratchpadEnabled()) {
     return false
   }
-  const scratchpadDir = getScratchpadDir()
-  // SECURITY: Normalize the path to resolve .. segments before checking
-  // This prevents path traversal bypasses like:
-  //   echo "malicious" > /tmp/crabcode-0/proj/session/scratchpad/../../../etc/passwd
-  // Without normalization, the path would pass the startsWith check but write to /etc/passwd
-  const normalizedPath = normalize(absolutePath)
-  return (
-    normalizedPath === scratchpadDir ||
-    normalizedPath.startsWith(scratchpadDir + sep)
+  return allPathFormsStayWithinRoot(
+    normalizePermissionPathForms(absolutePath, precomputedPathsToCheck),
+    getScratchpadDir(),
+  )
+}
+
+function getAgentMemoryRootForPath(absolutePath: string): string | null {
+  const normalizedPath = normalize(expandPath(absolutePath))
+  const fixedRoots = [
+    join(getMemoryBaseDir(), 'agent-memory'),
+    join(getCwd(), '.crabcode', 'agent-memory'),
+    join(getCwd(), '.crabcode', 'agent-memory-local'),
+  ]
+  for (const root of fixedRoots) {
+    if (pathInTrustedRoot(normalizedPath, root)) return root
+  }
+
+  // Remote local-scope memory is namespaced below
+  // <remote>/projects/<project>/agent-memory-local/. Preserve the existing
+  // namespace semantics while extracting the narrowest trusted root so a
+  // nested symlink cannot escape it.
+  const remoteMemoryDir = process.env.CRABCODE_REMOTE_MEMORY_DIR
+  if (!remoteMemoryDir) return null
+  const projectsRoot = join(remoteMemoryDir, 'projects')
+  if (!pathInTrustedRoot(normalizedPath, projectsRoot)) return null
+
+  const normalizedMarker = `${sep}agent-memory-local${sep}`
+  const markerIndex = normalizeCaseForComparison(normalizedPath).indexOf(
+    normalizeCaseForComparison(normalizedMarker),
+  )
+  if (markerIndex === -1) return null
+  return normalizedPath.slice(
+    0,
+    markerIndex + `${sep}agent-memory-local`.length,
+  )
+}
+
+function isSafeAgentMemoryPath(
+  absolutePath: string,
+  precomputedPathsToCheck?: readonly string[],
+): boolean {
+  const pathForms = normalizePermissionPathForms(
+    absolutePath,
+    precomputedPathsToCheck,
+  )
+  // A command validator may supply the canonical physical path as its primary
+  // value while retaining the lexical config-root form in pathForms. Find the
+  // authorized lexical identity first, then require every alias/canonical form
+  // to remain below that same resolved root.
+  for (const pathForm of pathForms) {
+    if (!isAgentMemoryPath(pathForm)) continue
+    const root = getAgentMemoryRootForPath(pathForm)
+    if (root && allPathFormsStayWithinRoot(pathForms, root)) return true
+  }
+  return false
+}
+
+function isSafeAutoMemPath(
+  absolutePath: string,
+  precomputedPathsToCheck?: readonly string[],
+): boolean {
+  const pathForms = normalizePermissionPathForms(
+    absolutePath,
+    precomputedPathsToCheck,
+  )
+  if (!pathForms.some(pathForm => isAutoMemPath(pathForm))) return false
+  return allPathFormsStayWithinRoot(pathForms, getAutoMemPath())
+}
+
+function isSafeProjectLaunchPath(
+  absolutePath: string,
+  precomputedPathsToCheck?: readonly string[],
+): boolean {
+  const projectConfigRoot = join(getOriginalCwd(), '.crabcode')
+  const pathForms = normalizePermissionPathForms(
+    absolutePath,
+    precomputedPathsToCheck,
+  )
+  const rootForms = getResolvedRootForms(projectConfigRoot)
+
+  return pathForms.every(pathForm =>
+    rootForms.some(rootForm => {
+      if (!pathInTrustedRoot(pathForm, rootForm)) return false
+      return (
+        normalizeCaseForComparison(relativePath(rootForm, pathForm)) ===
+        'launch.json'
+      )
+    }),
   )
 }
 
@@ -701,9 +868,42 @@ export function pathInAllowedWorkingPath(
   // If any resolved path is outside, deny access
   return pathsToCheck.every(pathToCheck =>
     workingPaths.some(workingPath =>
-      pathInWorkingPath(pathToCheck, workingPath),
+      pathInTrustedRoot(pathToCheck, workingPath),
     ),
   )
+}
+
+/**
+ * Positive allowlist containment. Unlike pathInWorkingPath (which folds case
+ * defensively for sensitive deny classification), this must not treat a
+ * case-variant sibling as an authorized child on a case-sensitive filesystem.
+ * Windows paths are case-insensitive by contract; other platforms use exact
+ * normalized spelling and may conservatively prompt on unusual case-folding
+ * volumes.
+ */
+export function pathInTrustedRoot(path: string, root: string): boolean {
+  const normalizePhysicalAlias = (value: string) => {
+    const expanded = expandPath(value)
+    if (getPlatform() !== 'darwin') return expanded
+    return expanded
+      .replace(/^\/private\/var(\/|$)/, '/var$1')
+      .replace(/^\/private\/tmp(\/|$)/, '/tmp$1')
+  }
+  const normalizedPath = normalizePhysicalAlias(path)
+  const normalizedRoot = normalizePhysicalAlias(root)
+  const comparisonPath =
+    getPlatform() === 'windows'
+      ? normalizeCaseForComparison(normalizedPath)
+      : normalizedPath
+  const comparisonRoot =
+    getPlatform() === 'windows'
+      ? normalizeCaseForComparison(normalizedRoot)
+      : normalizedRoot
+  const relative = relativePath(comparisonRoot, comparisonPath)
+
+  if (relative === '') return true
+  if (containsPathTraversal(relative)) return false
+  return !posix.isAbsolute(relative)
 }
 
 export function pathInWorkingPath(path: string, workingPath: string): boolean {
@@ -1152,7 +1352,11 @@ export function checkReadPermissionForTool(
 
   // 7. Allow reads from internal harness paths (session-memory, plans, tool-results)
   const absolutePath = expandPath(path)
-  const internalReadResult = checkReadableInternalPath(absolutePath, input)
+  const internalReadResult = checkReadableInternalPath(
+    absolutePath,
+    input,
+    pathsToCheck,
+  )
   if (internalReadResult.behavior !== 'passthrough') {
     return internalReadResult
   }
@@ -1244,6 +1448,7 @@ export function checkWritePermissionForTool<Input extends AnyObject>(
   const internalEditResult = checkEditableInternalPath(
     absolutePathForEdit,
     input,
+    pathsToCheck,
   )
   if (internalEditResult.behavior !== 'passthrough') {
     return internalEditResult
@@ -1479,13 +1684,19 @@ export function generateSuggestions(
 export function checkEditableInternalPath(
   absolutePath: string,
   input: { [key: string]: unknown },
+  precomputedPathsToCheck?: readonly string[],
 ): PermissionResult {
   // SECURITY: Normalize path to prevent traversal bypasses via .. segments
   // This is defense-in-depth; individual helper functions also normalize
   const normalizedPath = normalize(absolutePath)
 
   // Plan files for current session
-  if (isSessionPlanFile(normalizedPath)) {
+  const targetForms = normalizePermissionPathForms(
+    normalizedPath,
+    precomputedPathsToCheck,
+  )
+
+  if (isSessionPlanFile(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1497,7 +1708,7 @@ export function checkEditableInternalPath(
   }
 
   // Scratchpad directory for current session
-  if (isScratchpadPath(normalizedPath)) {
+  if (isScratchpadPath(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1530,7 +1741,6 @@ export function checkEditableInternalPath(
         jobsRootForms.some(jr => jd.startsWith(jr + sep)),
       )
       if (isUnderJobsRoot) {
-        const targetForms = getPathsForPermissionCheck(absolutePath)
         const allInsideJobDir = targetForms.every(p => {
           const np = normalize(p)
           return jobDirForms.some(jd => np === jd || np.startsWith(jd + sep))
@@ -1551,7 +1761,7 @@ export function checkEditableInternalPath(
   }
 
   // Agent memory directory (for self-improving agents)
-  if (isAgentMemoryPath(normalizedPath)) {
+  if (isSafeAgentMemoryPath(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1569,7 +1779,10 @@ export function checkEditableInternalPath(
   // so it gets NO special permission treatment here — writes go through normal
   // permission flow (step 5 → ask). SDK callers who want silent memory should
   // pass an allow rule for the override path.
-  if (!hasAutoMemPathOverride() && isAutoMemPath(normalizedPath)) {
+  if (
+    !hasAutoMemPathOverride() &&
+    isSafeAutoMemPath(normalizedPath, targetForms)
+  ) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1587,10 +1800,7 @@ export function checkEditableInternalPath(
   // cascades: user clicks "Always allow" → setMode:acceptEdits suggestion
   // applied → silent downgrade from auto mode. Matches the project-level
   // .crabcode/ only (not ~/.crabcode/) since launch.json is per-project.
-  if (
-    normalizeCaseForComparison(normalizedPath) ===
-    normalizeCaseForComparison(join(getOriginalCwd(), '.crabcode', 'launch.json'))
-  ) {
+  if (isSafeProjectLaunchPath(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1611,13 +1821,18 @@ export function checkEditableInternalPath(
 export function checkReadableInternalPath(
   absolutePath: string,
   input: { [key: string]: unknown },
+  precomputedPathsToCheck?: readonly string[],
 ): PermissionResult {
   // SECURITY: Normalize path to prevent traversal bypasses via .. segments
   // This is defense-in-depth; individual helper functions also normalize
   const normalizedPath = normalize(absolutePath)
+  const targetForms = normalizePermissionPathForms(
+    normalizedPath,
+    precomputedPathsToCheck,
+  )
 
   // Session memory directory
-  if (isSessionMemoryPath(normalizedPath)) {
+  if (isSessionMemoryPath(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1630,7 +1845,7 @@ export function checkReadableInternalPath(
 
   // Project directory (for reading past session memories)
   // Path format: ~/.crabcode/projects/{sanitized-cwd}/...
-  if (isProjectDirPath(normalizedPath)) {
+  if (isProjectDirPath(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1642,7 +1857,7 @@ export function checkReadableInternalPath(
   }
 
   // Plan files for current session
-  if (isSessionPlanFile(normalizedPath)) {
+  if (isSessionPlanFile(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1655,14 +1870,7 @@ export function checkReadableInternalPath(
 
   // Tool results directory (persisted large outputs)
   // Use path separator suffix to prevent path traversal (e.g., tool-results-evil/)
-  const toolResultsDir = getToolResultsDir()
-  const toolResultsDirWithSep = toolResultsDir.endsWith(sep)
-    ? toolResultsDir
-    : toolResultsDir + sep
-  if (
-    normalizedPath === toolResultsDir ||
-    normalizedPath.startsWith(toolResultsDirWithSep)
-  ) {
+  if (allPathFormsStayWithinRoot(targetForms, getToolResultsDir())) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1674,7 +1882,7 @@ export function checkReadableInternalPath(
   }
 
   // Scratchpad directory for current session
-  if (isScratchpadPath(normalizedPath)) {
+  if (isScratchpadPath(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1686,7 +1894,7 @@ export function checkReadableInternalPath(
   }
 
   // Agent memory directory (for self-improving agents)
-  if (isAgentMemoryPath(normalizedPath)) {
+  if (isSafeAgentMemoryPath(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1698,7 +1906,7 @@ export function checkReadableInternalPath(
   }
 
   // Memdir directory (persistent memory for cross-session learning)
-  if (isAutoMemPath(normalizedPath)) {
+  if (isSafeAutoMemPath(normalizedPath, targetForms)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1710,11 +1918,8 @@ export function checkReadableInternalPath(
   }
 
   // Tasks directory (~/.crabcode/tasks/) for swarm task coordination
-  const tasksDir = join(getCrabCodeConfigHomeDir(), 'tasks') + sep
-  if (
-    normalizedPath === tasksDir.slice(0, -1) ||
-    normalizedPath.startsWith(tasksDir)
-  ) {
+  const tasksDir = join(getCrabCodeConfigHomeDir(), 'tasks')
+  if (allPathFormsStayWithinRoot(targetForms, tasksDir)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1726,11 +1931,8 @@ export function checkReadableInternalPath(
   }
 
   // Teams directory (~/.crabcode/teams/) for swarm coordination
-  const teamsReadDir = join(getCrabCodeConfigHomeDir(), 'teams') + sep
-  if (
-    normalizedPath === teamsReadDir.slice(0, -1) ||
-    normalizedPath.startsWith(teamsReadDir)
-  ) {
+  const teamsReadDir = join(getCrabCodeConfigHomeDir(), 'teams')
+  if (allPathFormsStayWithinRoot(targetForms, teamsReadDir)) {
     return {
       behavior: 'allow',
       updatedInput: input,
@@ -1746,8 +1948,7 @@ export function checkReadableInternalPath(
   // is the load-bearing defense; uid/VERSION alone are public knowledge and
   // squattable. We always write-before-read on invocation, so content under
   // this subtree is harness-controlled.
-  const bundledSkillsRoot = getBundledSkillsRoot() + sep
-  if (normalizedPath.startsWith(bundledSkillsRoot)) {
+  if (allPathFormsStayWithinRoot(targetForms, getBundledSkillsRoot())) {
     return {
       behavior: 'allow',
       updatedInput: input,

@@ -72,6 +72,24 @@ const MAX_CONTENT_SIZE = 60 * 1024 // 60KB (Honeycomb limit is 64KB, staying saf
 const MEDIA_DATA_REDACTED = '[MEDIA DATA REDACTED]'
 const VISION_DESCRIPTION_REDACTED = '[VISION DESCRIPTION REDACTED]'
 const CIRCULAR_VALUE_REDACTED = '[CIRCULAR VALUE REDACTED]'
+const INTERACTIVE_QUESTION_RESULT_REDACTED =
+  '[INTERACTIVE QUESTION RESULT REDACTED]'
+
+// Interactive question payloads contain conversation content and may include
+// free-form answers, private notes, and visual previews. They are never
+// eligible for detailed tool tracing, even when the broad beta tracing switch
+// is enabled. Keep this guard at the tracing sink as defense in depth for all
+// current and future callers.
+const TOOL_TRACE_CONTENT_REDACTION_NAMES = new Set(['AskUserQuestion'])
+
+export function shouldRedactToolTraceContent(
+  toolName: string | number | boolean,
+): boolean {
+  return (
+    typeof toolName === 'string' &&
+    TOOL_TRACE_CONTENT_REDACTION_NAMES.has(toolName)
+  )
+}
 
 // The sidecar description is model-generated untrusted content. Treat the
 // complete envelope as media-derived data: tracing must never inspect or keep
@@ -461,10 +479,44 @@ interface FormattedMessages {
 }
 
 /**
+ * Collect tool-use IDs whose results must never enter detailed tracing.
+ *
+ * This deliberately scans the complete API history. `new_context` is an
+ * incremental window, so the assistant message that named the tool commonly
+ * sits before that window while its following user tool_result sits inside it.
+ * Looking only at the delta would therefore lose the only trustworthy mapping
+ * from tool_use_id to tool name and could expose an interactive answer.
+ */
+function collectRedactedToolUseIDs(messages: APIMessage[]): Set<string> {
+  const redactedToolUseIDs = new Set<string>()
+
+  for (const message of messages) {
+    if (message.type !== 'assistant') {
+      continue
+    }
+
+    for (const block of message.message.content) {
+      if (
+        block.type === 'tool_use' &&
+        typeof block.id === 'string' &&
+        shouldRedactToolTraceContent(block.name)
+      ) {
+        redactedToolUseIDs.add(block.id)
+      }
+    }
+  }
+
+  return redactedToolUseIDs
+}
+
+/**
  * Format user messages for new_context display, separating system reminders.
  * Only handles user messages (assistant messages are filtered out before this is called).
  */
-function formatMessagesForContext(messages: UserMessage[]): FormattedMessages {
+function formatMessagesForContext(
+  messages: UserMessage[],
+  redactedToolUseIDs: ReadonlySet<string>,
+): FormattedMessages {
   const contextParts: string[] = []
   const systemReminders: string[] = []
 
@@ -490,6 +542,17 @@ function formatMessagesForContext(messages: UserMessage[]): FormattedMessages {
             contextParts.push(`[USER]\n${block.text}`)
           }
         } else if (block.type === 'tool_result') {
+          const toolUseID =
+            typeof block.tool_use_id === 'string'
+              ? block.tool_use_id
+              : String(block.tool_use_id)
+          if (redactedToolUseIDs.has(toolUseID)) {
+            contextParts.push(
+              `[TOOL RESULT: ${toolUseID}]\n${INTERACTIVE_QUESTION_RESULT_REDACTED}`,
+            )
+            continue
+          }
+
           const resultContent =
             typeof block.content === 'string'
               ? block.content
@@ -500,7 +563,7 @@ function formatMessagesForContext(messages: UserMessage[]): FormattedMessages {
             systemReminders.push(reminderContent)
           } else {
             contextParts.push(
-              `[TOOL RESULT: ${String(block.tool_use_id)}]\n${resultContent}`,
+              `[TOOL RESULT: ${toolUseID}]\n${resultContent}`,
             )
           }
         }
@@ -673,9 +736,15 @@ export function addBetaLLMRequestAttributes(
       .filter((m): m is UserMessage => m.type === 'user')
 
     if (newMessages.length > 0) {
+      // Correlate against the complete history, not only the incremental
+      // window: the assistant tool_use normally precedes the user tool_result.
+      const redactedToolUseIDs = collectRedactedToolUseIDs(messagesForAPI)
+
       // Format new messages, separating system reminders from regular content
-      const { contextParts, systemReminders } =
-        formatMessagesForContext(newMessages)
+      const { contextParts, systemReminders } = formatMessagesForContext(
+        newMessages,
+        redactedToolUseIDs,
+      )
 
       // Set new_context (regular user content and tool results)
       if (contextParts.length > 0) {
@@ -774,7 +843,7 @@ export function addBetaToolInputAttributes(
   toolName: string,
   toolInput: string,
 ): void {
-  if (!isBetaTracingEnabled()) {
+  if (shouldRedactToolTraceContent(toolName) || !isBetaTracingEnabled()) {
     return
   }
 
@@ -800,7 +869,7 @@ export function addBetaToolResultAttributes(
   toolName: string | number | boolean,
   toolResult: string,
 ): void {
-  if (!isBetaTracingEnabled()) {
+  if (shouldRedactToolTraceContent(toolName) || !isBetaTracingEnabled()) {
     return
   }
 

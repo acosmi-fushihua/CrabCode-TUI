@@ -1907,7 +1907,7 @@ struct ExecGitCommandParams {
     env: Option<HashMap<String, String>>,
     #[serde(default)]
     input: Option<String>,
-    /// 权限模式（可选）。None = 跳过检查（向后兼容）。
+    /// 权限模式（可选）。省略时按 `default` 执行安全门禁。
     /// 取值: "default" | "bypassPermissions" | "dontAsk" | "plan" | "acceptEdits"
     #[serde(default)]
     permission_mode: Option<String>,
@@ -1927,7 +1927,7 @@ struct ExecCommandParams {
     env: Option<HashMap<String, String>>,
     #[serde(default)]
     input: Option<String>,
-    /// 权限模式（可选）。None = 跳过检查（向后兼容）。
+    /// 权限模式（可选）。省略时按 `default` 执行安全门禁。
     /// 取值: "default" | "bypassPermissions" | "dontAsk" | "plan" | "acceptEdits"
     #[serde(default)]
     permission_mode: Option<String>,
@@ -1965,7 +1965,7 @@ struct SpawnManagedParams {
     timeout: Option<u64>,
     #[serde(default)]
     env: Option<HashMap<String, String>>,
-    /// 权限模式（可选）。None = 跳过检查（向后兼容）。
+    /// 权限模式（可选）。省略时按 `default` 执行安全门禁。
     #[serde(default)]
     permission_mode: Option<String>,
     /// Sprint 7 阶段 4 新增（2026-04-23）：沙箱模式 opt-in。
@@ -2350,26 +2350,50 @@ enum PermCheckOutcome {
     Blocked(serde_json::Value),
 }
 
-/// 解析请求参数中的 `permission_mode` 字符串为 `PermissionMode` 枚举。
-/// 返回 None 表示跳过权限检查（向后兼容：请求不含此字段时）。
-fn parse_permission_mode(mode_str: Option<&str>) -> Option<PermissionMode> {
-    mode_str.map(|s| match s {
-        "bypassPermissions" => PermissionMode::BypassPermissions,
-        "dontAsk" => PermissionMode::DontAsk,
-        "plan" => PermissionMode::Plan,
-        "acceptEdits" => PermissionMode::AcceptEdits,
-        "auto" => PermissionMode::Auto,
-        _ => PermissionMode::Default,
-    })
+/// Parse the wire permission mode. A missing or unknown field is not a trusted
+/// compatibility signal: this stdio RPC carries model/tool-derived execution
+/// requests, so omission must retain the normal pre-spawn safety boundary.
+fn parse_permission_mode(mode_str: Option<&str>) -> PermissionMode {
+    match mode_str {
+        None => PermissionMode::Default,
+        Some(s) => match s {
+            "bypassPermissions" => PermissionMode::BypassPermissions,
+            "dontAsk" => PermissionMode::DontAsk,
+            "plan" => PermissionMode::Plan,
+            "acceptEdits" => PermissionMode::AcceptEdits,
+            "auto" => PermissionMode::Auto,
+            _ => PermissionMode::Default,
+        },
+    }
 }
 
-/// 将程序名和参数拼接为完整命令字符串，供 `check_bash_permission` 判定。
+/// Reconstruct a shell-parser input without changing the argv boundaries that
+/// `CommandExecutor` will actually spawn.
+///
+/// This string is used only for permission analysis; execution still uses the
+/// original program and argv. Raw space-joining is unsafe because an argument
+/// such as `"safe;"` becomes shell syntax and can detach a later dangerous path
+/// from the command being inspected. POSIX single-quote escaping gives the
+/// parser the exact literal word while leaving common safe words readable for
+/// rule matching.
 fn format_full_command(program: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        program.to_string()
-    } else {
-        format!("{} {}", program, args.join(" "))
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(shell_quote_permission_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote_permission_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "_@%+=:,./-".contains(ch))
+    {
+        return word.to_string();
     }
+
+    format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 /// 构建 git 宽松权限规则（隐式允许所有 git 命令）。
@@ -2386,6 +2410,9 @@ fn git_lenient_rules() -> Vec<PermissionRule> {
 }
 
 /// 对一条完整命令执行权限检查。
+///
+/// `BypassPermissions` 仅跳过常规逐次审批；显式 deny/ask 规则、shell
+/// 安全扫描、危险删除和敏感写路径仍由 `acosmi-permission` 拦截。
 ///
 /// - `full_command`: 完整命令字符串（如 "npm install" 或 "git push"）
 /// - `cwd`: 当前工作目录
@@ -2429,6 +2456,224 @@ fn check_exec_permission(
             }))
         }
     }
+}
+
+/// Permission dialect selected from the concrete executable returned by
+/// `resolve_shell`. This must follow resolution (including platform fallbacks)
+/// so permission analysis describes the shell that will actually be spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedShellPermissionKind {
+    BashLike,
+    PowerShell,
+    Cmd,
+}
+
+fn managed_shell_permission_kind(program: &str) -> ManagedShellPermissionKind {
+    let basename = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    match basename.as_str() {
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => {
+            ManagedShellPermissionKind::PowerShell
+        }
+        "cmd" | "cmd.exe" => ManagedShellPermissionKind::Cmd,
+        _ => ManagedShellPermissionKind::BashLike,
+    }
+}
+
+fn permission_ask_response(
+    id: &serde_json::Value,
+    command: &str,
+    message: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": JSONRPC_PERMISSION_ASK,
+            "message": message,
+            "data": {
+                "type": "permission_ask",
+                "command": command
+            }
+        },
+        "id": id
+    })
+}
+
+/// Audit a managed shell command using the semantics of the concrete shell.
+///
+/// Bash-like shells use the full permission engine. PowerShell and cmd are
+/// deliberately fail-closed because feeding their syntax to the Bash parser
+/// changes quoting, path, and operator semantics. A tiny literal/read-only
+/// subset stays usable without weakening the pre-spawn boundary.
+fn check_managed_shell_permission(
+    command: &str,
+    cwd: Option<&str>,
+    mode: PermissionMode,
+    kind: ManagedShellPermissionKind,
+    id: &serde_json::Value,
+) -> PermCheckOutcome {
+    if kind == ManagedShellPermissionKind::BashLike {
+        return check_exec_permission(command, cwd, mode, vec![], id);
+    }
+
+    if mode == PermissionMode::DontAsk {
+        return PermCheckOutcome::Blocked(jsonrpc_error(
+            id,
+            JSONRPC_PERMISSION_DENIED,
+            "Permission denied (DontAsk mode)",
+        ));
+    }
+    if mode == PermissionMode::Plan {
+        return PermCheckOutcome::Blocked(jsonrpc_error(
+            id,
+            JSONRPC_PERMISSION_DENIED,
+            "Plan mode: command would be executed",
+        ));
+    }
+    if is_proven_safe_managed_shell_command(command, kind) {
+        return PermCheckOutcome::Allowed;
+    }
+
+    let shell_name = match kind {
+        ManagedShellPermissionKind::PowerShell => "PowerShell",
+        ManagedShellPermissionKind::Cmd => "cmd",
+        ManagedShellPermissionKind::BashLike => unreachable!(),
+    };
+    PermCheckOutcome::Blocked(permission_ask_response(
+        id,
+        command,
+        &format!(
+            "{shell_name} command requires explicit approval because it is outside the closed pre-spawn safe subset"
+        ),
+    ))
+}
+
+fn is_proven_safe_managed_shell_command(command: &str, kind: ManagedShellPermissionKind) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(['\r', '\n'])
+        || !trimmed.chars().all(|ch| {
+            ch.is_alphanumeric()
+                || matches!(
+                    ch,
+                    ' ' | '\t' | '.' | '_' | '/' | '\\' | '@' | ':' | '+' | ',' | '=' | '-'
+                )
+        })
+    {
+        return false;
+    }
+
+    let mut words = trimmed.split_ascii_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    let program = program.to_ascii_lowercase();
+    let has_args = words.next().is_some();
+    match kind {
+        ManagedShellPermissionKind::PowerShell => match program.as_str() {
+            "echo" | "write-output" => true,
+            "get-location" | "pwd" | "get-date" | "whoami" | "hostname" => !has_args,
+            _ => false,
+        },
+        ManagedShellPermissionKind::Cmd => match program.as_str() {
+            "echo" => true,
+            "ver" | "cd" | "whoami" | "hostname" => !has_args,
+            _ => false,
+        },
+        ManagedShellPermissionKind::BashLike => false,
+    }
+}
+
+/// Environment variables are executable input too. Request-supplied loader,
+/// runtime, Git, shell, or unknown application variables can turn an audited
+/// `echo`/`git status` into helper execution after the permission decision.
+/// Only a small, value-constrained presentation/locale set is safe to inherit
+/// automatically; everything else requires explicit approval.
+fn check_exec_environment_permission(
+    env: Option<&HashMap<String, String>>,
+    command: &str,
+    id: &serde_json::Value,
+) -> PermCheckOutcome {
+    let Some(env) = env else {
+        return PermCheckOutcome::Allowed;
+    };
+    let mut keys: Vec<&str> = env.keys().map(String::as_str).collect();
+    keys.sort_unstable_by_key(|key| key.to_ascii_uppercase());
+    for key in keys {
+        let value = &env[key];
+        if env_entry_is_safe_for_automatic_spawn(key, value) {
+            continue;
+        }
+        let upper = key.to_ascii_uppercase();
+        let reason = if env_key_can_inject_behavior(&upper) {
+            "can inject a loader, runtime, shell, or Git helper"
+        } else {
+            "is outside the closed safe environment allowlist"
+        };
+        return PermCheckOutcome::Blocked(permission_ask_response(
+            id,
+            command,
+            &format!("Environment variable '{key}' requires explicit approval because it {reason}"),
+        ));
+    }
+    PermCheckOutcome::Allowed
+}
+
+fn env_entry_is_safe_for_automatic_spawn(key: &str, value: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    if upper == "PATH" {
+        return std::env::var_os("PATH").is_some_and(|current| current.to_string_lossy() == value);
+    }
+    if upper == "LANG" || upper == "LANGUAGE" || upper.starts_with("LC_") {
+        return !value.is_empty()
+            && value.len() <= 128
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '@' | '-'));
+    }
+    if matches!(upper.as_str(), "TERM" | "COLORTERM") {
+        return !value.is_empty()
+            && value.len() <= 128
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '+' | '-'));
+    }
+    if upper == "NO_COLOR" {
+        return value.len() <= 64
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'));
+    }
+    if matches!(
+        upper.as_str(),
+        "FORCE_COLOR" | "CLICOLOR" | "CLICOLOR_FORCE"
+    ) {
+        return matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "1" | "2" | "3" | "true" | "false"
+        );
+    }
+    false
+}
+
+fn env_key_can_inject_behavior(upper: &str) -> bool {
+    upper.starts_with("GIT_")
+        || upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || upper.starts_with("NODE_")
+        || upper.starts_with("PYTHON")
+        || upper.starts_with("PERL")
+        || upper.starts_with("RUBY")
+        || upper.starts_with("JAVA_")
+        || upper.starts_with("JDK_JAVA_")
+        || upper.starts_with("DOTNET_")
+        || matches!(
+            upper,
+            "BASH_ENV" | "ENV" | "PROMPT_COMMAND" | "COMSPEC" | "PATHEXT" | "SHELLOPTS" | "PS4"
+        )
 }
 
 /// `ExecBridge` 方法路由分发
@@ -2589,7 +2834,7 @@ async fn handle_get_git_context(
 
 /// 处理 exec.execGitCommand — 单个 git 命令
 ///
-/// 当请求携带 `permission_mode` 时，使用宽松模式检查（隐式 allow `git *`）。
+/// 使用宽松模式检查（隐式 allow `git *`）；省略 `permission_mode` 时按 default。
 /// 只有用户显式 deny 规则才能阻断 git 操作。
 async fn handle_exec_git_command(
     params: &serde_json::Value,
@@ -2602,17 +2847,21 @@ async fn handle_exec_git_command(
     };
 
     // 权限检查（宽松模式：注入隐式 git allow 规则）
-    if let Some(mode) = parse_permission_mode(parsed.permission_mode.as_deref()) {
-        let full_cmd = format_full_command("git", &parsed.args);
-        if let PermCheckOutcome::Blocked(resp) = check_exec_permission(
-            &full_cmd,
-            parsed.cwd.as_deref(),
-            mode,
-            git_lenient_rules(),
-            id,
-        ) {
-            return resp;
-        }
+    let mode = parse_permission_mode(parsed.permission_mode.as_deref());
+    let full_cmd = format_full_command("git", &parsed.args);
+    if let PermCheckOutcome::Blocked(resp) = check_exec_permission(
+        &full_cmd,
+        parsed.cwd.as_deref(),
+        mode,
+        git_lenient_rules(),
+        id,
+    ) {
+        return resp;
+    }
+    if let PermCheckOutcome::Blocked(resp) =
+        check_exec_environment_permission(parsed.env.as_ref(), &full_cmd, id)
+    {
+        return resp;
     }
 
     let git = find_git_executable();
@@ -2635,7 +2884,7 @@ async fn handle_exec_git_command(
 /// 处理 exec.execGitCommandBatch — 批量 git 命令并行
 ///
 /// 接受 `Arc<CommandExecutor>` 以便 spawn 并行任务。
-/// 当任一请求携带 `permission_mode` 时，逐条检查后再执行。
+/// 每条请求均在执行前检查；省略 `permission_mode` 时按 default。
 async fn handle_exec_git_command_batch(
     params: &serde_json::Value,
     id: &serde_json::Value,
@@ -2649,13 +2898,17 @@ async fn handle_exec_git_command_batch(
 
     // 逐条权限检查（宽松模式）—— 在 spawn 并行任务之前完成
     for req in &requests {
-        if let Some(mode) = parse_permission_mode(req.permission_mode.as_deref()) {
-            let full_cmd = format_full_command("git", &req.args);
-            if let PermCheckOutcome::Blocked(resp) =
-                check_exec_permission(&full_cmd, req.cwd.as_deref(), mode, git_lenient_rules(), id)
-            {
-                return resp;
-            }
+        let mode = parse_permission_mode(req.permission_mode.as_deref());
+        let full_cmd = format_full_command("git", &req.args);
+        if let PermCheckOutcome::Blocked(resp) =
+            check_exec_permission(&full_cmd, req.cwd.as_deref(), mode, git_lenient_rules(), id)
+        {
+            return resp;
+        }
+        if let PermCheckOutcome::Blocked(resp) =
+            check_exec_environment_permission(req.env.as_ref(), &full_cmd, id)
+        {
+            return resp;
         }
     }
 
@@ -2717,7 +2970,7 @@ async fn handle_exec_git_command_batch(
 
 /// 处理 exec.execCommand — 通用外部命令
 ///
-/// 当请求携带 `permission_mode` 时，执行前先做权限检查（严格模式，无隐式规则）。
+/// 执行前始终做权限检查（严格模式，无隐式规则）；省略模式时按 default。
 async fn handle_exec_command(
     params: &serde_json::Value,
     id: &serde_json::Value,
@@ -2729,13 +2982,17 @@ async fn handle_exec_command(
     };
 
     // 权限检查（严格模式：无隐式 allow 规则）
-    if let Some(mode) = parse_permission_mode(parsed.permission_mode.as_deref()) {
-        let full_cmd = format_full_command(&parsed.command, &parsed.args);
-        if let PermCheckOutcome::Blocked(resp) =
-            check_exec_permission(&full_cmd, parsed.cwd.as_deref(), mode, vec![], id)
-        {
-            return resp;
-        }
+    let mode = parse_permission_mode(parsed.permission_mode.as_deref());
+    let full_cmd = format_full_command(&parsed.command, &parsed.args);
+    if let PermCheckOutcome::Blocked(resp) =
+        check_exec_permission(&full_cmd, parsed.cwd.as_deref(), mode, vec![], id)
+    {
+        return resp;
+    }
+    if let PermCheckOutcome::Blocked(resp) =
+        check_exec_environment_permission(parsed.env.as_ref(), &full_cmd, id)
+    {
+        return resp;
     }
 
     let result = execute_and_format(
@@ -2787,10 +3044,22 @@ async fn handle_spawn_managed(
         "spawnManaged 请求（Sprint 7 阶段 0：字段已纳入观察，行为未变）"
     );
 
-    // 权限检查（严格模式）—— 只传真实命令名，不附加 shell 元信息
-    if let Some(mode) = parse_permission_mode(parsed.permission_mode.as_deref())
-        && let PermCheckOutcome::Blocked(resp) =
-            check_exec_permission(&parsed.command, parsed.cwd.as_deref(), mode, vec![], id)
+    // Resolve first so permission analysis uses the concrete shell that will
+    // actually execute the command, including platform-specific fallbacks.
+    let (exec_program, exec_args) = match resolve_shell(&parsed.shell, &parsed.command) {
+        Ok(pair) => pair,
+        Err(msg) => return jsonrpc_error(id, JSONRPC_INVALID_PARAMS, &msg),
+    };
+
+    let mode = parse_permission_mode(parsed.permission_mode.as_deref());
+    let kind = managed_shell_permission_kind(&exec_program);
+    if let PermCheckOutcome::Blocked(resp) =
+        check_managed_shell_permission(&parsed.command, parsed.cwd.as_deref(), mode, kind, id)
+    {
+        return resp;
+    }
+    if let PermCheckOutcome::Blocked(resp) =
+        check_exec_environment_permission(parsed.env.as_ref(), &parsed.command, id)
     {
         return resp;
     }
@@ -2815,11 +3084,6 @@ async fn handle_spawn_managed(
     // 被静默降级为 cmd.exe。现在按值分派真实 shell binary，查不到时按兼容策略回退
     // 历史默认，避免无 bash.exe / pwsh 的 Windows 机器突然 error（见 `resolve_shell`
     // 文档）。
-    let (exec_program, exec_args) = match resolve_shell(&parsed.shell, &parsed.command) {
-        Ok(pair) => pair,
-        Err(msg) => return jsonrpc_error(id, JSONRPC_INVALID_PARAMS, &msg),
-    };
-
     tracing::debug!(
         exec_program = %exec_program,
         shell_requested = %parsed.shell,
@@ -4599,36 +4863,30 @@ mod tests {
     // ── 权限检查测试 ────────────────────────────────────────────────
 
     #[test]
-    fn test_parse_permission_mode_none_skips_check() {
-        assert!(parse_permission_mode(None).is_none());
+    fn test_parse_permission_mode_none_defaults_safely() {
+        assert_eq!(parse_permission_mode(None), PermissionMode::Default);
     }
 
     #[test]
     fn test_parse_permission_mode_known_values() {
         assert_eq!(
             parse_permission_mode(Some("default")),
-            Some(PermissionMode::Default)
+            PermissionMode::Default
         );
         assert_eq!(
             parse_permission_mode(Some("bypassPermissions")),
-            Some(PermissionMode::BypassPermissions)
+            PermissionMode::BypassPermissions
         );
         assert_eq!(
             parse_permission_mode(Some("dontAsk")),
-            Some(PermissionMode::DontAsk)
+            PermissionMode::DontAsk
         );
-        assert_eq!(
-            parse_permission_mode(Some("plan")),
-            Some(PermissionMode::Plan)
-        );
+        assert_eq!(parse_permission_mode(Some("plan")), PermissionMode::Plan);
         assert_eq!(
             parse_permission_mode(Some("acceptEdits")),
-            Some(PermissionMode::AcceptEdits)
+            PermissionMode::AcceptEdits
         );
-        assert_eq!(
-            parse_permission_mode(Some("auto")),
-            Some(PermissionMode::Auto)
-        );
+        assert_eq!(parse_permission_mode(Some("auto")), PermissionMode::Auto);
     }
 
     #[test]
@@ -4636,7 +4894,7 @@ mod tests {
         // 未知值应降级为 Default
         assert_eq!(
             parse_permission_mode(Some("something_weird")),
-            Some(PermissionMode::Default)
+            PermissionMode::Default
         );
     }
 
@@ -4652,11 +4910,156 @@ mod tests {
     }
 
     #[test]
-    fn test_check_exec_permission_bypass_always_allows() {
+    fn test_format_full_command_preserves_literal_argv_boundaries() {
+        let args = vec![
+            "two words".to_string(),
+            "safe;".to_string(),
+            "it's".to_string(),
+            "$HOME".to_string(),
+            String::new(),
+        ];
+        assert_eq!(
+            format_full_command("echo", &args),
+            "echo 'two words' 'safe;' 'it'\\''s' '$HOME' ''"
+        );
+    }
+
+    #[test]
+    fn test_managed_shell_permission_uses_real_shell_semantics() {
+        let id = serde_json::json!("managed-shell-permission");
+
+        assert!(matches!(
+            check_managed_shell_permission(
+                "Write-Output ordinary",
+                Some("/workspace"),
+                PermissionMode::BypassPermissions,
+                ManagedShellPermissionKind::PowerShell,
+                &id,
+            ),
+            PermCheckOutcome::Allowed
+        ));
+        assert!(matches!(
+            check_managed_shell_permission(
+                r"Remove-Item -Recurse C:\custom-policy\settings.json",
+                Some(r"C:\workspace"),
+                PermissionMode::BypassPermissions,
+                ManagedShellPermissionKind::PowerShell,
+                &id,
+            ),
+            PermCheckOutcome::Blocked(_)
+        ));
+        assert!(matches!(
+            check_managed_shell_permission(
+                r"del C:\custom-policy\settings.json",
+                Some(r"C:\workspace"),
+                PermissionMode::BypassPermissions,
+                ManagedShellPermissionKind::Cmd,
+                &id,
+            ),
+            PermCheckOutcome::Blocked(_)
+        ));
+        assert!(matches!(
+            check_managed_shell_permission(
+                "echo safe & del settings.json",
+                Some(r"C:\workspace"),
+                PermissionMode::BypassPermissions,
+                ManagedShellPermissionKind::Cmd,
+                &id,
+            ),
+            PermCheckOutcome::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn test_exec_environment_permission_is_closed_and_value_constrained() {
+        let id = serde_json::json!("environment-permission");
+        let mut dangerous = HashMap::new();
+        dangerous.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+        assert!(matches!(
+            check_exec_environment_permission(Some(&dangerous), "git status", &id),
+            PermCheckOutcome::Blocked(_)
+        ));
+
+        let mut unknown = HashMap::new();
+        unknown.insert("FUTURE_RUNTIME_HOOK".to_string(), "/tmp/hook".to_string());
+        assert!(matches!(
+            check_exec_environment_permission(Some(&unknown), "echo ordinary", &id),
+            PermCheckOutcome::Blocked(_)
+        ));
+
+        let mut safe = HashMap::new();
+        safe.insert("LANG".to_string(), "en_US.UTF-8".to_string());
+        safe.insert("LC_ALL".to_string(), "C".to_string());
+        safe.insert("TERM".to_string(), "xterm-256color".to_string());
+        if let Some(path) = std::env::var_os("PATH") {
+            safe.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+        }
+        assert!(matches!(
+            check_exec_environment_permission(Some(&safe), "echo ordinary", &id),
+            PermCheckOutcome::Allowed
+        ));
+
+        safe.insert("LANG".to_string(), "../../plugin".to_string());
+        assert!(matches!(
+            check_exec_environment_permission(Some(&safe), "echo ordinary", &id),
+            PermCheckOutcome::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn test_argv_boundary_cannot_detach_dangerous_rm_path_from_audit() {
+        let id = serde_json::json!("test-argv-boundary-rm");
+        let args = vec!["-rf".to_string(), "safe;".to_string(), "/".to_string()];
+        let full_command = format_full_command("rm", &args);
+        assert_eq!(full_command, "rm -rf 'safe;' /");
+        assert!(matches!(
+            check_exec_permission(
+                &full_command,
+                Some("/workspace"),
+                PermissionMode::BypassPermissions,
+                vec![],
+                &id,
+            ),
+            PermCheckOutcome::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn test_literal_shell_metacharacter_in_safe_path_remains_one_argv_word() {
+        let id = serde_json::json!("test-argv-boundary-safe");
+        let args = vec!["build/safe;".to_string()];
+        let full_command = format_full_command("rm", &args);
+        assert!(matches!(
+            check_exec_permission(
+                &full_command,
+                Some("/workspace"),
+                PermissionMode::BypassPermissions,
+                vec![],
+                &id,
+            ),
+            PermCheckOutcome::Allowed
+        ));
+    }
+
+    #[test]
+    fn test_check_exec_permission_bypass_keeps_security_floor() {
         let id = serde_json::json!("test-1");
         let result = check_exec_permission(
             "rm -rf /",
             None,
+            PermissionMode::BypassPermissions,
+            vec![],
+            &id,
+        );
+        assert!(matches!(result, PermCheckOutcome::Blocked(_)));
+    }
+
+    #[test]
+    fn test_check_exec_permission_bypass_allows_ordinary_command() {
+        let id = serde_json::json!("test-1-safe");
+        let result = check_exec_permission(
+            "echo ordinary",
+            Some("/workspace"),
             PermissionMode::BypassPermissions,
             vec![],
             &id,
@@ -4754,9 +5157,169 @@ mod tests {
         });
         let id = serde_json::json!("perm-exec-1");
         let resp = handle_exec_command(&params, &id, &executor).await;
-        // bypassPermissions 应直接执行
+        // bypassPermissions 对通过安全下限的常规命令跳过逐次审批。
         assert!(resp.get("result").is_some(), "应有 result: {resp}");
         assert_eq!(resp["result"]["code"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_exec_command_bypass_blocks_dangerous_removal_before_spawn() {
+        let executor = Arc::new(CommandExecutor::new());
+        let params = serde_json::json!({
+            "command": "rm",
+            "args": ["-rf", "/"],
+            "permission_mode": "bypassPermissions"
+        });
+        let id = serde_json::json!("perm-exec-dangerous-rm");
+        let resp = handle_exec_command(&params, &id, &executor).await;
+        assert!(resp.get("error").is_some(), "应在 spawn 前拒绝: {resp}");
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(JSONRPC_PERMISSION_ASK as i64)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_command_argv_boundary_attack_is_blocked_before_spawn() {
+        let executor = Arc::new(CommandExecutor::new());
+        let params = serde_json::json!({
+            "command": "rm",
+            "args": ["-rf", "safe;", "/"],
+            "cwd": "/workspace",
+            "permission_mode": "bypassPermissions"
+        });
+        let id = serde_json::json!("perm-exec-argv-boundary-rm");
+        let resp = handle_exec_command(&params, &id, &executor).await;
+        assert!(resp.get("error").is_some(), "应在 spawn 前拒绝: {resp}");
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(JSONRPC_PERMISSION_ASK as i64)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exec_command_dangerous_env_is_blocked_before_spawn() {
+        let executor = Arc::new(CommandExecutor::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("must-not-exist");
+        let params = serde_json::json!({
+            "command": "touch",
+            "args": [sentinel.to_string_lossy()],
+            "cwd": tmp.path().to_string_lossy(),
+            "env": { "LD_PRELOAD": "/definitely/not/a/library.so" },
+            "permission_mode": "bypassPermissions"
+        });
+        let id = serde_json::json!("perm-exec-dangerous-env");
+        let resp = handle_exec_command(&params, &id, &executor).await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(JSONRPC_PERMISSION_ASK as i64),
+            "dangerous env must be rejected before executor spawn: {resp}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "the sentinel proves the audited command was never spawned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_managed_dangerous_env_is_blocked_before_spawn() {
+        let executor = Arc::new(CommandExecutor::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("must-not-exist");
+        let params = serde_json::json!({
+            "command": format!("touch '{}'", sentinel.display()),
+            "shell": "bash",
+            "cwd": tmp.path().to_string_lossy(),
+            "env": { "GIT_CONFIG_COUNT": "1" },
+            "permission_mode": "bypassPermissions"
+        });
+        let id = serde_json::json!("perm-spawn-dangerous-env");
+        let resp = handle_spawn_managed(&params, &id, executor, tx).await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(JSONRPC_PERMISSION_ASK as i64),
+            "dangerous env must be rejected before managed spawn: {resp}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "the sentinel proves the managed command was never spawned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exec_command_omitted_mode_cannot_bypass_pre_spawn_gate() {
+        let executor = Arc::new(CommandExecutor::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("omitted-mode-must-not-exist");
+        let params = serde_json::json!({
+            "command": "touch",
+            "args": [sentinel.to_string_lossy()],
+            "cwd": tmp.path().to_string_lossy()
+        });
+        let id = serde_json::json!("perm-exec-omitted-mode");
+        let resp = handle_exec_command(&params, &id, &executor).await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(JSONRPC_PERMISSION_ASK as i64),
+            "omitting permission_mode must retain the Default gate: {resp}"
+        );
+        assert!(!sentinel.exists(), "omitted mode must not reach spawn");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_managed_omitted_mode_cannot_bypass_pre_spawn_gate() {
+        let executor = Arc::new(CommandExecutor::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("omitted-mode-must-not-exist");
+        let params = serde_json::json!({
+            "command": format!("touch '{}'", sentinel.display()),
+            "shell": "bash",
+            "cwd": tmp.path().to_string_lossy()
+        });
+        let id = serde_json::json!("perm-spawn-omitted-mode");
+        let resp = handle_spawn_managed(&params, &id, executor, tx).await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(JSONRPC_PERMISSION_ASK as i64),
+            "omitting permission_mode must retain the managed Default gate: {resp}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "omitted mode must not reach managed spawn"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(windows, ignore = "echo executable lookup differs on Windows CI")]
+    async fn test_exec_command_safe_locale_env_still_spawns() {
+        let executor = Arc::new(CommandExecutor::new());
+        let mut env = serde_json::Map::new();
+        env.insert("LANG".to_string(), serde_json::json!("C"));
+        if let Some(path) = std::env::var_os("PATH") {
+            env.insert(
+                "PATH".to_string(),
+                serde_json::json!(path.to_string_lossy()),
+            );
+        }
+        let params = serde_json::json!({
+            "command": "echo",
+            "args": ["safe_env"],
+            "env": env,
+            "permission_mode": "bypassPermissions"
+        });
+        let id = serde_json::json!("perm-exec-safe-env");
+        let resp = handle_exec_command(&params, &id, &executor).await;
+        assert_eq!(
+            resp["result"]["code"], 0,
+            "safe env should remain usable: {resp}"
+        );
     }
 
     #[tokio::test]
@@ -4780,7 +5343,7 @@ mod tests {
         windows,
         ignore = "pre-existing Windows failure (同 test_exec_command_with_permission_bypass)"
     )]
-    async fn test_exec_command_without_permission_mode() {
+    async fn test_exec_command_without_permission_mode_allows_safe_default() {
         let executor = Arc::new(CommandExecutor::new());
         let params = serde_json::json!({
             "command": "echo",
@@ -4788,7 +5351,7 @@ mod tests {
         });
         let id = serde_json::json!("perm-exec-3");
         let resp = handle_exec_command(&params, &id, &executor).await;
-        // 无 permission_mode 应直接执行（向后兼容）
+        // Missing mode still runs the Default safety gate; readonly echo is safe.
         assert!(resp.get("result").is_some(), "应有 result: {resp}");
         assert_eq!(resp["result"]["code"], 0);
     }

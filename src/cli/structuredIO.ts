@@ -12,7 +12,10 @@ import type {
   SDKMessage,
   SDKUserMessage,
 } from 'src/entrypoints/agentSdkTypes.js'
-import { SDKControlElicitationResponseSchema } from 'src/entrypoints/sdk/controlSchemas.js'
+import {
+  SDKControlElicitationResponseSchema,
+  SDK_PERMISSION_DECISION_REASON_CODES,
+} from 'src/entrypoints/sdk/controlSchemas.js'
 import type {
   SDKControlRequest,
   SDKControlResponse,
@@ -22,6 +25,7 @@ import type {
 } from 'src/entrypoints/sdk/controlTypes.js'
 import type { CanUseToolFn } from 'src/types/canUseTool.js'
 import type { Tool, ToolUseContext } from 'src/Tool.js'
+import { ASK_USER_QUESTION_TOOL_NAME } from 'src/tools/AskUserQuestionTool/prompt.js'
 import { type HookCallback, hookJSONOutputSchema } from 'src/types/hooks.js'
 import { logForDebugging } from 'src/utils/debug.js'
 import { logForDiagnosticsNoPII } from 'src/utils/diagLogs.js'
@@ -35,7 +39,10 @@ import type {
   PermissionDecision,
   PermissionDecisionReason,
 } from 'src/utils/permissions/PermissionResult.js'
-import { hasPermissionsToUseTool } from 'src/utils/permissions/permissions.js'
+import {
+  createPermissionRequestMessage,
+  hasPermissionsToUseTool,
+} from 'src/utils/permissions/permissions.js'
 import { writeToStdout } from 'src/utils/process.js'
 import { jsonStringify } from 'src/utils/slowOperations.js'
 import { z } from 'zod/v4'
@@ -57,6 +64,12 @@ import {
   type DirectTuiRuntimeActionRoute,
 } from './directTuiRuntimeActions.js'
 import { ndjsonSafeStringify } from './ndjsonSafeStringify.js'
+import {
+  buildDirectTuiCommandCatalogChangedRequest,
+  DirectTuiCommandCatalogChangedResponseSchema,
+  type DirectTuiCommandCatalogChangedResponse,
+} from './directTuiCommandCatalogRefresh.js'
+import type { CommandCatalogEntry } from './commandCatalogProjection.js'
 
 export type StructuredIoOutboundMessage =
   | StdoutMessage
@@ -102,6 +115,84 @@ function serializeDecisionReason(
   }
 }
 
+type PermissionDecisionReasonCode =
+  (typeof SDK_PERMISSION_DECISION_REASON_CODES)[number]
+
+const PERMISSION_DECISION_REASON_CODE_BY_TYPE = {
+  rule: 'rule',
+  mode: 'mode',
+  subcommandResults: 'subcommand_results',
+  permissionPromptTool: 'permission_prompt_tool',
+  hook: 'hook',
+  asyncAgent: 'async_agent',
+  classifier: 'classifier',
+  workingDir: 'working_directory',
+  safetyCheck: 'safety_check',
+  other: 'other',
+} as const satisfies Record<
+  PermissionDecisionReason['type'],
+  PermissionDecisionReasonCode
+>
+
+export function permissionDecisionReasonCode(
+  reason: PermissionDecisionReason | undefined,
+): PermissionDecisionReasonCode | undefined {
+  return reason
+    ? PERMISSION_DECISION_REASON_CODE_BY_TYPE[reason.type]
+    : undefined
+}
+
+export function isPermissionRequestHookAllowAuthoritative(
+  toolName: string,
+): boolean {
+  return toolName !== ASK_USER_QUESTION_TOOL_NAME
+}
+
+export function buildCanUseToolControlRequest(
+  tool: Pick<Tool, 'name'>,
+  input: Record<string, unknown>,
+  permissionResult: Extract<PermissionDecision, { behavior: 'ask' }>,
+  toolUseID: string,
+  agentID?: string,
+): SDKControlPermissionRequest {
+  const explicitMessage = permissionResult.message?.trim()
+  let policyExplanation: string | undefined
+  try {
+    policyExplanation = createPermissionRequestMessage(
+      tool.name,
+      permissionResult.decisionReason,
+    )
+  } catch {
+    // Presentation formatting must never break the permission bridge. The
+    // decision's own message is already safe to use as the fallback copy.
+  }
+  const description =
+    explicitMessage &&
+    policyExplanation &&
+    explicitMessage !== policyExplanation
+      ? `${explicitMessage}\n${policyExplanation}`
+      : (explicitMessage ?? policyExplanation)
+  return {
+    subtype: 'can_use_tool',
+    tool_name: tool.name,
+    input,
+    permission_suggestions: permissionResult.suggestions,
+    blocked_path: permissionResult.blockedPath,
+    decision_reason_code: permissionDecisionReasonCode(
+      permissionResult.decisionReason,
+    ),
+    // Kept for compatibility with existing SDK hosts that consume the
+    // free-form reason. New consumers should branch on decision_reason_code.
+    decision_reason: serializeDecisionReason(permissionResult.decisionReason),
+    // Carry both the concrete tool message and the stable policy explanation
+    // when they differ. This keeps protected-path context visible without
+    // reducing the reason code to presentation copy.
+    description,
+    tool_use_id: toolUseID,
+    agent_id: agentID,
+  }
+}
+
 function buildRequiresActionDetails(
   tool: Tool,
   input: Record<string, unknown>,
@@ -139,10 +230,10 @@ type PendingRequest<T> = {
  * Provides a structured way to read and write SDK messages from stdio,
  * capturing the SDK protocol.
  */
-// Maximum number of resolved tool_use IDs to track. Once exceeded, the oldest
+// Maximum number of resolved correlations to track. Once exceeded, the oldest
 // entry is evicted. This bounds memory in very long sessions while keeping
 // enough history to catch duplicate control_response deliveries.
-const MAX_RESOLVED_TOOL_USE_IDS = 1000
+const MAX_RESOLVED_CONTROL_REQUESTS = 1000
 
 export class StructuredIO {
   readonly structuredInput: AsyncGenerator<StdinMessage | SDKMessage>
@@ -160,6 +251,7 @@ export class StructuredIO {
   // messages into mutableMessages and cause a 400 "tool_use ids must be unique"
   // error from the API.
   private readonly resolvedToolUseIds = new Set<string>()
+  private readonly resolvedControlRequestIds = new Set<string>()
   private prependedLines: string[] = []
   private onControlRequestSent?: (request: SDKControlRequest) => void
   private onControlRequestResolved?: (requestId: string) => void
@@ -177,15 +269,19 @@ export class StructuredIO {
     this.structuredInput = this.read()
   }
 
-  /**
-   * Records a tool_use ID as resolved so that late/duplicate control_response
-   * messages for the same tool are ignored by the orphan handler.
-   */
-  private trackResolvedToolUseId(request: SDKControlRequest): void {
+  /** Records both exact request and tool-use correlations for late responses. */
+  private trackResolvedControlRequest(request: SDKControlRequest): void {
+    this.resolvedControlRequestIds.add(request.request_id)
+    if (this.resolvedControlRequestIds.size > MAX_RESOLVED_CONTROL_REQUESTS) {
+      const first = this.resolvedControlRequestIds.values().next().value
+      if (first !== undefined) {
+        this.resolvedControlRequestIds.delete(first)
+      }
+    }
     const payload = request.request
     if (payload.subtype === 'can_use_tool') {
       this.resolvedToolUseIds.add(payload.tool_use_id)
-      if (this.resolvedToolUseIds.size > MAX_RESOLVED_TOOL_USE_IDS) {
+      if (this.resolvedToolUseIds.size > MAX_RESOLVED_CONTROL_REQUESTS) {
         // Evict the oldest entry (Sets iterate in insertion order)
         const first = this.resolvedToolUseIds.values().next().value
         if (first !== undefined) {
@@ -287,7 +383,7 @@ export class StructuredIO {
     if (!requestId) return
     const request = this.pendingRequests.get(requestId)
     if (!request) return
-    this.trackResolvedToolUseId(request.request)
+    this.trackResolvedControlRequest(request.request)
     this.pendingRequests.delete(requestId)
     // Cancel the SDK consumer's canUseTool callback — the bridge won.
     void this.write({
@@ -401,6 +497,14 @@ export class StructuredIO {
         }
         const request = this.pendingRequests.get(message.response.request_id)
         if (!request) {
+          if (
+            this.resolvedControlRequestIds.has(message.response.request_id)
+          ) {
+            logForDebugging(
+              `Ignoring duplicate control_response for already-resolved request_id=${message.response.request_id}`,
+            )
+            return undefined
+          }
           // Check if this tool_use was already resolved through the normal
           // permission flow. Duplicate control_response deliveries (e.g. from
           // WebSocket reconnects) arrive after the original was handled, and
@@ -425,7 +529,7 @@ export class StructuredIO {
           }
           return undefined // Ignore responses for requests we don't know about
         }
-        this.trackResolvedToolUseId(request.request)
+        this.trackResolvedControlRequest(request.request)
         this.pendingRequests.delete(message.response.request_id)
         // Notify the bridge when the SDK consumer resolves a can_use_tool
         // request, so it can cancel the stale permission prompt on acosmi.com.
@@ -433,7 +537,14 @@ export class StructuredIO {
           request.request.request.subtype === 'can_use_tool' &&
           this.onControlRequestResolved
         ) {
-          this.onControlRequestResolved(message.response.request_id)
+          try {
+            this.onControlRequestResolved(message.response.request_id)
+          } catch (error) {
+            logForDebugging(
+              `[StructuredIO] resolved-request observer failed for ${message.response.request_id}: ${error}`,
+              { level: 'warn' },
+            )
+          }
         }
 
         if (message.response.subtype === 'error') {
@@ -549,46 +660,69 @@ export class StructuredIO {
       throw new Error('Stream closed')
     }
     if (signal?.aborted) {
-      throw new Error('Request aborted')
+      throw new AbortError()
     }
-    this.outbound.enqueue(message)
-    if (
-      message.request.subtype === 'can_use_tool' &&
-      this.onControlRequestSent
-    ) {
-      this.onControlRequestSent(message)
+    if (this.pendingRequests.has(requestId)) {
+      throw new Error(`Duplicate control request ID: ${requestId}`)
     }
+
+    let requestWasQueued = false
     const aborted = () => {
-      this.outbound.enqueue({
-        type: 'control_cancel_request',
-        request_id: requestId,
-      })
       // Immediately reject the outstanding promise, without
       // waiting for the host to acknowledge the cancellation.
       const request = this.pendingRequests.get(requestId)
       if (request) {
         // Track the tool_use ID as resolved before rejecting, so that a
         // late response from the host is ignored by the orphan handler.
-        this.trackResolvedToolUseId(request.request)
+        this.trackResolvedControlRequest(request.request)
+        this.pendingRequests.delete(requestId)
+        if (requestWasQueued) {
+          this.outbound.enqueue({
+            type: 'control_cancel_request',
+            request_id: requestId,
+          })
+        }
         request.reject(new AbortError())
       }
     }
-    if (signal) {
-      signal.addEventListener('abort', aborted, {
-        once: true,
+
+    // Install correlation state before publishing the request. The direct TUI
+    // bridge is allowed to answer synchronously from onControlRequestSent; if
+    // the map were populated afterwards, that valid response would be lost.
+    const response = new Promise<Response>((resolve, reject) => {
+      this.pendingRequests.set(requestId, {
+        request: message,
+        resolve: result => {
+          resolve(result as Response)
+        },
+        reject,
+        schema,
       })
-    }
+    })
+    signal?.addEventListener('abort', aborted, { once: true })
     try {
-      const response = new Promise<Response>((resolve, reject) => {
-        this.pendingRequests.set(requestId, {
-          request: message,
-          resolve: result => {
-            resolve(result as Response)
-          },
-          reject,
-          schema,
-        })
-      })
+      // The signal may have transitioned between the initial check and
+      // listener registration. Re-check before exposing any request to a host.
+      if (signal?.aborted) {
+        aborted()
+        return await response
+      }
+
+      this.outbound.enqueue(message)
+      requestWasQueued = true
+      if (
+        message.request.subtype === 'can_use_tool' &&
+        this.onControlRequestSent
+      ) {
+        try {
+          this.onControlRequestSent(message)
+        } catch (error) {
+          logForDebugging(
+            `[StructuredIO] sent-request observer failed for ${requestId}: ${error}`,
+            { level: 'warn' },
+          )
+        }
+      }
       try {
         onQueued?.()
       } catch (error) {
@@ -645,6 +779,24 @@ export class StructuredIO {
     )
   }
 
+  /**
+   * Notify the same-generation native renderer that its discovery catalog is
+   * stale. This exact helper is deliberately process-private; standard SDK
+   * routes never call it and the request is not added to public schemas.
+   */
+  async requestDirectTuiCommandCatalogChanged(
+    commands: readonly CommandCatalogEntry[],
+  ): Promise<DirectTuiCommandCatalogChangedResponse> {
+    const request = buildDirectTuiCommandCatalogChangedRequest(commands)
+    return this.sendRequest<DirectTuiCommandCatalogChangedResponse>(
+      // The public SDK union is intentionally closed. StructuredIO's wire
+      // envelope is reused only inside the direct process pair, while the
+      // dedicated builder and response schema keep this extension closed.
+      request as unknown as SDKControlRequest['request'],
+      DirectTuiCommandCatalogChangedResponseSchema,
+    )
+  }
+
   createCanUseTool(
     onPermissionPrompt?: (details: RequiresActionDetails) => void,
   ): CanUseToolFn {
@@ -680,11 +832,28 @@ export class StructuredIO {
       // its permission dialog immediately while hooks run in the background.
       // Whichever resolves first wins; the loser is cancelled/ignored.
 
-      // AbortController used to cancel the SDK request if a hook decides first
-      const hookAbortController = new AbortController()
+      // One controller owns both sides of the race. Once either side wins,
+      // cancel the loser so a late hook cannot continue doing work after the
+      // user has already made a decision in the SDK/TUI.
+      const permissionRaceAbortController = new AbortController()
       const parentSignal = toolUseContext.abortController.signal
+      const cancelledDecision = () =>
+        permissionPromptToolResultToPermissionDecision(
+          {
+            behavior: 'deny',
+            message:
+              'Tool permission request was cancelled before a decision could be committed',
+            toolUseID,
+          },
+          tool,
+          input,
+          toolUseContext,
+        )
+      if (parentSignal.aborted) {
+        return cancelledDecision()
+      }
       // Forward parent abort to our local controller
-      const onParentAbort = () => hookAbortController.abort()
+      const onParentAbort = () => permissionRaceAbortController.abort()
       parentSignal.addEventListener('abort', onParentAbort, { once: true })
 
       try {
@@ -695,6 +864,7 @@ export class StructuredIO {
           input,
           toolUseContext,
           mainPermissionResult.suggestions,
+          permissionRaceAbortController.signal,
         ).then(decision => ({ source: 'hook' as const, decision }))
 
         // Start the SDK permission prompt immediately (don't wait for hooks)
@@ -703,20 +873,15 @@ export class StructuredIO {
           buildRequiresActionDetails(tool, input, toolUseID, requestId),
         )
         const sdkPromise = this.sendRequest<PermissionToolOutput>(
-          {
-            subtype: 'can_use_tool',
-            tool_name: tool.name,
+          buildCanUseToolControlRequest(
+            tool,
             input,
-            permission_suggestions: mainPermissionResult.suggestions,
-            blocked_path: mainPermissionResult.blockedPath,
-            decision_reason: serializeDecisionReason(
-              mainPermissionResult.decisionReason,
-            ),
-            tool_use_id: toolUseID,
-            agent_id: toolUseContext.agentId,
-          },
+            mainPermissionResult,
+            toolUseID,
+            toolUseContext.agentId,
+          ),
           permissionToolOutputSchema(),
-          hookAbortController.signal,
+          permissionRaceAbortController.signal,
           requestId,
         ).then(result => ({ source: 'sdk' as const, result }))
 
@@ -724,17 +889,26 @@ export class StructuredIO {
         // The hook promise always resolves (never rejects), returning
         // undefined if no hook made a decision.
         const winner = await Promise.race([hookPromise, sdkPromise])
+        if (parentSignal.aborted) {
+          return cancelledDecision()
+        }
 
         if (winner.source === 'hook') {
           if (winner.decision) {
             // Hook decided — abort the pending SDK request.
             // Suppress the expected AbortError rejection from sdkPromise.
             sdkPromise.catch(() => {})
-            hookAbortController.abort()
-            return winner.decision
+            permissionRaceAbortController.abort()
+            return commitWinningPermissionHookDecision(
+              winner.decision,
+              toolUseContext,
+            )
           }
           // Hook passed through (no decision) — wait for the SDK prompt
           const sdkResult = await sdkPromise
+          if (parentSignal.aborted) {
+            return cancelledDecision()
+          }
           return permissionPromptToolResultToPermissionDecision(
             sdkResult.result,
             tool,
@@ -743,8 +917,10 @@ export class StructuredIO {
           )
         }
 
-        // SDK prompt responded first — use its result (hook still running
-        // in background but its result will be ignored)
+        // SDK prompt responded first. Cancel the hook before committing the
+        // SDK result; hook-produced permission updates are intentionally
+        // side-effect free until the hook is selected as the winner.
+        permissionRaceAbortController.abort()
         return permissionPromptToolResultToPermissionDecision(
           winner.result,
           tool,
@@ -752,6 +928,9 @@ export class StructuredIO {
           toolUseContext,
         )
       } catch (error) {
+        if (parentSignal.aborted) {
+          return cancelledDecision()
+        }
         return permissionPromptToolResultToPermissionDecision(
           {
             behavior: 'deny',
@@ -763,9 +942,13 @@ export class StructuredIO {
           toolUseContext,
         )
       } finally {
+        permissionRaceAbortController.abort()
         // Only transition back to 'running' if no other permission prompts
         // are pending (concurrent tool execution can have multiple in-flight).
-        if (this.getPendingPermissionRequests().length === 0) {
+        if (
+          !parentSignal.aborted &&
+          this.getPendingPermissionRequests().length === 0
+        ) {
           notifySessionStateChanged('running')
         }
         parentSignal.removeEventListener('abort', onParentAbort)
@@ -903,7 +1086,8 @@ async function executePermissionRequestHooksForSDK(
   input: Record<string, unknown>,
   toolUseContext: ToolUseContext,
   suggestions: PermissionUpdate[] | undefined,
-): Promise<PermissionDecision | undefined> {
+  signal: AbortSignal,
+): Promise<PermissionHookEvaluation | undefined> {
   const appState = toolUseContext.getAppState()
   const permissionMode = appState.toolPermissionContext.mode
 
@@ -915,7 +1099,7 @@ async function executePermissionRequestHooksForSDK(
     toolUseContext,
     permissionMode,
     suggestions,
-    toolUseContext.abortController.signal,
+    signal,
   )
 
   for await (const hookResult of hookGenerator) {
@@ -926,47 +1110,83 @@ async function executePermissionRequestHooksForSDK(
     ) {
       const decision = hookResult.permissionRequestResult
       if (decision.behavior === 'allow') {
-        const finalInput = decision.updatedInput || input
-
-        // Apply permission updates if provided by hook ("always allow")
-        const permissionUpdates = decision.updatedPermissions ?? []
-        if (permissionUpdates.length > 0) {
-          persistPermissionUpdates(permissionUpdates)
-          const currentAppState = toolUseContext.getAppState()
-          const updatedContext = applyPermissionUpdates(
-            currentAppState.toolPermissionContext,
-            permissionUpdates,
+        // PermissionRequest hooks are policy automation, not the correlated
+        // human interaction host. They may deny an interactive question, but
+        // an allow result must not manufacture answers or suppress the prompt.
+        if (!isPermissionRequestHookAllowAuthoritative(toolName)) {
+          logForDebugging(
+            'Ignoring PermissionRequest hook allow for AskUserQuestion; a correlated host response is required',
+            { level: 'warn' },
           )
-          // Update permission context via setAppState
-          toolUseContext.setAppState(prev => {
-            if (prev.toolPermissionContext === updatedContext) return prev
-            return { ...prev, toolPermissionContext: updatedContext }
-          })
+          continue
         }
-
+        const finalInput = decision.updatedInput || input
         return {
-          behavior: 'allow',
-          updatedInput: finalInput,
-          userModified: false,
-          decisionReason: {
-            type: 'hook',
-            hookName: 'PermissionRequest',
+          decision: {
+            behavior: 'allow',
+            updatedInput: finalInput,
+            userModified: false,
+            decisionReason: {
+              type: 'hook',
+              hookName: 'PermissionRequest',
+            },
           },
+          permissionUpdates: decision.updatedPermissions ?? [],
+          interrupt: false,
         }
       } else {
         // Hook denied the permission
         return {
-          behavior: 'deny',
-          message:
-            decision.message || 'Permission denied by PermissionRequest hook',
-          decisionReason: {
-            type: 'hook',
-            hookName: 'PermissionRequest',
+          decision: {
+            behavior: 'deny',
+            message:
+              decision.message || 'Permission denied by PermissionRequest hook',
+            decisionReason: {
+              type: 'hook',
+              hookName: 'PermissionRequest',
+              reason: decision.message,
+            },
           },
+          permissionUpdates: [],
+          interrupt: decision.interrupt ?? false,
         }
       }
     }
   }
 
   return undefined
+}
+
+type PermissionHookEvaluation = {
+  decision: PermissionDecision
+  permissionUpdates: PermissionUpdate[]
+  interrupt: boolean
+}
+
+/**
+ * Commit the only local side effects produced by a PermissionRequest hook.
+ * Evaluation itself is pure so losing a race against an SDK/TUI decision can
+ * never persist an allow rule or abort the active turn after the user's choice.
+ */
+function commitWinningPermissionHookDecision(
+  evaluation: PermissionHookEvaluation,
+  toolUseContext: ToolUseContext,
+): PermissionDecision {
+  if (evaluation.permissionUpdates.length > 0) {
+    persistPermissionUpdates(evaluation.permissionUpdates)
+    toolUseContext.setAppState(prev => ({
+      ...prev,
+      toolPermissionContext: applyPermissionUpdates(
+        prev.toolPermissionContext,
+        evaluation.permissionUpdates,
+      ),
+    }))
+  }
+  if (evaluation.interrupt && evaluation.decision.behavior === 'deny') {
+    logForDebugging(
+      `PermissionRequest hook interrupted tool use: ${evaluation.decision.message}`,
+    )
+    toolUseContext.abortController.abort()
+  }
+  return evaluation.decision
 }

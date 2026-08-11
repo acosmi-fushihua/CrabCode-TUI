@@ -74,7 +74,11 @@ import {
   stripSafeHeredocSubstitutions,
 } from './bashSecurity.js'
 import { checkPermissionMode } from './modeValidation.js'
-import { checkPathConstraints } from './pathValidation.js'
+import {
+  checkBashMutationSafetyConstraints,
+  checkPathConstraints,
+  checkUnparsedBashMutationSafetyConstraints,
+} from './pathValidation.js'
 import { checkSedConstraints } from './sedValidation.js'
 import { shouldUseSandbox } from './shouldUseSandbox.js'
 
@@ -1267,6 +1271,7 @@ export async function checkCommandAndSuggestRules(
 function checkSandboxAutoAllow(
   input: z.infer<typeof BashTool.inputSchema>,
   toolPermissionContext: ToolPermissionContext,
+  astCommands?: readonly SimpleCommand[],
 ): PermissionResult {
   const command = input.command.trim()
 
@@ -1343,6 +1348,19 @@ function checkSandboxAutoAllow(
       },
     }
   }
+
+  // Sandbox auto-allow is an early return, so run the shared protected-path
+  // floor here as well. The sandbox may constrain writes, but it does not make
+  // hidden config outputs or delegated execution semantically inspectable.
+  const mutationSafetyResult = checkBashMutationSafetyConstraints(
+    input,
+    getCwd(),
+    toolPermissionContext,
+    astCommands,
+  )
+  if (mutationSafetyResult.behavior !== 'passthrough') {
+    return mutationSafetyResult
+  }
   // No explicit rules, so auto-allow with sandbox
 
   return {
@@ -1412,6 +1430,27 @@ function checkEarlyExitDeny(
 }
 
 /**
+ * Parser-degraded decisions still need the protected mutation floor. Exact
+ * deny/ask rules retain priority; an exact allow is only honored after the
+ * raw fail-closed check proves no known mutator/delegator or visible config
+ * path is being hidden by the unsupported syntax.
+ */
+function checkEarlyExitWithMutationSafety(
+  input: z.infer<typeof BashTool.inputSchema>,
+  toolPermissionContext: ToolPermissionContext,
+): PermissionResult | null {
+  const ruleResult = checkEarlyExitDeny(input, toolPermissionContext)
+  if (ruleResult && ruleResult.behavior !== 'allow') return ruleResult
+  const safetyResult = checkUnparsedBashMutationSafetyConstraints(
+    input,
+    getCwd(),
+    toolPermissionContext,
+  )
+  if (safetyResult.behavior !== 'passthrough') return safetyResult
+  return ruleResult
+}
+
+/**
  * checkSemantics-path deny enforcement. Calls checkEarlyExitDeny (exact-match
  * + full-command prefix deny), then checks each individual SimpleCommand .text
  * span against prefix deny rules. The per-subcommand check is needed because
@@ -1428,10 +1467,10 @@ function checkEarlyExitDeny(
 function checkSemanticsDeny(
   input: z.infer<typeof BashTool.inputSchema>,
   toolPermissionContext: ToolPermissionContext,
-  commands: readonly { text: string }[],
+  commands: readonly SimpleCommand[],
 ): PermissionResult | null {
   const fullCmd = checkEarlyExitDeny(input, toolPermissionContext)
-  if (fullCmd !== null) return fullCmd
+  if (fullCmd !== null && fullCmd.behavior !== 'allow') return fullCmd
   for (const cmd of commands) {
     const subDeny = matchingRulesForInput(
       { ...input, command: cmd.text },
@@ -1446,7 +1485,14 @@ function checkSemanticsDeny(
       }
     }
   }
-  return null
+  const safetyResult = checkBashMutationSafetyConstraints(
+    input,
+    getCwd(),
+    toolPermissionContext,
+    commands,
+  )
+  if (safetyResult.behavior !== 'passthrough') return safetyResult
+  return fullCmd
 }
 
 /**
@@ -1740,7 +1786,10 @@ export async function bashToolHasPermission(
     // (command substitution, expansion, control flow, parser differential).
     // Respect exact-match deny/ask/allow, then prefix/wildcard deny. Only
     // fall through to ask if no deny matched — don't downgrade deny to ask.
-    const earlyExit = checkEarlyExitDeny(input, appState.toolPermissionContext)
+    const earlyExit = checkEarlyExitWithMutationSafety(
+      input,
+      appState.toolPermissionContext,
+    )
     if (earlyExit !== null) return earlyExit
     const decisionReason: PermissionDecisionReason = {
       type: 'other' as const,
@@ -1832,6 +1881,7 @@ export async function bashToolHasPermission(
     const sandboxAutoAllowResult = checkSandboxAutoAllow(
       input,
       appState.toolPermissionContext,
+      astCommands,
     )
     if (sandboxAutoAllowResult.behavior !== 'passthrough') {
       return sandboxAutoAllowResult

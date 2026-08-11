@@ -10,6 +10,12 @@ import { execSync } from 'child_process'
 import { readFileSync, rmSync } from 'fs'
 import { join, resolve } from 'path'
 import { valid as validSemver } from 'semver'
+import {
+  bindTuiRuntimeArtifact,
+  bindTuiRuntimeBuild,
+  bindTuiRuntimeInputs,
+  createTuiRuntimeBuildConfiguration,
+} from './tui-runtime-source-binding.mjs'
 
 const pkg = JSON.parse(readFileSync(join(import.meta.dir, '..', 'package.json'), 'utf8'))
 const version: string = pkg.version ?? '0.1.0'
@@ -245,6 +251,8 @@ const define: Record<string, string> = {
 // NODE_ENV=test 会把 `=== 'test'` 分支（TestingPermissionTool 等）焊进 dist。
 const NODE_ENV_INLINE =
   process.env.CRABCODE_BUILD_MINIFY === '1' ? 'production' : 'development'
+const BUILD_PROFILE =
+  process.env.CRABCODE_RELEASE_BUILD === '1' ? 'release' : 'development'
 define['process.env.NODE_ENV'] = JSON.stringify(NODE_ENV_INLINE)
 
 // The dedicated TUI package must own every reachable JavaScript dependency.
@@ -302,16 +310,45 @@ if (!tuiRuntimeResult.success) {
   process.exit(1)
 }
 
+const sourceBinding = bindTuiRuntimeInputs(
+  projectRoot,
+  Object.keys(tuiRuntimeResult.metafile.inputs),
+)
+const artifactBinding = bindTuiRuntimeArtifact(
+  resolve(projectRoot, 'dist/tui-runtime/index.js'),
+)
+const runtimeBuildIdentity = {
+  entryPoint: 'src/entrypoints/tuiRuntime.ts',
+  output: 'dist/tui-runtime/index.js',
+  version,
+  buildId,
+}
+const buildConfiguration = createTuiRuntimeBuildConfiguration({
+  profile: BUILD_PROFILE,
+  minify,
+  nodeEnv: NODE_ENV_INLINE,
+  accountBridgeConfiguration: {
+    controlPlaneEndpoint,
+    eligibilityPublicKeyBase64url: eligibilityTrustRoot,
+    connectorPolicyPublicKeyBase64url: connectorPolicyTrustRoot,
+    artifactPublicKeyBase64url: artifactTrustRoot,
+  },
+})
+const boundBuild = {
+  schemaVersion: 3,
+  ...runtimeBuildIdentity,
+  imageProcessorNapi: false,
+  buildConfiguration,
+  sourceBinding,
+  artifactBinding,
+}
+const crabcodeTuiBuild = {
+  ...boundBuild,
+  buildBinding: bindTuiRuntimeBuild(boundBuild),
+}
 const boundTuiRuntimeMetafile = {
   ...tuiRuntimeResult.metafile,
-  crabcodeTuiBuild: {
-    schemaVersion: 1,
-    entryPoint: 'src/entrypoints/tuiRuntime.ts',
-    output: 'dist/tui-runtime/index.js',
-    version,
-    buildId,
-    imageProcessorNapi: false,
-  },
+  crabcodeTuiBuild,
 }
 await Bun.write(
   'dist/tui-runtime/metafile.json',

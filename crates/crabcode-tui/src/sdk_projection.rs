@@ -713,6 +713,10 @@ pub enum DirectProgressPresentation {
         in_progress_count: usize,
         resolved_count: usize,
     },
+    Compact {
+        phase: DirectCompactProgressPhase,
+        hook_type: Option<DirectCompactHookType>,
+    },
     Workflow {
         /// Stable workflow-task identity. Unlike `toolUseID`, this remains
         /// constant across every progress emission for one workflow run.
@@ -726,6 +730,19 @@ pub enum DirectProgressPresentation {
         phases: Vec<DirectWorkflowPhase>,
         status: DirectWorkflowStatus,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectCompactProgressPhase {
+    HooksStart,
+    CompactStart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectCompactHookType {
+    PreCompact,
+    PostCompact,
+    SessionStart,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3067,6 +3084,7 @@ impl Projection {
                         "bypassPermissions",
                         "plan",
                         "dontAsk",
+                        "auto",
                     ],
                     "system:init",
                     envelope,
@@ -3122,6 +3140,7 @@ impl Projection {
                         "bypassPermissions",
                         "plan",
                         "dontAsk",
+                        "auto",
                     ],
                     "status",
                     envelope,
@@ -4402,6 +4421,7 @@ impl Projection {
             }
             "waiting_for_task" => self.project_direct_waiting_progress(envelope),
             "hook_progress" => self.project_direct_hook_progress(envelope, &identity),
+            "compact_progress" => self.project_direct_compact_progress(envelope),
             "workflow_progress" => self.project_direct_workflow_progress(envelope),
             // The source documents this as an ant-only placeholder and does
             // not define a renderable payload. Preserve the exact envelope in
@@ -4430,6 +4450,116 @@ impl Projection {
             }
         }
         self.direct_progress_identities.push(identity);
+        Ok(())
+    }
+
+    fn project_direct_compact_progress(&mut self, envelope: &RawEnvelope) -> Result<(), String> {
+        let value = &envelope.value;
+        let parent_tool_use_id = required_string_at(
+            value,
+            &["parentToolUseID"],
+            "direct compact progress",
+            envelope,
+        )?;
+        let data = required_object_at(value, &["data"], "direct compact progress", envelope)?;
+        let phase = required_string_at(
+            value,
+            &["data", "phase"],
+            "direct compact progress",
+            envelope,
+        )?;
+
+        let key = format!("direct-compact-progress:{parent_tool_use_id}");
+        let (phase, hook_type, text) = match phase.as_str() {
+            "hooks_start" => {
+                if data.len() != 3
+                    || !data.contains_key("type")
+                    || !data.contains_key("phase")
+                    || !data.contains_key("hookType")
+                {
+                    return Err(format!(
+                        "direct compact progress hooks_start data must contain exactly type, phase, and hookType at sequence {}",
+                        envelope.sequence
+                    ));
+                }
+                let hook_type = required_string_at(
+                    value,
+                    &["data", "hookType"],
+                    "direct compact progress",
+                    envelope,
+                )?;
+                let (hook_type, text) = match hook_type.as_str() {
+                    "pre_compact" => (
+                        DirectCompactHookType::PreCompact,
+                        "Running pre-compaction hooks…",
+                    ),
+                    "post_compact" => (
+                        DirectCompactHookType::PostCompact,
+                        "Running post-compaction hooks…",
+                    ),
+                    "session_start" => (
+                        DirectCompactHookType::SessionStart,
+                        "Running session-start hooks…",
+                    ),
+                    unknown => {
+                        return Err(format!(
+                            "direct compact progress has unknown hookType `{unknown}` at sequence {}",
+                            envelope.sequence
+                        ));
+                    }
+                };
+                (
+                    DirectCompactProgressPhase::HooksStart,
+                    Some(hook_type),
+                    text,
+                )
+            }
+            "compact_start" | "compact_end" => {
+                if data.len() != 2 || !data.contains_key("type") || !data.contains_key("phase") {
+                    return Err(format!(
+                        "direct compact progress {phase} data must contain exactly type and phase at sequence {}",
+                        envelope.sequence
+                    ));
+                }
+                if phase == "compact_start" {
+                    (
+                        DirectCompactProgressPhase::CompactStart,
+                        None,
+                        "Summarizing conversation…",
+                    )
+                } else {
+                    // `compact_end` is emitted from a `finally` block. It says
+                    // only that the transient lifecycle is over; success,
+                    // failure, and cancellation are reported by later
+                    // boundary/stdout and stderr/result envelopes. Keeping a
+                    // completed green row here would therefore turn every
+                    // failed compaction into a visual success. Remove the
+                    // running row instead and retain the raw identity below.
+                    self.remove_item(&key, envelope.sequence);
+                    return Ok(());
+                }
+            }
+            unknown => {
+                return Err(format!(
+                    "direct compact progress has unknown phase `{unknown}` at sequence {}",
+                    envelope.sequence
+                ));
+            }
+        };
+
+        let presentation = ProjectedPresentation {
+            direct_progress: Some(DirectProgressPresentation::Compact { phase, hook_type }),
+            ..ProjectedPresentation::default()
+        };
+        self.upsert_stream_item_with_presentation(
+            key,
+            ProjectedKind::Progress,
+            "Compact",
+            text.to_string(),
+            envelope.sequence,
+            Some(parent_tool_use_id),
+            presentation,
+        );
         Ok(())
     }
 
@@ -11990,6 +12120,129 @@ mod tests {
     }
 
     #[test]
+    fn compact_progress_upserts_one_typed_row_and_compact_end_removes_it() {
+        let mut projection = Projection::default();
+        let phases = [
+            (
+                json!({"type":"compact_progress","phase":"hooks_start","hookType":"pre_compact"}),
+                DirectCompactProgressPhase::HooksStart,
+                Some(DirectCompactHookType::PreCompact),
+                "Running pre-compaction hooks…",
+            ),
+            (
+                json!({"type":"compact_progress","phase":"compact_start"}),
+                DirectCompactProgressPhase::CompactStart,
+                None,
+                "Summarizing conversation…",
+            ),
+            (
+                json!({"type":"compact_progress","phase":"hooks_start","hookType":"session_start"}),
+                DirectCompactProgressPhase::HooksStart,
+                Some(DirectCompactHookType::SessionStart),
+                "Running session-start hooks…",
+            ),
+            (
+                json!({"type":"compact_progress","phase":"hooks_start","hookType":"post_compact"}),
+                DirectCompactProgressPhase::HooksStart,
+                Some(DirectCompactHookType::PostCompact),
+                "Running post-compaction hooks…",
+            ),
+        ];
+
+        for (sequence, (data, phase, hook_type, text)) in phases.into_iter().enumerate() {
+            assert_eq!(
+                projection.ingest(raw(
+                    sequence as u64,
+                    json!({
+                        "type":"progress",
+                        "data":data,
+                        "toolUseID":"compact-progress-1",
+                        "parentToolUseID":"compact-progress-1",
+                        "uuid":format!("compact-progress-{sequence}"),
+                        "timestamp":"2026-08-10T00:00:00.000Z"
+                    })
+                )),
+                ProjectionEffect::None
+            );
+            assert_eq!(projection.items().len(), 1);
+            let item = &projection.items()[0];
+            assert_eq!(item.kind, ProjectedKind::Progress);
+            assert_eq!(item.tool_use_id.as_deref(), Some("compact-progress-1"));
+            assert_eq!(item.text, text);
+            assert!(item.streaming);
+            assert_eq!(
+                item.presentation.direct_progress.as_ref(),
+                Some(&DirectProgressPresentation::Compact { phase, hook_type })
+            );
+            assert_eq!(item.raw_sequences.len(), sequence + 1);
+        }
+
+        assert_eq!(
+            projection.ingest(raw(
+                4,
+                json!({
+                    "type":"progress",
+                    "data":{"type":"compact_progress","phase":"compact_end"},
+                    "toolUseID":"compact-progress-1",
+                    "parentToolUseID":"compact-progress-1",
+                    "uuid":"compact-progress-4",
+                    "timestamp":"2026-08-10T00:00:00.000Z"
+                })
+            )),
+            ProjectionEffect::None
+        );
+        assert!(
+            projection.items().is_empty(),
+            "finally-only compact_end must remove the running row instead of rendering success"
+        );
+        assert!(projection.item_removals().iter().any(|removal| {
+            removal.key == "direct-compact-progress:compact-progress-1" && removal.raw_sequence == 4
+        }));
+
+        assert_eq!(projection.direct_progress_identities().len(), 5);
+        assert!(
+            projection
+                .direct_progress_identities()
+                .iter()
+                .all(|identity| {
+                    identity.progress_type == "compact_progress"
+                        && identity.parent_tool_use_id == "compact-progress-1"
+                        && identity.tool_use_id == "compact-progress-1"
+                })
+        );
+    }
+
+    #[test]
+    fn compact_progress_projection_rejects_phase_hook_mismatch_if_classification_is_bypassed() {
+        let value = json!({
+            "type":"progress",
+            "data":{
+                "type":"compact_progress",
+                "phase":"compact_start",
+                "hookType":"pre_compact"
+            },
+            "toolUseID":"compact-progress-1",
+            "parentToolUseID":"compact-progress-1",
+            "uuid":"compact-progress-malformed",
+            "timestamp":"2026-08-10T00:00:00.000Z"
+        });
+        let effect = Projection::default().ingest(RawEnvelope {
+            sequence: 0,
+            encoded_len: serde_json::to_vec(&value).expect("encode").len(),
+            value,
+            classification: EnvelopeClass::DirectProgress {
+                progress_type: "compact_progress".to_string(),
+            },
+            correlation: None,
+        });
+        assert!(matches!(
+            effect,
+            ProjectionEffect::FailClosed { ref reason, .. }
+                if reason.contains("must contain exactly type and phase")
+        ));
+    }
+
+    #[test]
     fn fixed_direct_mcp_search_and_waiting_progress_upsert_source_state() {
         let mut mcp = Projection::default();
         for (sequence, data) in [
@@ -12996,6 +13249,60 @@ mod tests {
         assert!(projection.items().is_empty());
         assert_eq!(projection.raw_envelopes()[0].value, init);
         assert_eq!(projection.raw_envelopes()[1].value, result);
+    }
+
+    #[test]
+    fn auto_permission_mode_is_accepted_on_init_and_status_updates() {
+        let init = |permission_mode: &str, session_id: &str| {
+            json!({
+                "type":"system",
+                "subtype":"init",
+                "apiKeySource":"none",
+                "crab_code_version":"1.0.0",
+                "cwd":"/workspace",
+                "tools":[],
+                "mcp_servers":[],
+                "model":"model-from-backend",
+                "permissionMode":permission_mode,
+                "slash_commands":[],
+                "output_style":"default",
+                "skills":[],
+                "plugins":[],
+                "session_id":session_id,
+                "uuid":format!("init-{session_id}")
+            })
+        };
+
+        let mut init_projection = Projection::default();
+        assert!(matches!(
+            init_projection.ingest(raw(0, init("auto", "auto-init"))),
+            ProjectionEffect::Initialized {
+                permission_mode: Some(ref mode),
+                ..
+            } if mode == "auto"
+        ));
+        assert_eq!(init_projection.permission_mode(), Some("auto"));
+
+        let mut status_projection = Projection::default();
+        assert!(matches!(
+            status_projection.ingest(raw(0, init("default", "auto-status"))),
+            ProjectionEffect::Initialized { .. }
+        ));
+        assert_eq!(
+            status_projection.ingest(raw(
+                1,
+                json!({
+                    "type":"system",
+                    "subtype":"status",
+                    "status":null,
+                    "permissionMode":"auto",
+                    "session_id":"auto-status",
+                    "uuid":"status-auto"
+                })
+            )),
+            ProjectionEffect::None
+        );
+        assert_eq!(status_projection.permission_mode(), Some("auto"));
     }
 
     #[test]

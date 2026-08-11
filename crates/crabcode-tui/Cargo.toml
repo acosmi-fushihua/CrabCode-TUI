@@ -86,6 +86,7 @@ arboard = { workspace = true }
 [dev-dependencies]
 crabcode-pager-render = { path = "../crabcode-pager-render", features = ["test-support"] }
 portable-pty = { workspace = true }
+serial_test = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]

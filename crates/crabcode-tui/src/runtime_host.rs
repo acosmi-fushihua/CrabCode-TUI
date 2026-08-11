@@ -36,6 +36,7 @@ const RUNTIME_BUNDLE_DIR: &str = "tui-runtime";
 const RUNTIME_ENTRY_FILE: &str = "index.js";
 pub const INITIALIZE_REQUEST_ID: &str = "crabcode-tui-initialize";
 const CRABCODE_TUI_SETUP_SUBTYPE: &str = "crabcode_tui_setup";
+const CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE: &str = "crabcode_tui_command_catalog_changed";
 
 #[derive(Debug, Error)]
 pub enum HostStartError {
@@ -213,9 +214,9 @@ impl RuntimeHost {
         subtype: &str,
         response: Value,
     ) -> Result<OutboundDeliveryId, OutboundSubmitError> {
-        if subtype != CRABCODE_TUI_SETUP_SUBTYPE {
+        if !native_interaction_response_supported(subtype) {
             return Err(SendError::InvalidEnvelope(format!(
-                "unsupported native TUI startup interaction subtype `{subtype}`"
+                "unsupported native TUI interaction subtype `{subtype}`"
             ))
             .into());
         }
@@ -240,6 +241,13 @@ impl RuntimeHost {
         let sequence = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         format!("crabcode-tui-{sequence}")
     }
+}
+
+fn native_interaction_response_supported(subtype: &str) -> bool {
+    matches!(
+        subtype,
+        CRABCODE_TUI_SETUP_SUBTYPE | CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE
+    )
 }
 
 fn direct_runtime_environment(
@@ -271,7 +279,11 @@ fn initialize_request_payload() -> Value {
     json!({
         "subtype": "initialize",
         "promptSuggestions": true,
-        "agentProgressSummaries": true
+        "agentProgressSummaries": true,
+        "askUserQuestion": {
+            "version": 2,
+            "previewFormats": ["markdown"]
+        }
     })
 }
 
@@ -433,9 +445,27 @@ mod tests {
             json!({
                 "subtype": "initialize",
                 "promptSuggestions": true,
-                "agentProgressSummaries": true
+                "agentProgressSummaries": true,
+                "askUserQuestion": {
+                    "version": 2,
+                    "previewFormats": ["markdown"]
+                }
             })
         );
+    }
+
+    #[test]
+    fn native_response_lane_is_closed_to_setup_and_catalog_refresh() {
+        assert!(native_interaction_response_supported(
+            CRABCODE_TUI_SETUP_SUBTYPE
+        ));
+        assert!(native_interaction_response_supported(
+            CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE
+        ));
+        assert!(!native_interaction_response_supported("can_use_tool"));
+        assert!(!native_interaction_response_supported(
+            "future_private_control"
+        ));
     }
 
     #[test]

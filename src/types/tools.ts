@@ -20,6 +20,7 @@
 
 import type { AgentId } from './ids.js'
 import type { NormalizedMessage } from './message.js'
+import type { CompactProgressEvent } from './toolContracts.js'
 
 // ---------------------------------------------------------------------------
 // Shell-family progress (Bash & PowerShell)
@@ -70,6 +71,29 @@ export type PowerShellProgress = {
  * Also forwarded by AgentTool to parent when sub-agent runs shell commands.
  */
 export type ShellProgress = BashProgress | PowerShellProgress
+
+// ---------------------------------------------------------------------------
+// Conversation compaction progress
+// ---------------------------------------------------------------------------
+
+/**
+ * Renderer-facing projection of the in-process compaction lifecycle callback.
+ * The synthetic progress message that carries this data is ephemeral: it is
+ * delivered to direct renderers but is never appended to conversation history.
+ */
+export type CompactProgress =
+  | {
+      type: 'compact_progress'
+      phase: 'hooks_start'
+      hookType: Extract<
+        CompactProgressEvent,
+        { type: 'hooks_start' }
+      >['hookType']
+    }
+  | {
+      type: 'compact_progress'
+      phase: Exclude<CompactProgressEvent['type'], 'hooks_start'>
+    }
 
 // ---------------------------------------------------------------------------
 // Agent / Skill progress
@@ -222,6 +246,7 @@ export type WorkflowToolProgress = {
 export type ToolProgressData =
   | BashProgress
   | PowerShellProgress
+  | CompactProgress
   | AgentToolProgress
   | SkillToolProgress
   | MCPProgress

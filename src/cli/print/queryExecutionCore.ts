@@ -22,6 +22,10 @@ import {
   installHeadlessCommandSurface,
 } from 'src/cli/headlessCommands.js'
 import { projectCommandCatalogEntries } from 'src/cli/commandCatalogProjection.js'
+import {
+  DirectTuiCommandCatalogLifecycle,
+  DirectTuiCommandCatalogPublisher,
+} from 'src/cli/directTuiCommandCatalogRefresh.js'
 import { createStreamlinedTransformer } from 'src/utils/streamlinedTransform.js'
 import {
   shouldRegisterSdkHookEventHandler,
@@ -175,6 +179,7 @@ import {
 } from './pluginMcpStatusProjection.js'
 import { isPolicyAllowed } from 'src/services/policyLimits/index.js'
 import type { CanUseToolFn } from 'src/types/canUseTool.js'
+import { withDirectTuiPermissionBridge } from '../directTuiPermissionBridge.js'
 import { hasPermissionsToUseTool } from 'src/utils/permissions/permissions.js'
 import { safeParseJSON } from 'src/utils/json.js'
 import {
@@ -223,14 +228,12 @@ import {
 } from 'src/services/PromptSuggestion/promptSuggestion.js'
 import { drainPendingExtraction } from 'src/services/memoryRunners/extract/drain.js'
 import { getLastCacheSafeParams } from 'src/utils/forkedAgent.js'
-import { getAccountInformation } from 'src/utils/auth.js'
 import {
   getAuthStatus,
   loginStream,
   resolveOAuthCompletionScopes,
 } from 'src/services/acosmi/client.js'
 import { installOAuthTokens } from 'src/services/auth/installOAuthTokens.js'
-import { getAPIProvider } from 'src/utils/model/providers.js'
 import type { HookCallbackMatcher } from 'src/types/hooks.js'
 import { AwsAuthStatusManager } from 'src/utils/awsAuthStatusManager.js'
 import type { HookEvent } from 'src/entrypoints/agentSdkTypes.js'
@@ -307,7 +310,7 @@ import {
   createModelSwitchBreadcrumbs,
   createUserMessage,
 } from 'src/utils/messages.js'
-import { collectContextData } from 'src/commands/context/context-noninteractive.js'
+import { handleGetContextUsageControlRequest } from 'src/commands/context/context-noninteractive.js'
 import { LOCAL_COMMAND_STDOUT_TAG } from 'src/constants/xml.js'
 import {
   statusListeners,
@@ -424,8 +427,11 @@ import {
   routeDirectTeamInboxMessages,
 } from './directTeamInboxRouter.js'
 import {
+  conservativeControlAuthCatalog,
+  handleDirectTuiLogoutRequest,
   handleInitializeRequest,
   handleRewindFiles,
+  refreshControlAuthCatalog,
   handleSetPermissionMode,
   handleChannelEnable,
   reregisterChannelHandlerAfterReconnect,
@@ -602,7 +608,7 @@ export async function runHeadlessDirectTui(
   if (exitAfterFirstRenderIfRequested()) return
   installDirectTuiCommandSurface()
   const options = {
-    ...args[7],
+    ...withDirectTuiPermissionBridge(args[7]),
     sessionTitleGenerator: generateSessionTitleDirect,
   }
   const directArgs = [...args.slice(0, 7), options] as RunHeadlessArguments
@@ -2044,6 +2050,8 @@ function runHeadlessStreaming(
       pluginInstallPromise = installPluginsAndApplyMcpInBackground()
     } else {
       void installPluginsAndApplyMcpInBackground()
+        .then(() => refreshPluginState())
+        .catch(error => logError(error))
     }
   }
 
@@ -2053,6 +2061,32 @@ function runHeadlessStreaming(
   // Mutable commands and agents for hot reloading
   let currentCommands = commands
   let currentAgents = agents
+  const commandCatalogPublisher = routePolicy.directQueryEventDelivery
+    ? new DirectTuiCommandCatalogPublisher(
+        catalog =>
+          structuredIO.requestDirectTuiCommandCatalogChanged(catalog),
+        error => {
+          if (!inputClosed) {
+            logForDebugging(
+              `Direct TUI command catalog refresh was not acknowledged: ${errorMessage(error)}`,
+              { level: 'warn' },
+            )
+          }
+        },
+      )
+    : null
+  const commandCatalogLifecycle = new DirectTuiCommandCatalogLifecycle(
+    currentCommands,
+    refreshedCommands => {
+      currentCommands = [...refreshedCommands]
+      commandCatalogPublisher?.update(
+        projectCommandCatalogEntries(
+          currentCommands,
+          formatHeadlessCommandDescription,
+        ),
+      )
+    },
+  )
 
   // Clear all plugin-related caches, reload commands/agents/hooks.
   // Called after CRABCODE_SYNC_PLUGIN_INSTALL completes (before first query)
@@ -2071,7 +2105,9 @@ function runHeadlessStreaming(
     // Headless-specific: currentCommands/currentAgents are local mutable refs
     // captured by the query loop (REPL uses AppState instead). getCommands is
     // fresh because refreshActivePlugins cleared its cache.
-    currentCommands = await routePolicy.commandLoader(cwd())
+    await commandCatalogLifecycle.refresh(() =>
+      routePolicy.commandLoader(cwd()),
+    )
 
     // Preserve SDK-provided agents (--agents CLI flag or SDK initialize
     // control_request) — both inject via parseAgentsFromJson with
@@ -2126,9 +2162,9 @@ function runHeadlessStreaming(
 
   // Subscribe to skill changes for hot reloading
   const unsubscribeSkillChanges = skillChangeDetector.subscribe(() => {
-    void routePolicy.commandLoader(cwd()).then(newCommands => {
-      currentCommands = newCommands
-    })
+    void commandCatalogLifecycle
+      .refresh(() => routePolicy.commandLoader(cwd()))
+      .catch(error => logError(error))
   })
 
   // Proactive mode: schedule a tick to keep the model looping autonomously.
@@ -2342,14 +2378,17 @@ function runHeadlessStreaming(
     // If CRABCODE_SYNC_PLUGIN_INSTALL_TIMEOUT_MS is set, races against that
     // deadline and proceeds without plugins on timeout (logging an error).
     if (pluginInstallPromise) {
+      const installation = pluginInstallPromise
+      let completedBeforeDeadline = true
       const timeoutMs = parseInt(
         process.env.CRABCODE_SYNC_PLUGIN_INSTALL_TIMEOUT_MS || '',
         10,
       )
       if (timeoutMs > 0) {
         const timeout = sleep(timeoutMs).then(() => 'timeout' as const)
-        const result = await Promise.race([pluginInstallPromise, timeout])
+        const result = await Promise.race([installation, timeout])
         if (result === 'timeout') {
+          completedBeforeDeadline = false
           logError(
             new Error(
               `CRABCODE_SYNC_PLUGIN_INSTALL: plugin installation timed out after ${timeoutMs}ms`,
@@ -2358,14 +2397,25 @@ function runHeadlessStreaming(
           logEvent('tengu_sync_plugin_install_timeout', {
             timeout_ms: timeoutMs,
           })
+          // Timeout relaxes first-turn availability; it must not make the
+          // eventual installation invisible for the rest of this process.
+          // Reconcile once the original install settles, unless the input
+          // lifecycle has already closed.
+          void installation
+            .then(() => (inputClosed ? undefined : refreshPluginState()))
+            .catch(error => logError(error))
         }
       } else {
-        await pluginInstallPromise
+        await installation
       }
       pluginInstallPromise = null
 
-      // Refresh commands, agents, and hooks now that plugins are installed
-      await refreshPluginState()
+      // Refresh commands, agents, and hooks only after installation. On a
+      // timeout the continuation above owns this refresh, avoiding a cache
+      // sweep racing the still-running installer.
+      if (completedBeforeDeadline) {
+        await refreshPluginState()
+      }
 
       // Set up hot-reload for plugin hooks now that the initial install is done.
       // In sync-install mode, setup.ts skips this to avoid racing with the install.
@@ -3152,6 +3202,8 @@ function runHeadlessStreaming(
         suggestionState.abortController?.abort()
         suggestionState.abortController = null
         await finalizePendingAsyncHooks()
+        commandCatalogLifecycle.close()
+        commandCatalogPublisher?.close()
         unsubscribeSkillChanges()
         unsubscribeAuthStatus?.()
         statusListeners.delete(rateLimitListener)
@@ -3326,6 +3378,7 @@ function runHeadlessStreaming(
   // await its result.
   let crabCodeOAuth: {
     flow: Promise<void>
+    credentialsCommitted: () => boolean
   } | null = null
 
   // This is essentially spawning a parallel async task- we have two
@@ -3407,12 +3460,12 @@ function runHeadlessStreaming(
             message.request_id,
             runtimeInitialized,
             output,
-            commands,
+            currentCommands,
             modelInfos,
             structuredIO,
             !!options.enableAuthStatus,
             options,
-            agents,
+            currentAgents,
             getAppState,
           )
 
@@ -3434,6 +3487,7 @@ function runHeadlessStreaming(
           }
 
           runtimeInitialized = true
+          commandCatalogPublisher?.markInitialized()
           taskListWatcher?.notifyIdle()
           // The initialize response is the runtime-ready boundary. Every
           // renderer-only setup authority completed before this request was
@@ -3475,28 +3529,38 @@ function runHeadlessStreaming(
             }
           }
           sendControlResponseSuccess(message)
+        } else if (req.subtype === 'crabcode_tui_logout') {
+          await handleDirectTuiLogoutRequest(
+            message.request_id,
+            output,
+            routePolicy.commandLoader,
+            cwd(),
+            routePolicy.interactiveProductSession,
+            undefined,
+            refreshedCommands => {
+              if (!commandCatalogLifecycle.replace(refreshedCommands)) {
+                throw new Error(
+                  'direct TUI command catalog lifecycle rejected the signed-out snapshot',
+                )
+              }
+            },
+          )
         } else if (message.request.subtype === 'mcp_status') {
           sendControlResponseSuccess(message, {
             mcpServers: await buildMcpServerStatuses(),
           })
         } else if (message.request.subtype === 'get_context_usage') {
-          try {
-            const appState = getAppState()
-            const data = await collectContextData({
+          output.enqueue(
+            await handleGetContextUsageControlRequest({
+              message,
               messages: mutableMessages,
               getAppState,
-              options: {
-                mainLoopModel: getMainLoopModel(),
-                tools: buildAllTools(appState),
-                agentDefinitions: appState.agentDefinitions,
-                customSystemPrompt: options.systemPrompt,
-                appendSystemPrompt: options.appendSystemPrompt,
-              },
-            })
-            sendControlResponseSuccess(message, { ...data })
-          } catch (error) {
-            sendControlResponseError(message, errorMessage(error))
-          }
+              getMainLoopModel,
+              buildTools: buildAllTools,
+              customSystemPrompt: options.systemPrompt,
+              appendSystemPrompt: options.appendSystemPrompt,
+            }),
+          )
         } else if (message.request.subtype === 'mcp_message') {
           // Handle MCP notifications from SDK servers
           const mcpRequest = message.request
@@ -3611,13 +3675,13 @@ function runHeadlessStreaming(
             // allSettled so one failure doesn't discard the others.
             let plugins: SDKControlReloadPluginsResponse['plugins'] = []
             const [cmdsR, mcpR, pluginsR] = await Promise.allSettled([
-              routePolicy.commandLoader(cwd()),
+              commandCatalogLifecycle.refresh(() =>
+                routePolicy.commandLoader(cwd()),
+              ),
               applyPluginMcpDiff(),
               loadAllPluginsCacheOnly(),
             ])
-            if (cmdsR.status === 'fulfilled') {
-              currentCommands = cmdsR.value
-            } else {
+            if (cmdsR.status === 'rejected') {
               logError(cmdsR.reason)
             }
             if (mcpR.status === 'rejected') {
@@ -4184,7 +4248,10 @@ function runHeadlessStreaming(
           const scopes =
             (loginWithAcosmi ?? true) ? ['ai', 'skills', 'account'] : ['ai']
 
-          // Start the SDK streaming flow in background
+          // Start the SDK streaming flow in background. Resolution alone is
+          // not a commit signal: a provider may end the stream without a
+          // complete event, so keep the installed-token boundary explicit.
+          let credentialsCommitted = false
           const flow = (async () => {
             for await (const event of loginStream(scopes, {
               skipBrowser: true,
@@ -4228,6 +4295,7 @@ function runHeadlessStreaming(
                 if (!storageResult.success && !storageResult.committed) {
                   throw new Error(t('native_tui_auth_persistence_failed'))
                 }
+                credentialsCommitted = true
                 logEvent('tengu_oauth_success', {
                   loginWithAcosmi: loginWithAcosmi ?? true,
                 })
@@ -4241,7 +4309,10 @@ function runHeadlessStreaming(
             }
           })()
 
-          crabCodeOAuth = { flow }
+          crabCodeOAuth = {
+            flow,
+            credentialsCommitted: () => credentialsCommitted,
+          }
 
           void flow.catch(err =>
             logForDebugging(`crabcode_authenticate flow ended: ${err}`, {
@@ -4261,24 +4332,58 @@ function runHeadlessStreaming(
             // SDK handles the callback via its own localhost server.
             // crabcode_oauth_callback is now a no-op (manual code entry removed).
             // crabcode_oauth_wait_for_completion awaits the flow promise.
-            const { flow } = crabCodeOAuth
-            void flow.then(
-              () => {
-                const accountInfo = getAccountInformation()
-                sendControlResponseSuccess(message, {
-                  account: {
-                    email: accountInfo?.email,
-                    organization: accountInfo?.organization,
-                    subscriptionType: accountInfo?.subscription,
-                    tokenSource: accountInfo?.tokenSource,
-                    apiKeySource: accountInfo?.apiKeySource,
-                    apiProvider: getAPIProvider(),
-                  },
-                })
-              },
-              (error: unknown) =>
-                sendControlResponseError(message, errorMessage(error)),
-            )
+            const { flow, credentialsCommitted } = crabCodeOAuth
+            void (async () => {
+              try {
+                await flow
+              } catch (error) {
+                sendControlResponseError(message, errorMessage(error))
+                return
+              }
+              if (!credentialsCommitted()) {
+                sendControlResponseError(
+                  message,
+                  t('native_tui_auth_persistence_failed'),
+                )
+                return
+              }
+
+              // Token installation is now committed. Discovery and account
+              // projection failures must degrade to a closed empty snapshot,
+              // not report a false login failure while leaving stale UI and
+              // TypeScript command state behind.
+              let refreshed
+              try {
+                refreshed = await refreshControlAuthCatalog(
+                  routePolicy.commandLoader,
+                  cwd(),
+                )
+              } catch (error) {
+                refreshed = conservativeControlAuthCatalog()
+                logForDebugging(
+                  `[direct-tui] login credentials were committed but the auth/catalog refresh degraded safely: ${errorMessage(error)}`,
+                  { level: 'warn' },
+                )
+              }
+              if (!commandCatalogLifecycle.replace(refreshed.commands)) {
+                logForDebugging(
+                  '[direct-tui] login credentials were committed after the command catalog lifecycle closed; refusing a stale completion acknowledgement',
+                  { level: 'warn' },
+                )
+                return
+              }
+              try {
+                sendControlResponseSuccess(
+                  message,
+                  refreshed.response,
+                )
+              } catch (error) {
+                logForDebugging(
+                  `[direct-tui] login credentials were committed but the completion response could not be queued: ${errorMessage(error)}`,
+                  { level: 'warn' },
+                )
+              }
+            })()
           }
         } else if (req.subtype === 'mcp_clear_auth') {
           const { serverName } = req
@@ -4566,6 +4671,7 @@ function runHeadlessStreaming(
 
       // First prompt message implicitly initializes if not already done.
       runtimeInitialized = true
+      commandCatalogPublisher?.markInitialized()
 
       // Check for duplicate user message - skip if already processed
       if (message.uuid) {
@@ -4657,6 +4763,8 @@ function runHeadlessStreaming(
       suggestionState.abortController?.abort()
       suggestionState.abortController = null
       await finalizePendingAsyncHooks()
+      commandCatalogLifecycle.close()
+      commandCatalogPublisher?.close()
       unsubscribeSkillChanges()
       unsubscribeAuthStatus?.()
       statusListeners.delete(rateLimitListener)

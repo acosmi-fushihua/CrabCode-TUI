@@ -1,4 +1,11 @@
-import { describe, expect, spyOn, test } from 'bun:test'
+import {
+  describe,
+  expect,
+  mock,
+  setDefaultTimeout,
+  spyOn,
+  test,
+} from 'bun:test'
 import { createHash } from 'node:crypto'
 import {
   mkdirSync,
@@ -18,6 +25,10 @@ import * as settings from '../../src/utils/settings/settings.js'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
 
+// QueryEngine lifecycle assertions run in isolated children. Keep any
+// load-induced pause distinct from the command's own terminal contract.
+setDefaultTimeout(20_000)
+
 function source(path: string): string {
   return readFileSync(join(REPO_ROOT, path), 'utf8')
 }
@@ -26,15 +37,81 @@ function sha256(path: string): string {
   return createHash('sha256').update(source(path)).digest('hex')
 }
 
+type ClearFixtureEvidence = {
+  oldSessionId: string
+  newSessionId: string
+  envelopes: Array<{
+    type: string
+    subtype?: string
+    session_id?: string
+    is_error?: boolean
+    stop_reason?: string | null
+    errors?: string[]
+  }>
+}
+
+async function runClearQueryFixture(
+  overrides: Record<string, string> = {},
+): Promise<ClearFixtureEvidence> {
+  const auditRoot = mkdtempSync(join(tmpdir(), 'crabcode-clear-query-engine-'))
+  const configDir = join(auditRoot, 'config')
+  const homeDir = join(auditRoot, 'home')
+  mkdirSync(configDir, { recursive: true })
+  mkdirSync(homeDir, { recursive: true })
+  writeFileSync(
+    join(configDir, '.crabcode.json'),
+    JSON.stringify({ theme: 'dark', hasCompletedOnboarding: true }),
+  )
+  writeFileSync(
+    join(configDir, 'settings.json'),
+    JSON.stringify({ autoMemoryEnabled: false, disableAllHooks: true }),
+  )
+
+  try {
+    const child = Bun.spawn({
+      cmd: [
+        process.execPath,
+        join(REPO_ROOT, 'tests/fixtures/direct-tui-clear-query-engine.ts'),
+      ],
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        CRABCODE_CONFIG_DIR: configDir,
+        CRABCODE_DISABLE_AUTO_MEMORY: '1',
+        CRABCODE_DISABLE_TELEMETRY: '1',
+        // This fixture exercises the fixed local-command envelope only.
+        // Disable the unrelated coordinator branch so Bun's raw-module
+        // circular require cannot affect the assertion.
+        CRABCODE_FEATURE_COORDINATOR_MODE: '0',
+        DISABLE_BACKGROUND_TASKS: '1',
+        ...overrides,
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
+    expect(exitCode, stderr).toBe(0)
+    return JSON.parse(
+      stdout.trim().split('\n').at(-1) ?? '',
+    ) as ClearFixtureEvidence
+  } finally {
+    rmSync(auditRoot, { recursive: true, force: true })
+  }
+}
+
 describe('direct TUI fixed local actions', () => {
   test('routes clear/reset/new through the byte-exact fixed transaction owner', async () => {
-    const catalog = await import('../../src/cli/headlessCommands.js')
-    catalog.clearHeadlessCommandMemoizationCaches()
-    const commands = await catalog.getDirectTuiCommands(process.cwd())
-    const command = commands.find(candidate => candidate.name === 'clear')
+    const { default: command } = await import(
+      '../../src/commands/clear/index.js'
+    )
     expect(command?.type).toBe('local')
     expect(command?.aliases).toEqual(['reset', 'new'])
-    if (!command || command.type !== 'local') {
+    if (command.type !== 'local') {
       throw new Error('direct clear command is absent')
     }
 
@@ -62,7 +139,7 @@ describe('direct TUI fixed local actions', () => {
       'eab6a857043fbf2e42605bd70d4423d6ac19e9b98ce4463cfaebc01d8be01b07',
     )
     expect(sha256('src/commands/clear/conversation.ts')).toBe(
-      'b6743eae3eb8fa75af953d7482f5133d42b3b39317294a7020ebadd961aa2aa7',
+      'e0652811485cfc0686676d1fb4faac2d10598d18ca55b24224f41e6f0e653683',
     )
     const conversation = source('src/commands/clear/conversation.ts')
     expect(conversation).toContain(
@@ -80,91 +157,83 @@ describe('direct TUI fixed local actions', () => {
   })
 
   test('QueryEngine emits the regenerated clear session id on the real local-command envelope path', async () => {
-    const auditRoot = mkdtempSync(
-      join(tmpdir(), 'crabcode-clear-query-engine-'),
-    )
-    const configDir = join(auditRoot, 'config')
-    const homeDir = join(auditRoot, 'home')
-    mkdirSync(configDir, { recursive: true })
-    mkdirSync(homeDir, { recursive: true })
-    writeFileSync(
-      join(configDir, '.crabcode.json'),
-      JSON.stringify({
-        theme: 'dark',
-        hasCompletedOnboarding: true,
-      }),
-    )
-    writeFileSync(
-      join(configDir, 'settings.json'),
-      JSON.stringify({
-        autoMemoryEnabled: false,
-        disableAllHooks: true,
-      }),
-    )
+    const evidence = await runClearQueryFixture()
+    expect(evidence.newSessionId).not.toBe(evidence.oldSessionId)
+    expect(evidence.envelopes[0]).toMatchObject({
+      type: 'system',
+      subtype: 'init',
+      session_id: evidence.newSessionId,
+    })
+    expect(evidence.envelopes.at(-1)).toMatchObject({
+      type: 'result',
+      subtype: 'success',
+      session_id: evidence.newSessionId,
+    })
+    expect(
+      evidence.envelopes
+        .filter(envelope => envelope.session_id !== undefined)
+        .every(envelope => envelope.session_id === evidence.newSessionId),
+    ).toBe(true)
+  })
+
+  test('projects clear transaction rejection as a terminal error through the real catalog and QueryEngine', async () => {
+    const evidence = await runClearQueryFixture({
+      DIRECT_TUI_CLEAR_FAILURE: '1',
+    })
+    expect(evidence.newSessionId).toBe(evidence.oldSessionId)
+    expect(evidence.envelopes.at(-1)).toMatchObject({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      stop_reason: null,
+      session_id: evidence.oldSessionId,
+      errors: ['Error: fixture clear transaction failed'],
+    })
+  })
+
+  test('projects pre-commit clear cancellation as interrupted through the real catalog and QueryEngine', async () => {
+    const evidence = await runClearQueryFixture({
+      DIRECT_TUI_CLEAR_PREABORT: '1',
+    })
+    expect(evidence.newSessionId).toBe(evidence.oldSessionId)
+    expect(evidence.envelopes.at(-1)).toMatchObject({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      stop_reason: 'interrupted',
+      session_id: evidence.oldSessionId,
+    })
+  })
+
+  test('pre-abort leaves clear session, messages, and persistence pointers untouched', async () => {
+    const transaction = await import('../../src/commands/clear/conversation.js')
+    const state = await import('../../src/bootstrap/state.js')
+    const storage = await import('../../src/utils/sessionStorage.js')
+    const abortController = new AbortController()
+    abortController.abort(new DOMException('fixture pre-abort', 'AbortError'))
+    const setMessages = mock(() => {})
+    const setAppState = mock(() => {})
+    const readFileState = new Map()
+    const clearReadFileState = spyOn(readFileState, 'clear')
+    const sessionBefore = state.getSessionId()
+    const transcriptBefore = storage.getTranscriptPath()
 
     try {
-      const child = Bun.spawn({
-        cmd: [
-          process.execPath,
-          join(
-            REPO_ROOT,
-            'tests/fixtures/direct-tui-clear-query-engine.ts',
-          ),
-        ],
-        cwd: REPO_ROOT,
-        env: {
-          ...process.env,
-          HOME: homeDir,
-          CRABCODE_CONFIG_DIR: configDir,
-          CRABCODE_DISABLE_AUTO_MEMORY: '1',
-          CRABCODE_DISABLE_TELEMETRY: '1',
-          // This fixture exercises the fixed local-command envelope only.
-          // Disable the unrelated coordinator branch so Bun's raw-module
-          // circular require cannot affect the assertion.
-          CRABCODE_FEATURE_COORDINATOR_MODE: '0',
-          DISABLE_BACKGROUND_TASKS: '1',
-        },
-        stdout: 'pipe',
-        stderr: 'pipe',
-      })
-      const [exitCode, stdout, stderr] = await Promise.all([
-        child.exited,
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-      ])
-      expect(exitCode, stderr).toBe(0)
-      const evidence = JSON.parse(
-        stdout.trim().split('\n').at(-1) ?? '',
-      ) as {
-        oldSessionId: string
-        newSessionId: string
-        envelopes: Array<{
-          type: string
-          subtype?: string
-          session_id?: string
-        }>
-      }
-      expect(evidence.newSessionId).not.toBe(evidence.oldSessionId)
-      expect(evidence.envelopes[0]).toMatchObject({
-        type: 'system',
-        subtype: 'init',
-        session_id: evidence.newSessionId,
-      })
-      expect(evidence.envelopes.at(-1)).toMatchObject({
-        type: 'result',
-        subtype: 'success',
-        session_id: evidence.newSessionId,
-      })
-      expect(
-        evidence.envelopes
-          .filter(envelope => envelope.session_id !== undefined)
-          .every(
-            envelope =>
-              envelope.session_id === evidence.newSessionId,
-          ),
-      ).toBe(true)
+      await expect(
+        transaction.clearConversation({
+          setMessages,
+          readFileState,
+          setAppState,
+          abortController,
+        } as never),
+      ).rejects.toThrow('fixture pre-abort')
+      expect(state.getSessionId()).toBe(sessionBefore)
+      expect(storage.getTranscriptPath()).toBe(transcriptBefore)
+      expect(setMessages).not.toHaveBeenCalled()
+      expect(setAppState).not.toHaveBeenCalled()
+      expect(clearReadFileState).not.toHaveBeenCalled()
     } finally {
-      rmSync(auditRoot, { recursive: true, force: true })
+      clearReadFileState.mockRestore()
     }
   })
 

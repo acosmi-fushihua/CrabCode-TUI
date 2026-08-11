@@ -9,7 +9,8 @@ const localModels = {
   type: 'local',
   name: 'local-models',
   description: DESCRIPTION,
-  argumentHint: '[status|install <id>|remove <id>]',
+  argumentHint:
+    '[status|install <id>|add <path> [name]|remove <id>|remove-byo <id>|help]',
   supportsNonInteractive: true,
   load: () => import('./local-models.js'),
 } satisfies Command

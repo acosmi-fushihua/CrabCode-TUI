@@ -80,7 +80,6 @@ const DIRECT_TUI_BUILTINS = [
   'prComments',
   'proxy',
   'releaseNotes',
-  'DIRECT_TUI_RELOAD_PLUGINS',
   'directTuiStatusline',
   'review',
   'securityReview',
@@ -91,7 +90,6 @@ const DIRECT_TUI_BUILTINS = [
   '...WORKFLOW_MANAGEMENT_BUILTINS',
   "...(feature('PROACTIVE') || feature('KAIROS')",
   '? [DIRECT_TUI_PROACTIVE]',
-  '...(!isUsing3PServices() ? [logout] : [])',
   '...ANT_RENDERER_NEUTRAL_BUILTINS',
 ] as const
 
@@ -123,13 +121,15 @@ describe('direct TUI command catalog denominator', () => {
     expect(directTui.match(/directTuiStatusline/g)).toHaveLength(1)
     expect(directTui.match(/DIRECT_TUI_INSTALL_SLACK_APP/g)).toHaveLength(1)
     expect(directTui.match(/DIRECT_TUI_PROACTIVE/g)).toHaveLength(1)
-    expect(directTui.match(/DIRECT_TUI_RELOAD_PLUGINS/g)).toHaveLength(1)
+    expect(directTui).not.toContain('DIRECT_TUI_RELOAD_PLUGINS')
     expect(directTui.match(/DIRECT_TUI_CLEAR/g)).toHaveLength(1)
     expect(directTui.match(/DIRECT_TUI_SMALLMODEL/g)).toHaveLength(1)
     expect(directTui.match(/DIRECT_TUI_TERMINAL_SETUP/g)).toHaveLength(1)
     expect(directTui.match(/DIRECT_TUI_VISION/g)).toHaveLength(1)
     expect(directTui.match(/outputStyle/g)).toHaveLength(1)
-    expect(directTui.match(/\[logout\]/g)).toHaveLength(1)
+    expect(directTui).not.toContain('[logout]')
+    expect(catalog).toContain("'logout',\n  'reload-plugins'")
+    expect(catalog).toContain('claimsDirectTuiRendererOwnedInvocation')
     expect(catalog).toContain(
       'DIRECT_TUI_RENDERER_NEUTRAL_LOCAL_JSX.has(command)',
     )
@@ -152,7 +152,7 @@ describe('direct TUI command catalog denominator', () => {
   test('keeps context renderer-owned on its pre-existing direct control', () => {
     const app = source('crates/crabcode-tui/src/tui_app.rs')
     const runtimeCatalogPrecedence = app.indexOf(
-      'if self.runtime_catalog_contains(name)',
+      'self.runtime_catalog_contains(name)',
     )
     const nativeContextBranch = app.indexOf(
       '"/context" if rest.is_empty()',
@@ -185,10 +185,13 @@ describe('direct TUI command catalog denominator', () => {
     expect(core).toContain('commandLoader: getDirectTuiCommands')
     expect(core).toContain('commandLoader: getHeadlessCommands')
     expect(core).toContain(
-      'currentCommands = await routePolicy.commandLoader(cwd())',
+      'commandCatalogLifecycle.refresh(() =>\n      routePolicy.commandLoader(cwd()),',
     )
     expect(core.match(/routePolicy\.commandLoader\(cwd\(\)\)/g)).toHaveLength(
       3,
+    )
+    expect(core).toContain(
+      'refreshControlAuthCatalog(\n                  routePolicy.commandLoader,\n                  cwd(),',
     )
   })
 
@@ -200,18 +203,25 @@ describe('direct TUI command catalog denominator', () => {
   })
 
   test('uses one canonical-plus-alias projector for every catalog producer', () => {
-    const producerPaths = [
-      'src/cli/print/sdkControlHandlers.ts',
-      'src/cli/print/queryExecutionCore.ts',
-    ] as const
+    const handlers = source('src/cli/print/sdkControlHandlers.ts')
+    expectOrdered(handlers, [
+      'export async function refreshControlAuthCatalog(',
+      'commands: projectCommandCatalogEntries(',
+      'async function refreshSignedOutControlAuthCatalog(',
+      'commands: projectCommandCatalogEntries(',
+      'export async function handleInitializeRequest(',
+      'commands: projectCommandCatalogEntries(',
+    ])
+    expect(handlers).not.toContain('commands: commands.map(')
 
-    for (const path of producerPaths) {
-      const producer = source(path)
-      expect(
-        producer.match(/projectCommandCatalogEntries\(/g),
-        path,
-      ).toHaveLength(1)
-    }
+    const query = source('src/cli/print/queryExecutionCore.ts')
+    expectOrdered(query, [
+      'const commandCatalogLifecycle = new DirectTuiCommandCatalogLifecycle(',
+      'projectCommandCatalogEntries(',
+      "message.request.subtype === 'reload_plugins'",
+      'commands: projectCommandCatalogEntries(',
+    ])
+    expect(query).not.toContain('commands: currentCommands.map(')
 
     const projection = source('src/cli/commandCatalogProjection.ts')
     expectOrdered(projection, [
@@ -219,7 +229,9 @@ describe('direct TUI command catalog denominator', () => {
       'for (const name of [command.name, ...(command.aliases ?? [])])',
       'if (claimedInvocationNames.has(name)) continue',
       'claimedInvocationNames.add(name)',
-      'entries.push({ name, description, argumentHint })',
+      'entries.push({',
+      '...(command.isHidden === true',
+      '...(builtInNames.has(name)',
     ])
     expect(projection).not.toContain('.userFacingName')
   })

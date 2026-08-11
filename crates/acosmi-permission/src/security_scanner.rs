@@ -48,7 +48,7 @@ pub mod check_ids {
 /// 等价于 TS `bashCommandIsSafe_DEPRECATED` 的返回值
 #[derive(Debug, Clone)]
 pub enum BashSecurityResult {
-    /// 命令安全（早期允许路径）— 跳过后续权限检查
+    /// 命令通过注入扫描（候选早期允许）— 路径安全下限仍需执行
     Allow,
     /// 发现安全违规 — 需要用户确认
     Ask(SecurityViolation),

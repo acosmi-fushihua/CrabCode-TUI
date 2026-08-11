@@ -44,7 +44,23 @@ const tracked = run('git', [
   .split('\0')
   .filter(Boolean)
   .sort()
-const trackedSet = new Set(tracked)
+
+// These command modules were intentionally removed when ownership moved into the
+// renderer/private control channel. Keep the boundary runnable before the deletion
+// is staged, while still failing if any retired implementation reappears.
+const reviewedWorkingTreeRemovals = new Set([
+  'src/commands/logout/headless.ts',
+  'src/commands/logout/headlessCall.ts',
+  'src/commands/reload-plugins/index.ts',
+  'src/commands/reload-plugins/reload-plugins.ts',
+])
+for (const path of reviewedWorkingTreeRemovals) {
+  if (existsSync(resolve(root, path))) {
+    fail(`reviewed renderer-owned command removal unexpectedly exists: ${path}`)
+  }
+}
+const repositoryFiles = tracked.filter(path => !reviewedWorkingTreeRemovals.has(path))
+const trackedSet = new Set(repositoryFiles)
 
 const requiredFiles = [
   'README.md',
@@ -162,7 +178,7 @@ const forbiddenRootDocument = /^(?:ACOSMI|AGENTS|AUDIT[^/]*|CLAUDE|CRABCODE|MIGR
 const forbiddenArtifact = /\.(?:7z|app|dll|dmg|docx?|exe|gz|pdf|pkg|pptx?|rar|so|tar|tgz|xlsx?|zip)$/iu
 
 let trackedBytes = 0
-for (const path of tracked) {
+for (const path of repositoryFiles) {
   const segments = path.split('/')
   if (segments.length === 1) {
     if (!allowedRootFiles.has(path)) fail(`unexpected root file: ${path}`)
@@ -194,7 +210,9 @@ for (const path of tracked) {
   }
   trackedBytes += info.size
 }
-if (tracked.length > 5_000) fail(`tracked file ceiling exceeded: ${tracked.length} > 5000`)
+if (repositoryFiles.length > 5_000) {
+  fail(`tracked file ceiling exceeded: ${repositoryFiles.length} > 5000`)
+}
 if (trackedBytes > 80 * 1024 * 1024) {
   fail(`tracked byte ceiling exceeded: ${trackedBytes} > 80 MiB`)
 }
@@ -215,9 +233,13 @@ const exactScripts = new Set([
   'scripts/release-x64-darwin-runtime-preflight.mjs',
   'scripts/run-bun-test.ts',
   'scripts/run-full-test-suite.ts',
+  'scripts/tui-runtime-source-binding.mjs',
+  'scripts/tui-runtime-smoke-contract.mjs',
   'scripts/tui-runtime-smoke.mjs',
+  'scripts/verify-direct-tui-command-capabilities.mjs',
+  'scripts/verify-tui-runtime-source-binding.mjs',
 ])
-for (const path of tracked.filter(path => path.startsWith('scripts/'))) {
+for (const path of repositoryFiles.filter(path => path.startsWith('scripts/'))) {
   if (!exactScripts.has(path)) fail(`unexpected build/governance script: ${path}`)
 }
 const exactWorkflows = new Set([
@@ -227,7 +249,7 @@ const exactWorkflows = new Set([
   '.github/workflows/ci.yml',
   '.github/workflows/release.yml',
 ])
-for (const path of tracked.filter(path => path.startsWith('.github/'))) {
+for (const path of repositoryFiles.filter(path => path.startsWith('.github/'))) {
   if (!exactWorkflows.has(path)) fail(`unexpected GitHub project file: ${path}`)
 }
 
@@ -257,7 +279,7 @@ const exactCrates = new Set([
   'crabcode-ratatui-textarea',
   'crabcode-tui',
 ])
-for (const path of tracked.filter(path => path.startsWith('crates/'))) {
+for (const path of repositoryFiles.filter(path => path.startsWith('crates/'))) {
   const segment = path.split('/')[1]
   if (
     !new Set(['Cargo.toml', 'Cargo.lock', 'clippy.toml', 'rustfmt.toml']).has(segment) &&
@@ -279,7 +301,7 @@ const exactThirdParty = new Set([
   'release-licenses',
   'sharp-native',
 ])
-for (const path of tracked.filter(path => path.startsWith('third_party/'))) {
+for (const path of repositoryFiles.filter(path => path.startsWith('third_party/'))) {
   if (!exactThirdParty.has(path.split('/')[1])) {
     fail(`third-party tree outside the TUI runtime closure is tracked: ${path}`)
   }
@@ -335,7 +357,7 @@ compareSet(
   ]),
 )
 
-for (const manifest of tracked.filter(path => path.endsWith('Cargo.toml'))) {
+for (const manifest of repositoryFiles.filter(path => path.endsWith('Cargo.toml'))) {
   const text = readFileSync(resolve(root, manifest), 'utf8')
   for (const line of text.split(/\r?\n/u)) {
     if (line.trimStart().startsWith('#')) continue
@@ -367,7 +389,7 @@ const forbiddenSourceFragments = [
   ['removed GUI autocompaction switch', /\bCRABCODE_SUPPRESS_INLOOP_AUTOCOMPACT\b/u],
   ['removed desktop artifact state', /\bdesktopArtifactAccountEpochMs\b/u],
 ]
-for (const path of tracked.filter(path => {
+for (const path of repositoryFiles.filter(path => {
   const sourceRoot = /^(?:components|crates|libs|src)\//u.test(path)
   const sourceExtension = /\.(?:go|rs|[cm]?[jt]sx?)$/u.test(path)
   return sourceRoot && sourceExtension
@@ -449,7 +471,7 @@ if (!sourceOnly) {
     'src/utils/secureStorage/types.ts',
   ])
     const typeOnlySources = new Set(
-      tracked.filter(
+      repositoryFiles.filter(
         path =>
           path.startsWith('src/') &&
           /\.[cm]?[jt]sx?$/u.test(path) &&
@@ -470,7 +492,7 @@ if (!sourceOnly) {
           .map(path => portable(relative(root, path)))
           .filter(path => !path.startsWith('../')),
       )
-      const unreachable = tracked.filter(
+      const unreachable = repositoryFiles.filter(
         path =>
           path.startsWith('src/') &&
           /\.[cm]?[jt]sx?$/u.test(path) &&
@@ -494,5 +516,5 @@ if (failures.length > 0) {
 }
 
 process.stdout.write(
-  `repository boundary passed: mode=${sourceOnly ? 'source' : 'complete'} files=${tracked.length} bytes=${trackedBytes} pure_tui=true\n`,
+  `repository boundary passed: mode=${sourceOnly ? 'source' : 'complete'} files=${repositoryFiles.length} bytes=${trackedBytes} pure_tui=true\n`,
 )

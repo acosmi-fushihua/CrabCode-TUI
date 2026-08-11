@@ -27,7 +27,7 @@ use crate::generated_renderer_contract::{
     GENERATED_RENDERER_CAPABILITY_CONTRACT_SHA256, GENERATED_STDOUT_SYSTEM_SUBTYPES,
 };
 
-const FIXED_RUNTIME_ARGS: [&str; 7] = [
+const FIXED_RUNTIME_ARGS: [&str; 9] = [
     "--print",
     "--input-format",
     "stream-json",
@@ -35,11 +35,15 @@ const FIXED_RUNTIME_ARGS: [&str; 7] = [
     "stream-json",
     "--verbose",
     "--include-partial-messages",
+    "--permission-prompt-tool",
+    "stdio",
 ];
 
 const PRIVATE_RUNTIME_ACTION_TYPE: &str = "crabcode_tui_runtime_action";
 const PRIVATE_RUNTIME_RESULT_TYPE: &str = "crabcode_tui_runtime_result";
 const PRIVATE_RUNTIME_PROTOCOL_VERSION: u64 = 1;
+const CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE: &str = "crabcode_tui_command_catalog_changed";
+const CRABCODE_TUI_COMMAND_CATALOG_PROTOCOL_VERSION: u64 = 1;
 
 pub const RENDERER_CAPABILITY_CONTRACT_SHA256: &str = GENERATED_RENDERER_CAPABILITY_CONTRACT_SHA256;
 
@@ -58,7 +62,7 @@ const KNOWN_SYSTEM_SUBTYPES: &[&str] = GENERATED_STDOUT_SYSTEM_SUBTYPES;
 const KNOWN_CONTROL_REQUEST_SUBTYPES: &[&str] = GENERATED_CONTROL_REQUEST_SUBTYPES;
 const KNOWN_CONTROL_REQUEST_PROCESS_PRIVATE_EXTENSIONS: [&str; 1] = ["crabcode_tui_setup"];
 
-const KNOWN_CONTROL_REQUEST_QUERY_EXTENSIONS: [&str; 11] = [
+const KNOWN_CONTROL_REQUEST_QUERY_EXTENSIONS: [&str; 13] = [
     "end_session",
     "channel_enable",
     "mcp_authenticate",
@@ -66,6 +70,8 @@ const KNOWN_CONTROL_REQUEST_QUERY_EXTENSIONS: [&str; 11] = [
     "crabcode_authenticate",
     "crabcode_oauth_callback",
     "crabcode_oauth_wait_for_completion",
+    "crabcode_tui_logout",
+    CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
     "mcp_clear_auth",
     "generate_session_title",
     "side_question",
@@ -628,6 +634,9 @@ pub fn classify_envelope(value: &Value) -> Result<EnvelopeClass, ProtocolViolati
                     observed_system_subtype: Some(progress_type),
                 });
             }
+            if progress_type == "compact_progress" {
+                validate_compact_progress_data(data)?;
+            }
             Ok(EnvelopeClass::DirectProgress { progress_type })
         }
         "attachment" => {
@@ -720,6 +729,10 @@ pub fn classify_envelope(value: &Value) -> Result<EnvelopeClass, ProtocolViolati
                 return Err(ProtocolViolation {
                     reason: format!("unknown control request subtype `{subtype}`"),
                 });
+            }
+            if subtype == CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE {
+                validate_command_catalog_changed_request(request)
+                    .map_err(|reason| ProtocolViolation { reason })?;
             }
             Ok(EnvelopeClass::ControlRequest {
                 request_id,
@@ -824,6 +837,49 @@ fn validate_direct_message_identity(
 ) -> Result<(), ProtocolViolation> {
     string_field(object, "uuid", context)?;
     string_field(object, "timestamp", context)?;
+    Ok(())
+}
+
+/// Validate the renderer-facing compaction lifecycle union at the transport
+/// boundary. Unlike an unknown additive progress discriminator, a malformed
+/// member of a known fixed union is a producer/protocol violation and must not
+/// be downgraded to an unclassified presentation row.
+fn validate_compact_progress_data(
+    data: &serde_json::Map<String, Value>,
+) -> Result<(), ProtocolViolation> {
+    let phase = string_field(data, "phase", "direct compact progress.data")?;
+    match phase.as_str() {
+        "hooks_start" => {
+            if !object_has_exact_fields(data, &["type", "phase", "hookType"], &[]) {
+                return Err(ProtocolViolation {
+                    reason: "direct compact progress hooks_start data must contain exactly `type`, `phase`, and `hookType`".to_string(),
+                });
+            }
+            let hook_type = string_field(data, "hookType", "direct compact progress.data")?;
+            if !matches!(
+                hook_type.as_str(),
+                "pre_compact" | "post_compact" | "session_start"
+            ) {
+                return Err(ProtocolViolation {
+                    reason: format!("direct compact progress has unknown hookType `{hook_type}`"),
+                });
+            }
+        }
+        "compact_start" | "compact_end" => {
+            if !object_has_exact_fields(data, &["type", "phase"], &[]) {
+                return Err(ProtocolViolation {
+                    reason: format!(
+                        "direct compact progress {phase} data must contain exactly `type` and `phase`"
+                    ),
+                });
+            }
+        }
+        unknown => {
+            return Err(ProtocolViolation {
+                reason: format!("direct compact progress has unknown phase `{unknown}`"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1089,6 +1145,110 @@ fn object_has_exact_fields(
         && object
             .keys()
             .all(|field| required.contains(&field.as_str()) || optional.contains(&field.as_str()))
+}
+
+fn javascript_string_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
+fn command_catalog_invocation_name_roundtrips(name: &str) -> bool {
+    let whitespace_free = |value: &str| {
+        !value
+            .chars()
+            .any(crabcode_pager_render::text_safety::is_ecmascript_whitespace)
+    };
+    if let Some(prefix) = name.strip_suffix(" (MCP)") {
+        !prefix.is_empty() && whitespace_free(prefix)
+    } else {
+        !name.is_empty() && whitespace_free(name)
+    }
+}
+
+fn validate_command_catalog_changed_request(
+    request: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    if !object_has_exact_fields(request, &["subtype", "protocol_version", "commands"], &[]) {
+        return Err(
+            "control request `crabcode_tui_command_catalog_changed` has unknown or missing fields"
+                .to_string(),
+        );
+    }
+    if request.get("protocol_version").and_then(Value::as_u64)
+        != Some(CRABCODE_TUI_COMMAND_CATALOG_PROTOCOL_VERSION)
+    {
+        return Err(
+            "control request `crabcode_tui_command_catalog_changed` has unsupported protocol_version"
+                .to_string(),
+        );
+    }
+    let commands = request
+        .get("commands")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "control request `crabcode_tui_command_catalog_changed` commands must be an array"
+                .to_string()
+        })?;
+    if commands.len() > 4_096 {
+        return Err(
+            "control request `crabcode_tui_command_catalog_changed` commands exceeded 4096 entries"
+                .to_string(),
+        );
+    }
+
+    let mut names = HashSet::with_capacity(commands.len());
+    for (index, command) in commands.iter().enumerate() {
+        let command = command.as_object().ok_or_else(|| {
+            format!(
+                "control request `crabcode_tui_command_catalog_changed` commands[{index}] must be an object"
+            )
+        })?;
+        if !object_has_exact_fields(
+            command,
+            &["name", "description", "argumentHint"],
+            &["hidden", "builtin"],
+        ) {
+            return Err(format!(
+                "control request `crabcode_tui_command_catalog_changed` commands[{index}] has unknown or missing fields"
+            ));
+        }
+        let string = |field: &str, maximum: usize| -> Result<&str, String> {
+            let value = command.get(field).and_then(Value::as_str).ok_or_else(|| {
+                format!(
+                    "control request `crabcode_tui_command_catalog_changed` commands[{index}].{field} must be a string"
+                )
+            })?;
+            if javascript_string_len(value) > maximum {
+                return Err(format!(
+                    "control request `crabcode_tui_command_catalog_changed` commands[{index}].{field} exceeded {maximum} UTF-16 code units"
+                ));
+            }
+            Ok(value)
+        };
+        let name = string("name", 512)?;
+        if !command_catalog_invocation_name_roundtrips(name) {
+            return Err(format!(
+                "control request `crabcode_tui_command_catalog_changed` commands[{index}].name must be one exact invocation token"
+            ));
+        }
+        string("description", 16_384)?;
+        string("argumentHint", 4_096)?;
+        for field in ["hidden", "builtin"] {
+            if command
+                .get(field)
+                .is_some_and(|value| value.as_bool() != Some(true))
+            {
+                return Err(format!(
+                    "control request `crabcode_tui_command_catalog_changed` commands[{index}].{field} must be true when present"
+                ));
+            }
+        }
+        if !names.insert(name) {
+            return Err(format!(
+                "control request `crabcode_tui_command_catalog_changed` commands[{index}].name duplicates `{name}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn string_or_null(value: Option<&Value>) -> bool {
@@ -1866,6 +2026,24 @@ fn validate_outbound_control_request(
         return Err(SendError::InvalidEnvelope(format!(
             "unknown control request subtype `{subtype}`"
         )));
+    }
+    if subtype == "crabcode_tui_logout"
+        && !request
+            .as_object()
+            .is_some_and(|object| object_has_exact_fields(object, &["subtype"], &[]))
+    {
+        return Err(SendError::InvalidEnvelope(
+            "control request `crabcode_tui_logout` has unknown or missing fields".to_string(),
+        ));
+    }
+    if subtype == CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE {
+        let request = request.as_object().ok_or_else(|| {
+            SendError::InvalidEnvelope(
+                "control request `crabcode_tui_command_catalog_changed` must be an object"
+                    .to_string(),
+            )
+        })?;
+        validate_command_catalog_changed_request(request).map_err(SendError::InvalidEnvelope)?;
     }
     Ok(subtype)
 }
@@ -3932,6 +4110,7 @@ fn validate_runtime_args(args: &[OsString]) -> Result<(), SpawnError> {
                 | "--no-include-partial-messages"
                 | "--include-hook-events"
                 | "--no-include-hook-events"
+                | "--permission-prompt-tool"
         ) {
             return Err(SpawnError::ReservedArgument(value.into_owned()));
         }
@@ -5187,7 +5366,8 @@ printf '%s\n' '{"type":"crabcode_tui_runtime_result","protocol_version":1,"reque
     #[test]
     fn generated_contract_denominators_are_duplicate_free_and_match_classifiers() {
         assert_eq!(RENDERER_CAPABILITY_CONTRACT_SHA256.len(), 64);
-        assert_eq!(KNOWN_DIRECT_PROGRESS_TYPES.len(), 11);
+        assert_eq!(KNOWN_DIRECT_PROGRESS_TYPES.len(), 12);
+        assert!(KNOWN_DIRECT_PROGRESS_TYPES.contains(&"compact_progress"));
         assert!(KNOWN_DIRECT_PROGRESS_TYPES.contains(&"repl_progress"));
         assert!(KNOWN_DIRECT_PROGRESS_TYPES.contains(&"workflow_progress"));
         assert_eq!(KNOWN_DIRECT_MESSAGE_TYPES.len(), 9);
@@ -5230,6 +5410,8 @@ printf '%s\n' '{"type":"crabcode_tui_runtime_result","protocol_version":1,"reque
                 "crabcode_authenticate",
                 "crabcode_oauth_callback",
                 "crabcode_oauth_wait_for_completion",
+                "crabcode_tui_logout",
+                "crabcode_tui_command_catalog_changed",
                 "mcp_clear_auth",
                 "generate_session_title",
                 "side_question",
@@ -5267,6 +5449,113 @@ printf '%s\n' '{"type":"crabcode_tui_runtime_result","protocol_version":1,"reque
             .chain(KNOWN_CONTROL_REQUEST_QUERY_EXTENSIONS.iter())
         {
             assert!(known_control_request_subtype(subtype));
+        }
+    }
+
+    #[test]
+    fn command_catalog_changed_private_request_is_closed_bounded_and_duplicate_free() {
+        let request = json!({
+            "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+            "protocol_version":CRABCODE_TUI_COMMAND_CATALOG_PROTOCOL_VERSION,
+            "commands":[
+                {
+                    "name":"compact",
+                    "description":"Compact the conversation",
+                    "argumentHint":"",
+                    "builtin":true
+                },
+                {
+                    "name":"hidden-skill",
+                    "description":"Exact dispatch only",
+                    "argumentHint":"<value>",
+                    "hidden":true
+                },
+                {
+                    "name":"mcp:tool (MCP)",
+                    "description":"MCP command",
+                    "argumentHint":""
+                }
+            ]
+        });
+        let envelope = json!({
+            "type":"control_request",
+            "request_id":"catalog-1",
+            "request":request
+        });
+        assert_eq!(
+            classify_envelope(&envelope).expect("valid catalog refresh"),
+            EnvelopeClass::ControlRequest {
+                request_id: "catalog-1".to_string(),
+                subtype: CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE.to_string(),
+            }
+        );
+        assert_eq!(
+            validate_outbound_control_request("catalog-1", &envelope["request"])
+                .expect("valid outbound catalog request"),
+            CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE
+        );
+
+        for malformed_request in [
+            json!({
+                "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                "protocol_version":2,
+                "commands":[]
+            }),
+            json!({
+                "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                "protocol_version":1,
+                "commands":[],
+                "future":true
+            }),
+            json!({
+                "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                "protocol_version":1,
+                "commands":[{"name":"compact","description":"","argumentHint":"","hidden":false}]
+            }),
+            json!({
+                "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                "protocol_version":1,
+                "commands":[
+                    {"name":"compact","description":"","argumentHint":""},
+                    {"name":"compact","description":"","argumentHint":""}
+                ]
+            }),
+            json!({
+                "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                "protocol_version":1,
+                "commands":[{"name":"   ","description":"","argumentHint":""}]
+            }),
+            json!({
+                "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                "protocol_version":1,
+                "commands":[{"name":"mcp:tool  (MCP)","description":"","argumentHint":""}]
+            }),
+            json!({
+                "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                "protocol_version":1,
+                "commands":[{"name":"x".repeat(513),"description":"","argumentHint":""}]
+            }),
+            json!({
+                "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                "protocol_version":1,
+                "commands":[{"name":"compact","description":"x".repeat(16_385),"argumentHint":""}]
+            }),
+            json!({
+                "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                "protocol_version":1,
+                "commands":[{"name":"compact","description":"","argumentHint":"x".repeat(4_097)}]
+            }),
+        ] {
+            let malformed = json!({
+                "type":"control_request",
+                "request_id":"catalog-bad",
+                "request":malformed_request
+            });
+            assert!(classify_envelope(&malformed).is_err(), "{malformed}");
+            assert!(
+                validate_outbound_control_request("catalog-bad", &malformed["request"]).is_err(),
+                "{malformed}"
+            );
         }
     }
 
@@ -5464,6 +5753,52 @@ printf '%s\n' '{"type":"crabcode_tui_runtime_result","protocol_version":1,"reque
             .expect("camel-case historical boundary"),
             EnvelopeClass::DirectSystem(DirectSystemSubtype::CompactBoundary)
         );
+    }
+
+    #[test]
+    fn compact_progress_classifier_enforces_the_exact_phase_hook_union() {
+        let envelope = |data: Value| {
+            json!({
+                "type":"progress",
+                "data":data,
+                "toolUseID":"compact-progress-1",
+                "parentToolUseID":"compact-progress-1",
+                "uuid":"compact-progress-event",
+                "timestamp":"2026-08-10T00:00:00.000Z"
+            })
+        };
+
+        for data in [
+            json!({"type":"compact_progress","phase":"hooks_start","hookType":"pre_compact"}),
+            json!({"type":"compact_progress","phase":"hooks_start","hookType":"post_compact"}),
+            json!({"type":"compact_progress","phase":"hooks_start","hookType":"session_start"}),
+            json!({"type":"compact_progress","phase":"compact_start"}),
+            json!({"type":"compact_progress","phase":"compact_end"}),
+        ] {
+            assert_eq!(
+                classify_envelope(&envelope(data)).expect("valid compact progress"),
+                EnvelopeClass::DirectProgress {
+                    progress_type: "compact_progress".to_string(),
+                }
+            );
+        }
+
+        for data in [
+            json!({"type":"compact_progress"}),
+            json!({"type":"compact_progress","phase":null}),
+            json!({"type":"compact_progress","phase":"future_phase"}),
+            json!({"type":"compact_progress","phase":"hooks_start"}),
+            json!({"type":"compact_progress","phase":"hooks_start","hookType":"future_hook"}),
+            json!({"type":"compact_progress","phase":"hooks_start","hookType":"pre_compact","extra":true}),
+            json!({"type":"compact_progress","phase":"compact_start","hookType":"pre_compact"}),
+            json!({"type":"compact_progress","phase":"compact_end","hookType":null}),
+            json!({"type":"compact_progress","phase":"compact_end","extra":true}),
+        ] {
+            assert!(
+                classify_envelope(&envelope(data.clone())).is_err(),
+                "known compact progress must fail closed for malformed data: {data}"
+            );
+        }
     }
 
     #[test]

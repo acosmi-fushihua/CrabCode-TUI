@@ -13,6 +13,7 @@ import type { PermissionRule } from '../../types/permissions.js'
 import { getCwd } from '../../utils/cwd.js'
 import {
   getFsImplementation,
+  getPathsForPermissionCheck,
   safeResolvePath,
 } from '../../utils/fsOperations.js'
 import { containsPathTraversal, getDirectoryForPath } from '../../utils/path.js'
@@ -867,18 +868,22 @@ function isPathAllowed(
   precomputedPathsToCheck?: readonly string[],
 ): PathCheckResult {
   const permissionType = operationType === 'read' ? 'read' : 'edit'
+  const pathsToCheck =
+    precomputedPathsToCheck ?? getPathsForPermissionCheck(resolvedPath)
 
-  // 1. Check deny rules first
-  const denyRule = matchingRuleForInput(
-    resolvedPath,
-    context,
-    permissionType,
-    'deny',
-  )
-  if (denyRule !== null) {
-    return {
-      allowed: false,
-      decisionReason: { type: 'rule', rule: denyRule },
+  // 1. Deny rules apply to every lexical/intermediate/canonical identity.
+  for (const pathToCheck of pathsToCheck) {
+    const denyRule = matchingRuleForInput(
+      pathToCheck,
+      context,
+      permissionType,
+      'deny',
+    )
+    if (denyRule !== null) {
+      return {
+        allowed: false,
+        decisionReason: { type: 'rule', rule: denyRule },
+      }
     }
   }
 
@@ -887,7 +892,11 @@ function isPathAllowed(
   // and internal editable paths live under ~/.crabcode/ — matching the ordering in
   // checkWritePermissionForTool (filesystem.ts step 1.5)
   if (operationType !== 'read') {
-    const internalEditResult = checkEditableInternalPath(resolvedPath, {})
+    const internalEditResult = checkEditableInternalPath(
+      resolvedPath,
+      {},
+      pathsToCheck,
+    )
     if (internalEditResult.behavior === 'allow') {
       return {
         allowed: true,
@@ -900,7 +909,7 @@ function isPathAllowed(
   if (operationType !== 'read') {
     const safetyCheck = checkPathSafetyForAutoEdit(
       resolvedPath,
-      precomputedPathsToCheck,
+      pathsToCheck,
     )
     if (!safetyCheck.safe) {
       return {
@@ -918,7 +927,7 @@ function isPathAllowed(
   const isInWorkingDir = pathInAllowedWorkingPath(
     resolvedPath,
     context,
-    precomputedPathsToCheck,
+    pathsToCheck,
   )
   if (isInWorkingDir) {
     if (operationType === 'read' || context.mode === 'acceptEdits') {
@@ -928,7 +937,11 @@ function isPathAllowed(
 
   // 3.5. For read operations, check internal readable paths
   if (operationType === 'read') {
-    const internalReadResult = checkReadableInternalPath(resolvedPath, {})
+    const internalReadResult = checkReadableInternalPath(
+      resolvedPath,
+      {},
+      pathsToCheck,
+    )
     if (internalReadResult.behavior === 'allow') {
       return {
         allowed: true,
@@ -947,7 +960,7 @@ function isPathAllowed(
   if (
     operationType !== 'read' &&
     !isInWorkingDir &&
-    isPathInSandboxWriteAllowlist(resolvedPath)
+    isPathInSandboxWriteAllowlist(resolvedPath, pathsToCheck)
   ) {
     return {
       allowed: true,
@@ -958,17 +971,15 @@ function isPathAllowed(
     }
   }
 
-  // 4. Check allow rules
-  const allowRule = matchingRuleForInput(
-    resolvedPath,
-    context,
-    permissionType,
-    'allow',
+  // 4. Positive rules must cover every identity form; an allow on one alias
+  // must not authorize a different physical target.
+  const allowRules = pathsToCheck.map(pathToCheck =>
+    matchingRuleForInput(pathToCheck, context, permissionType, 'allow'),
   )
-  if (allowRule !== null) {
+  if (allowRules.length > 0 && allowRules.every(rule => rule !== null)) {
     return {
       allowed: true,
-      decisionReason: { type: 'rule', rule: allowRule },
+      decisionReason: { type: 'rule', rule: allowRules[0]! },
     }
   }
 
@@ -998,13 +1009,16 @@ function checkDenyRuleForGuessedPath(
     : resolve(cwd, tildeExpanded)
   const { resolvedPath } = safeResolvePath(getFsImplementation(), abs)
   const permissionType = operationType === 'read' ? 'read' : 'edit'
-  const denyRule = matchingRuleForInput(
-    resolvedPath,
-    toolPermissionContext,
-    permissionType,
-    'deny',
-  )
-  return denyRule ? { resolvedPath, rule: denyRule } : null
+  for (const pathToCheck of getPathsForPermissionCheck(abs)) {
+    const denyRule = matchingRuleForInput(
+      pathToCheck,
+      toolPermissionContext,
+      permissionType,
+      'deny',
+    )
+    if (denyRule) return { resolvedPath, rule: denyRule }
+  }
+  return null
 }
 
 /**
@@ -1179,7 +1193,8 @@ function validatePath(
       const absolutePath = isAbsolute(normalizedPath)
         ? normalizedPath
         : resolve(cwd, normalizedPath)
-      const { resolvedPath, isCanonical } = safeResolvePath(
+      const pathsToCheck = getPathsForPermissionCheck(absolutePath)
+      const { resolvedPath } = safeResolvePath(
         getFsImplementation(),
         absolutePath,
       )
@@ -1187,7 +1202,7 @@ function validatePath(
         resolvedPath,
         toolPermissionContext,
         operationType,
-        isCanonical ? [resolvedPath] : undefined,
+        pathsToCheck,
       )
       return {
         allowed: result.allowed,
@@ -1212,22 +1227,25 @@ function validatePath(
     const absoluteBasePath = isAbsolute(basePath)
       ? basePath
       : resolve(cwd, basePath)
+    const pathsToCheck = getPathsForPermissionCheck(absoluteBasePath)
     const { resolvedPath } = safeResolvePath(
       getFsImplementation(),
       absoluteBasePath,
     )
     const permissionType = operationType === 'read' ? 'read' : 'edit'
-    const denyRule = matchingRuleForInput(
-      resolvedPath,
-      toolPermissionContext,
-      permissionType,
-      'deny',
-    )
-    if (denyRule !== null) {
-      return {
-        allowed: false,
-        resolvedPath,
-        decisionReason: { type: 'rule', rule: denyRule },
+    for (const pathToCheck of pathsToCheck) {
+      const denyRule = matchingRuleForInput(
+        pathToCheck,
+        toolPermissionContext,
+        permissionType,
+        'deny',
+      )
+      if (denyRule !== null) {
+        return {
+          allowed: false,
+          resolvedPath,
+          decisionReason: { type: 'rule', rule: denyRule },
+        }
       }
     }
     return {
@@ -1245,7 +1263,8 @@ function validatePath(
   const absolutePath = isAbsolute(normalizedPath)
     ? normalizedPath
     : resolve(cwd, normalizedPath)
-  const { resolvedPath, isCanonical } = safeResolvePath(
+  const pathsToCheck = getPathsForPermissionCheck(absolutePath)
+  const { resolvedPath } = safeResolvePath(
     getFsImplementation(),
     absolutePath,
   )
@@ -1254,7 +1273,7 @@ function validatePath(
     resolvedPath,
     toolPermissionContext,
     operationType,
-    isCanonical ? [resolvedPath] : undefined,
+    pathsToCheck,
   )
   return {
     allowed: result.allowed,

@@ -3,12 +3,18 @@ import {
   beforeEach,
   describe,
   expect,
+  setDefaultTimeout,
   spyOn,
   test,
 } from 'bun:test'
 import { getComposerExecutionKind } from '../../src/types/command.js'
 
 const auth = await import('../../src/utils/auth.js')
+
+// Command discovery loads the complete built-in/skill surface. The normal
+// path is sub-second, but a concurrent Rust link can pause this isolated Bun
+// worker past Bun's 5s default without indicating a product timeout.
+setDefaultTimeout(20_000)
 const overageSpy = spyOn(
   auth,
   'isOverageProvisioningAllowed',
@@ -67,7 +73,6 @@ describe('direct TUI extra-usage catalog', () => {
       'clear',
       'install-slack-app',
       'output-style',
-      'reload-plugins',
       'smallmodel',
       'terminal-setup',
     ]) {
@@ -153,7 +158,7 @@ describe('direct TUI extra-usage catalog', () => {
     expect(jsx).toBeUndefined()
     expect(completion).toEqual({
       result:
-        '/output-style has been deprecated. Use /config to change your output style, or set it in your settings file. Changes take effect on the next session.',
+        '/output-style has been deprecated. Change outputStyle in your settings file; changes take effect on the next session.',
       options: { display: 'system' },
     })
   })

@@ -13,6 +13,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use serde_json::{Value, json};
+use unicode_normalization::UnicodeNormalization as _;
 use unicode_width::UnicodeWidthStr as _;
 
 use crate::app_event_loop::PasteProvenance;
@@ -83,6 +84,9 @@ const MAX_STDERR_NOTICES: usize = 64;
 const MAX_OVERLAY_BYTES: usize = 512 * 1024;
 const MAX_BUG_REPORT_DESCRIPTION_BYTES: usize = 8_000;
 pub(crate) const MAX_COMPOSER_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QUESTION_OTHER_TEXT_BYTES: usize = 20_000;
+const MAX_QUESTION_PREVIEW_BYTES: usize = 100_000;
+const MAX_QUESTION_PREVIEW_UTF16_UNITS: usize = 100_000;
 const MAX_COMPOSER_HISTORY_ENTRIES: usize = 200;
 const MAX_COMPOSER_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 const HISTORY_SEARCH_MAX_ITEMS: usize = 100;
@@ -108,8 +112,12 @@ const COLLAPSED_USER_PROMPT_MAX_LINES: usize = 3;
 const USER_PROMPT_FOLD_ESTIMATE_WIDTH: usize = 60;
 const CRABCODE_TUI_SETUP_SUBTYPE: &str = "crabcode_tui_setup";
 const CRABCODE_TUI_SETUP_PROTOCOL_VERSION: u64 = 1;
+const CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE: &str = "crabcode_tui_command_catalog_changed";
+const CRABCODE_TUI_COMMAND_CATALOG_PROTOCOL_VERSION: u64 = 1;
+const MAX_DIRECT_TUI_COMMAND_CATALOG_ENTRIES: usize = 4_096;
 const GROVE_TERMS_SETUP_KIND: &str = "grove_terms";
 const SANDBOX_NETWORK_ACCESS_TOOL_NAME: &str = "SandboxNetworkAccess";
+const ASK_USER_QUESTION_TOOL_NAME: &str = "AskUserQuestion";
 const GOAL_REPORT_TOOL_NAME: &str = "GoalReport";
 const SAFE_TITLE_UTF16_LIMIT: usize = 160;
 const SAFE_LINE_UTF16_LIMIT: usize = 1_024;
@@ -197,6 +205,7 @@ const UNAVAILABLE_LOCAL_COMMAND_TOKENS: &[&str] = &[
     "reset",
     "new",
     "compact",
+    "com",
     "config",
     "settings",
     "copy",
@@ -251,13 +260,30 @@ const UNAVAILABLE_LOCAL_COMMAND_TOKENS: &[&str] = &[
     "hooks",
     "export",
     "sandbox",
-    "logout",
     "passes",
     "tasks",
     "bashes",
     "bridge-kick",
     "version",
     "ultraplan",
+    "office",
+    "rc",
+    "remote-control",
+    "remote-status",
+    // These built-ins are healthy only when the authoritative runtime
+    // advertises them. Keep the renderer's known-command guard closed when a
+    // feature/auth/build gate removes them from the current catalog; normal
+    // runtime first-wins dispatch remains unchanged when they are present.
+    "compact-history",
+    "init",
+    "insights",
+    "local-models",
+    "pr-comments",
+    "proxy",
+    "review",
+    "security-review",
+    "statusline",
+    "vision",
 ];
 
 struct KnownUnavailableLocalCommands;
@@ -280,6 +306,7 @@ impl KnownUnavailableLocalCommands {
         }
     }
 
+    #[cfg(test)]
     fn tokens(&self) -> impl Iterator<Item = &'static str> {
         UNAVAILABLE_LOCAL_COMMAND_TOKENS.iter().copied()
     }
@@ -317,6 +344,7 @@ const FIXED_LOCAL_COMMAND_COMPLETIONS: &[(&str, &str, &str)] = &[
         "[list|add|remove|update]",
     ),
     ("login", "Sign in with your Acosmi account", ""),
+    ("logout", "Sign out of your Acosmi account", ""),
     (
         "mcp",
         "Manage MCP servers",
@@ -349,7 +377,7 @@ fn fixed_local_completion_contains(slash_name: &str) -> bool {
 fn reserved_private_local_command(slash_name: &str) -> bool {
     matches!(
         slash_name.strip_prefix('/').unwrap_or(slash_name),
-        "bug" | "feedback"
+        "bug" | "feedback" | "logout" | "reload-plugins"
     )
 }
 
@@ -371,6 +399,7 @@ fn fixed_local_command_description(
         "plugin" | "plugins" => "发现并管理插件与插件市场",
         "marketplace" => "管理插件市场",
         "login" => "登录 Acosmi 账户",
+        "logout" => "退出 Acosmi 账户",
         "mcp" => "管理 MCP 服务器",
         "context" => "以彩色网格显示当前上下文用量",
         "reload-plugins" => "在当前会话中激活待应用的插件更改",
@@ -451,6 +480,7 @@ enum MouseScrollTarget {
     Transcript,
     SideQuestion,
     BlockViewer,
+    QuestionPreview,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -547,6 +577,7 @@ pub enum OutboundPurpose {
     SetModel,
     LoginStart,
     LoginWait,
+    Logout,
     McpStatus,
     McpStatusForBulkToggle {
         enabled: bool,
@@ -965,6 +996,12 @@ pub struct SlashCommandChoice {
     pub name: String,
     pub description: String,
     pub argument_hint: String,
+    /// Hidden commands retain exact typed dispatch ownership but do not
+    /// participate in completion or Help discovery.
+    pub hidden: bool,
+    /// Authoritative backend classification used by Help's builtin/custom
+    /// partition. This avoids inferring provenance from a stale deny list.
+    pub builtin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1444,8 +1481,90 @@ impl Overlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionChoice {
     AllowOnce,
+    AllowSession,
     AllowAlways,
     Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub preview: Option<String>,
+    pub recommended: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionPrompt {
+    pub id: String,
+    pub question: String,
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+    pub min_selections: usize,
+    pub max_selections: usize,
+}
+
+#[derive(Debug)]
+pub struct QuestionAnswerState {
+    pub selected: Vec<bool>,
+    pub other_selected: bool,
+    pub cursor: usize,
+    pub other_input: Box<TextArea>,
+    pub other_input_state: TextAreaState,
+}
+
+impl QuestionAnswerState {
+    fn new(option_count: usize) -> Self {
+        Self {
+            selected: vec![false; option_count],
+            other_selected: false,
+            cursor: 0,
+            other_input: Box::new(TextArea::new()),
+            other_input_state: TextAreaState::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionFocus {
+    Options,
+    OtherInput,
+    Actions,
+}
+
+#[derive(Debug)]
+pub struct QuestionDialog {
+    pub request_id: String,
+    pub agent_id: Option<String>,
+    /// Original input with deterministic question/option IDs injected. This is
+    /// the base for the `updatedInput` returned over the existing
+    /// `can_use_tool` response protocol.
+    pub normalized_input: Value,
+    pub questions: Vec<QuestionPrompt>,
+    pub answers: Vec<QuestionAnswerState>,
+    pub current: usize,
+    pub focus: QuestionFocus,
+    pub action_index: usize,
+    pub validation_error: Option<String>,
+    pub preview_scroll: usize,
+    pub preview_max_scroll: usize,
+    pub preview_page_rows: usize,
+}
+
+impl QuestionDialog {
+    pub(crate) fn current_question(&self) -> &QuestionPrompt {
+        &self.questions[self.current]
+    }
+
+    pub(crate) fn current_answer(&self) -> &QuestionAnswerState {
+        &self.answers[self.current]
+    }
+
+    pub(crate) fn current_answer_mut(&mut self) -> &mut QuestionAnswerState {
+        &mut self.answers[self.current]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1558,6 +1677,7 @@ pub enum RequestDialog {
         choices: Vec<PermissionChoice>,
         selected: usize,
     },
+    Question(QuestionDialog),
     Elicitation {
         request_id: String,
         server_name: String,
@@ -2265,7 +2385,7 @@ pub struct TuiApp {
     pub(crate) composer_attachment_hitboxes: Vec<(ratatui::layout::Rect, usize)>,
     pub(crate) mermaid_hitboxes: Vec<(ratatui::layout::Rect, MermaidAffordanceAction, Arc<str>)>,
     pub(crate) status_hit_areas: HashMap<&'static str, ratatui::layout::Rect>,
-    pending_dialogs: VecDeque<String>,
+    pending_dialogs: VecDeque<PendingControl>,
     pending_outbound: HashMap<String, OutboundPurpose>,
     pending_private_runtime: HashMap<String, PendingPrivateRuntimeRequest>,
     bug_report_inflight_request_id: Option<String>,
@@ -2314,6 +2434,7 @@ pub struct TuiApp {
     interrupt_pending: bool,
     turn_abort_pending: Option<TurnAbortState>,
     turn_abort_result_pending: bool,
+    turn_interrupt_result_pending: bool,
     stream_requesting: bool,
     turn_status: TurnStatus,
     action_registry: TuiActionRegistry,
@@ -2559,6 +2680,7 @@ impl TuiApp {
             interrupt_pending: false,
             turn_abort_pending: None,
             turn_abort_result_pending: false,
+            turn_interrupt_result_pending: false,
             stream_requesting: false,
             turn_status: TurnStatus::default(),
             action_registry: TuiActionRegistry::for_screen_mode(false),
@@ -4363,7 +4485,7 @@ impl TuiApp {
                 // renderer-owned state before observing the triggering
                 // envelope so its task/artifact state enters the new session
                 // normally.
-                let effect = self.prepare_projection_effect(effect);
+                let (effect, mut transition_actions) = self.prepare_projection_effect(effect);
                 if observes_conversation_context {
                     self.context_usage_is_baseline = false;
                     self.baseline_context_send_users_pending = 0;
@@ -4401,7 +4523,8 @@ impl TuiApp {
                     self.scroll
                         .clamp(self.transcript_line_count, self.transcript_viewport_height);
                 }
-                let mut actions = self.handle_projection_effect(effect);
+                transition_actions.extend(self.handle_projection_effect(effect));
+                let mut actions = transition_actions;
                 if let Some((request_id, result_kind, validation_error, value)) =
                     private_runtime_result
                 {
@@ -5144,6 +5267,10 @@ impl TuiApp {
                             .and_then(Value::as_str)
                             .unwrap_or("<missing>")
                     ));
+                } else if subtype == CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE {
+                    self.fail_closed(format!(
+                        "failed to acknowledge command catalog refresh {request_id}: {error}"
+                    ));
                 } else {
                     self.status = match self.renderer_ui_language {
                         UiLanguage::ZhCn => format!("回复请求 {request_id} 失败：{error}"),
@@ -5167,7 +5294,7 @@ impl TuiApp {
                     ));
                     return;
                 }
-                self.interrupt_pending = false;
+                self.resume_after_interrupt_failure();
                 self.status = match self.renderer_ui_language {
                     UiLanguage::ZhCn => format!("中断失败：{error}"),
                     UiLanguage::EnUs => format!("Interrupt failed: {error}"),
@@ -5374,6 +5501,8 @@ impl TuiApp {
                             .to_string();
                         self.should_quit = true;
                     }
+                } else if subtype == CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE {
+                    self.projection.resolve_pending_control(request_id);
                 } else if dialog_request_id(self.dialog.as_ref()) == Some(request_id.as_str()) {
                     self.finish_dialog();
                 }
@@ -5713,7 +5842,7 @@ impl TuiApp {
         let mut commands = self
             .commands
             .iter()
-            .filter(|command| !reserved_private_local_command(&command.name))
+            .filter(|command| !command.hidden && !reserved_private_local_command(&command.name))
             .cloned()
             .collect::<Vec<_>>();
         commands.extend(
@@ -5728,6 +5857,8 @@ impl TuiApp {
                     description: fixed_local_command_description(ui_language, name, description)
                         .to_string(),
                     argument_hint: (*argument_hint).to_string(),
+                    hidden: false,
+                    builtin: true,
                 }),
         );
         self.completion_commands = commands;
@@ -6474,6 +6605,13 @@ impl TuiApp {
                         matches!(dialog, RequestDialog::SetupInput(_))
                             || matches!(
                                 dialog,
+                                RequestDialog::Question(QuestionDialog {
+                                    focus: QuestionFocus::OtherInput,
+                                    ..
+                                })
+                            )
+                            || matches!(
+                                dialog,
                                 RequestDialog::Elicitation { mode, .. } if mode != "url"
                             )
                     }) =>
@@ -6785,12 +6923,20 @@ impl TuiApp {
         {
             return None;
         }
-        if self
-            .dialog
-            .as_ref()
-            .is_some_and(|dialog| !matches!(dialog, RequestDialog::Permission { .. }))
-        {
-            return None;
+        if let Some(dialog) = self.dialog.as_ref() {
+            if matches!(dialog, RequestDialog::Question(_)) {
+                return self
+                    .last_mouse_position
+                    .filter(|position| {
+                        self.dialog_pointer
+                            .preview_area()
+                            .is_some_and(|area| area.contains((*position).into()))
+                    })
+                    .map(|_| MouseScrollTarget::QuestionPreview);
+            }
+            if !matches!(dialog, RequestDialog::Permission { .. }) {
+                return None;
+            }
         }
         match self.overlay.as_ref().map(|overlay| overlay.kind) {
             Some(OverlayKind::BlockViewer) => Some(MouseScrollTarget::BlockViewer),
@@ -6835,6 +6981,10 @@ impl TuiApp {
                 .as_ref()
                 .filter(|overlay| overlay.kind == OverlayKind::BlockViewer)
                 .and_then(|overlay| overlay.body_viewport_height),
+            MouseScrollTarget::QuestionPreview => self
+                .dialog_pointer
+                .preview_area()
+                .map(|area| area.height.max(1)),
         }
     }
 
@@ -6885,6 +7035,23 @@ impl TuiApp {
                 };
                 overlay.scroll_by(lines)
             }
+            MouseScrollTarget::QuestionPreview => {
+                let Some(RequestDialog::Question(dialog)) = self.dialog.as_mut() else {
+                    return false;
+                };
+                let before = dialog.preview_scroll;
+                dialog.preview_scroll = if lines < 0 {
+                    dialog
+                        .preview_scroll
+                        .saturating_sub(lines.unsigned_abs() as usize)
+                } else {
+                    dialog
+                        .preview_scroll
+                        .saturating_add(lines as usize)
+                        .min(dialog.preview_max_scroll)
+                };
+                before != dialog.preview_scroll
+            }
         }
     }
 
@@ -6928,6 +7095,11 @@ impl TuiApp {
                     ) => {
                         contexts.push(CrabcodeKeybindingContext::Confirmation);
                     }
+                    // AskUserQuestion owns a complete option/input/action
+                    // state machine. Borrowing Confirmation here makes its
+                    // historical `confirm:cycleMode` Shift+Tab binding win
+                    // before the question dialog can process BackTab.
+                    Some(RequestDialog::Question(_)) => {}
                     Some(RequestDialog::Elicitation { mode, .. }) if mode == "url" => {
                         contexts.push(CrabcodeKeybindingContext::Confirmation);
                     }
@@ -8341,6 +8513,23 @@ impl TuiApp {
         Vec::new()
     }
 
+    /// A delivery/control rejection did not cancel the backend turn. Release
+    /// the one-request interrupt latch and move the visual lifecycle out of
+    /// `Cancelling` so the user can retry while the original turn continues.
+    /// If a result already won the race and completed the turn, keep it idle
+    /// instead of manufacturing a replacement request activity.
+    fn resume_after_interrupt_failure(&mut self) {
+        self.interrupt_pending = false;
+        self.turn_interrupt_result_pending = false;
+        if self.turn_status.is_running() {
+            let activity = self
+                .turn_status
+                .activity()
+                .unwrap_or(TurnActivity::Requesting);
+            self.turn_status.set_activity(activity, Instant::now());
+        }
+    }
+
     fn toggle_composer_stash(&mut self) {
         if !self.composer_enabled() {
             return;
@@ -8560,7 +8749,7 @@ impl TuiApp {
 
     fn handle_local_command(&mut self, command: &str) -> Option<Vec<HostAction>> {
         let (name, raw_rest) = command
-            .split_once(char::is_whitespace)
+            .split_once(crate::text_safety::is_ecmascript_whitespace)
             .map_or((command, ""), |(name, rest)| (name, rest));
         let rest = raw_rest.trim();
         if !self.slash_commands_enabled {
@@ -8573,7 +8762,10 @@ impl TuiApp {
         if name == "/model" && rest == "manage" {
             return Some(self.open_model_management(false));
         }
-        if name == "/local-models" && rest.is_empty() {
+        if name == "/local-models"
+            && rest.is_empty()
+            && self.runtime_catalog_contains("/local-models")
+        {
             return Some(self.open_model_management(true));
         }
         // The historical CrabCode registry is first-wins: discovered
@@ -8603,10 +8795,14 @@ impl TuiApp {
             }
             let description = crate::text_safety::trim_ecmascript_whitespace(raw_rest);
             if description.is_empty() {
-                self.status = self
-                    .renderer_ui_language
-                    .text("用法：/bug <问题描述>", "Usage: /bug <issue description>")
-                    .to_string();
+                self.status = match (self.renderer_ui_language, name) {
+                    (UiLanguage::ZhCn, "/feedback") => "用法：/feedback <反馈内容>".to_string(),
+                    (UiLanguage::EnUs, "/feedback") => {
+                        "Usage: /feedback <feedback description>".to_string()
+                    }
+                    (UiLanguage::ZhCn, _) => "用法：/bug <问题描述>".to_string(),
+                    (UiLanguage::EnUs, _) => "Usage: /bug <issue description>".to_string(),
+                };
                 return Some(Vec::new());
             }
             if description.len() > MAX_BUG_REPORT_DESCRIPTION_BYTES {
@@ -8736,7 +8932,11 @@ impl TuiApp {
                     .to_string();
                 Some(Vec::new())
             }
-            "/logout" if !rest.is_empty() => {
+            "/logout" if rest.is_empty() => Some(vec![HostAction::SendControl {
+                request: json!({"subtype": "crabcode_tui_logout"}),
+                purpose: OutboundPurpose::Logout,
+            }]),
+            "/logout" => {
                 self.status = self
                     .renderer_ui_language
                     .text("用法：/logout", "Usage: /logout")
@@ -8913,6 +9113,24 @@ impl TuiApp {
                 return Vec::new();
             }
             dialog.input.insert_str(&text);
+            return Vec::new();
+        }
+        if let Some(RequestDialog::Question(dialog)) = self.dialog.as_mut()
+            && dialog.focus == QuestionFocus::OtherInput
+        {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            let text = sanitize_terminal_text(&normalized);
+            let answer = dialog.current_answer_mut();
+            let truncated = insert_textarea_bounded(
+                &mut answer.other_input,
+                &text,
+                MAX_QUESTION_OTHER_TEXT_BYTES,
+            );
+            if truncated {
+                dialog.validation_error = Some(question_input_limit_message(ui_language));
+            } else {
+                dialog.validation_error = None;
+            }
             return Vec::new();
         }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -9600,17 +9818,55 @@ impl TuiApp {
         inserted
     }
 
-    fn prepare_projection_effect(&mut self, effect: ProjectionEffect) -> ProjectionEffect {
+    fn prepare_projection_effect(
+        &mut self,
+        effect: ProjectionEffect,
+    ) -> (ProjectionEffect, Vec<HostAction>) {
         match effect {
             ProjectionEffect::SessionTransition { effect, .. } => {
-                self.reset_renderer_session_projection_state();
-                *effect
+                let actions = self.reset_renderer_session_projection_state();
+                (*effect, actions)
             }
-            effect => effect,
+            effect => (effect, Vec::new()),
         }
     }
 
-    fn reset_renderer_session_projection_state(&mut self) {
+    fn reset_renderer_session_projection_state(&mut self) -> Vec<HostAction> {
+        let mut terminal_actions = Vec::new();
+        let active_response_already_reserved = self.dialog_response_inflight;
+        if let Some(dialog) = self.dialog.take()
+            && !active_response_already_reserved
+            && let Some(action) = session_changed_dialog_action(&dialog)
+        {
+            terminal_actions.push(action);
+        }
+        while let Some(pending) = self.pending_dialogs.pop_front() {
+            match dialog_from_pending_with_language(&pending, self.renderer_ui_language) {
+                Ok(dialog) => {
+                    if let Some(action) = session_changed_dialog_action(&dialog) {
+                        terminal_actions.push(action);
+                    }
+                }
+                Err(_) if pending.subtype == "can_use_tool" => {
+                    terminal_actions.push(HostAction::RespondPermission {
+                        request_id: pending.request_id,
+                        response: json!({
+                            "behavior":"deny",
+                            "message":"The session changed before this request could be presented.",
+                            "interrupt":false,
+                            "decisionClassification":"user_reject"
+                        }),
+                    });
+                }
+                Err(_) if pending.subtype == "elicitation" => {
+                    terminal_actions.push(HostAction::RespondElicitation {
+                        request_id: pending.request_id,
+                        response: json!({"action":"cancel"}),
+                    });
+                }
+                Err(_) => {}
+            }
+        }
         self.transcript_line_count = 0;
         self.transcript_following = true;
         self.mouse_scroll = MouseScrollState::default();
@@ -9646,6 +9902,7 @@ impl TuiApp {
         self.interrupt_pending = false;
         self.turn_abort_pending = None;
         self.turn_abort_result_pending = false;
+        self.turn_interrupt_result_pending = false;
         self.pending_extra_usage_output = false;
         self.live_context_usage = None;
         self.context_usage_is_baseline = true;
@@ -9656,21 +9913,21 @@ impl TuiApp {
         self.active_goal = None;
         self.goal_tasks.clear();
         self.processed_goal_report_results.clear();
-        self.dialog = None;
         self.dialog_pointer.reset();
-        self.pending_dialogs.clear();
         self.pending_outbound.clear();
         self.dialog_response_inflight = false;
         self.minimal_welcome_pending = true;
         self.synchronize_modal_tree();
+        terminal_actions
     }
 
     fn handle_projection_effect(&mut self, effect: ProjectionEffect) -> Vec<HostAction> {
         match effect {
             ProjectionEffect::None => Vec::new(),
             ProjectionEffect::SessionTransition { effect, .. } => {
-                self.reset_renderer_session_projection_state();
-                self.handle_projection_effect(*effect)
+                let mut actions = self.reset_renderer_session_projection_state();
+                actions.extend(self.handle_projection_effect(*effect));
+                actions
             }
             ProjectionEffect::Initialized {
                 session_id,
@@ -9738,6 +9995,9 @@ impl TuiApp {
                 if pending.subtype == CRABCODE_TUI_SETUP_SUBTYPE {
                     return self.handle_setup_control_opened(pending);
                 }
+                if pending.subtype == CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE {
+                    return self.handle_command_catalog_changed(pending);
+                }
                 if !matches!(pending.subtype.as_str(), "can_use_tool" | "elicitation") {
                     self.fail_closed(format!(
                         "unsupported reverse SDK control `{}`; request {} retained raw",
@@ -9767,7 +10027,7 @@ impl TuiApp {
                         Err(error) => self.fail_closed(error),
                     }
                 } else {
-                    self.pending_dialogs.push_back(pending.request_id);
+                    self.pending_dialogs.push_back(pending);
                 }
                 Vec::new()
             }
@@ -9778,7 +10038,8 @@ impl TuiApp {
                     self.dialog_response_inflight = false;
                     self.open_next_dialog();
                 } else {
-                    self.pending_dialogs.retain(|id| id != &request_id);
+                    self.pending_dialogs
+                        .retain(|pending| pending.request_id != request_id);
                 }
                 self.status = match self.renderer_ui_language {
                     UiLanguage::ZhCn => format!("运行环境已取消请求 {request_id}"),
@@ -9813,6 +10074,7 @@ impl TuiApp {
                 // result from an already acknowledged abort must not poison
                 // the successor's terminal disposition.
                 self.turn_abort_result_pending = false;
+                self.turn_interrupt_result_pending = false;
                 self.stream_requesting = true;
                 self.turn_status.begin(
                     self.projection.direct_stream_activity().turn_generation,
@@ -9848,6 +10110,15 @@ impl TuiApp {
                     self.turn_abort_result_pending = false;
                     self.stream_requesting = false;
                     self.turn_status.finish(TurnOutcome::Failed);
+                    return Vec::new();
+                }
+                if self.turn_interrupt_result_pending {
+                    self.projection.finish_output_epoch();
+                    self.turn_interrupt_result_pending = false;
+                    self.stream_requesting = false;
+                    // The correlated interrupt acknowledgement already made
+                    // Cancelled terminal. A late success/error result belongs
+                    // to that cancelled turn and cannot overwrite its status.
                     return Vec::new();
                 }
                 let _had_visible_output = self.projection.output_since_last_finish();
@@ -9899,6 +10170,55 @@ impl TuiApp {
                 Vec::new()
             }
         }
+    }
+
+    fn handle_command_catalog_changed(&mut self, pending: PendingControl) -> Vec<HostAction> {
+        if self.setup_lifecycle_phase != SetupLifecyclePhase::Initialized {
+            self.fail_closed(format!(
+                "command catalog refresh {} arrived before the initialized renderer lifecycle",
+                pending.request_id
+            ));
+            return Vec::new();
+        }
+        let commands = match parse_command_catalog_changed_request(&pending.request) {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.fail_closed(format!(
+                    "command catalog refresh {} is incompatible with the CrabCode TUI: {error}",
+                    pending.request_id
+                ));
+                return Vec::new();
+            }
+        };
+
+        // Parse and validate the whole snapshot before replacing any renderer
+        // state. A plugin-discovery race must never leave dispatch, completion,
+        // the open palette, and Help on different catalog generations.
+        self.commands = commands;
+        self.rebuild_completion_commands();
+        self.refresh_command_palette();
+        if let Some(overlay) = self
+            .overlay
+            .as_mut()
+            .filter(|overlay| overlay.kind == OverlayKind::Help)
+        {
+            let active_tab = overlay.window.active_tab;
+            overlay.help_tabs =
+                help_tab_documents(&self.completion_commands, self.renderer_ui_language);
+            overlay.window = ModalWindowState::with_tabs(overlay.help_tabs.len());
+            overlay.window.active_tab = active_tab.min(overlay.help_tabs.len().saturating_sub(1));
+            overlay.scroll = 0;
+            overlay.body_viewport_height = None;
+        }
+
+        vec![HostAction::RespondStartupInteraction {
+            request_id: pending.request_id,
+            subtype: CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE.to_string(),
+            response: json!({
+                "protocol_version": CRABCODE_TUI_COMMAND_CATALOG_PROTOCOL_VERSION,
+                "received": true
+            }),
+        }]
     }
 
     fn handle_setup_control_opened(&mut self, pending: PendingControl) -> Vec<HostAction> {
@@ -10955,6 +11275,9 @@ impl TuiApp {
         if !success && matches!(&purpose, OutboundPurpose::ContextUsageRefresh) {
             return self.complete_live_context_usage_refresh();
         }
+        if !success && matches!(&purpose, OutboundPurpose::Interrupt) {
+            self.resume_after_interrupt_failure();
+        }
         if !success {
             let Some(error) = payload.get("error").and_then(Value::as_str) else {
                 self.fail_closed(format!(
@@ -11087,6 +11410,7 @@ impl TuiApp {
             OutboundPurpose::Interrupt => {
                 self.interrupt_pending = false;
                 self.stream_requesting = false;
+                self.turn_interrupt_result_pending = true;
                 self.turn_status.finish(TurnOutcome::Cancelled);
                 self.status = self
                     .renderer_ui_language
@@ -11179,19 +11503,56 @@ impl TuiApp {
                         return Vec::new();
                     }
                 };
-                let Some(account) = response.get("account").filter(|value| value.is_object())
-                else {
-                    self.fail_closed(
-                        "CrabCode authentication completion omitted object account".to_string(),
-                    );
-                    return Vec::new();
+                let (account_summary, commands) = match parse_auth_catalog_response(
+                    response,
+                    "CrabCode authentication completion",
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.fail_closed(error);
+                        return Vec::new();
+                    }
                 };
-                self.account_summary = Some(bounded_pretty_json(account));
+                self.account_summary = Some(account_summary);
+                self.commands = commands;
+                self.rebuild_completion_commands();
+                self.refresh_command_palette();
                 self.status = self
                     .renderer_ui_language
                     .text(
                         "CrabCode 后端已完成登录",
                         "Login completed by the CrabCode backend",
+                    )
+                    .to_string();
+                Vec::new()
+            }
+            OutboundPurpose::Logout => {
+                let response = match control_response_body(&payload) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.fail_closed(format!(
+                            "CrabCode logout returned a malformed control_response: {error}"
+                        ));
+                        return Vec::new();
+                    }
+                };
+                let (account_summary, commands) =
+                    match parse_auth_catalog_response(response, "CrabCode logout") {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            self.fail_closed(error);
+                            return Vec::new();
+                        }
+                    };
+                self.account_summary = Some(account_summary);
+                self.commands = commands;
+                self.rebuild_completion_commands();
+                self.refresh_command_palette();
+                self.status = self
+                    .renderer_ui_language
+                    .text(
+                        "已退出 Acosmi 账户；命令目录已刷新",
+                        "Signed out of the Acosmi account; command catalog refreshed",
                     )
                     .to_string();
                 Vec::new()
@@ -11594,6 +11955,9 @@ impl TuiApp {
         ) {
             return self.handle_setup_dialog_key(key);
         }
+        if matches!(self.dialog, Some(RequestDialog::Question(_))) {
+            return self.handle_question_dialog_key(key);
+        }
         let ui_language = self.renderer_ui_language;
         let Some(dialog) = self.dialog.as_mut() else {
             return Vec::new();
@@ -11772,8 +12136,219 @@ impl TuiApp {
                 }
                 _ => Vec::new(),
             },
-            RequestDialog::Setup(_) | RequestDialog::SetupInput(_) => {
+            RequestDialog::Question(_) | RequestDialog::Setup(_) | RequestDialog::SetupInput(_) => {
                 unreachable!("setup dialogs are handled before borrowing the general dialog")
+            }
+        }
+    }
+
+    fn handle_question_dialog_key(&mut self, key: KeyEvent) -> Vec<HostAction> {
+        let language = self.renderer_ui_language;
+        let Some(RequestDialog::Question(dialog)) = self.dialog.as_mut() else {
+            return Vec::new();
+        };
+
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            let request_id = dialog.request_id.clone();
+            let response = question_dialog_response(dialog, "declined");
+            self.dialog_response_inflight = true;
+            return vec![HostAction::RespondPermission {
+                request_id,
+                response,
+            }];
+        }
+
+        match key.code {
+            KeyCode::PageUp => {
+                dialog.preview_scroll = dialog
+                    .preview_scroll
+                    .saturating_sub(dialog.preview_page_rows.max(1));
+                return Vec::new();
+            }
+            KeyCode::PageDown => {
+                dialog.preview_scroll = dialog
+                    .preview_scroll
+                    .saturating_add(dialog.preview_page_rows.max(1))
+                    .min(dialog.preview_max_scroll);
+                return Vec::new();
+            }
+            _ => {}
+        }
+
+        match dialog.focus {
+            QuestionFocus::Options => {
+                let option_count = dialog.current_question().options.len();
+                match key.code {
+                    KeyCode::Up => {
+                        let answer = dialog.current_answer_mut();
+                        answer.cursor = answer.cursor.saturating_sub(1);
+                        dialog.preview_scroll = 0;
+                    }
+                    KeyCode::Down => {
+                        let answer = dialog.current_answer_mut();
+                        answer.cursor = (answer.cursor + 1).min(option_count);
+                        dialog.preview_scroll = 0;
+                    }
+                    KeyCode::Home => {
+                        dialog.current_answer_mut().cursor = 0;
+                        dialog.preview_scroll = 0;
+                    }
+                    KeyCode::End => {
+                        dialog.current_answer_mut().cursor = option_count;
+                        dialog.preview_scroll = 0;
+                    }
+                    KeyCode::Tab => {
+                        if dialog.current_answer().other_selected {
+                            dialog.focus = QuestionFocus::OtherInput;
+                        } else {
+                            dialog.focus = QuestionFocus::Actions;
+                        }
+                    }
+                    KeyCode::BackTab => dialog.focus = QuestionFocus::Actions,
+                    KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                        question_dialog_toggle_current(dialog, false, language);
+                    }
+                    KeyCode::Enter if key.modifiers.is_empty() => {
+                        question_dialog_toggle_current(dialog, true, language);
+                    }
+                    _ => {}
+                }
+            }
+            QuestionFocus::OtherInput => match key.code {
+                KeyCode::Tab => dialog.focus = QuestionFocus::Actions,
+                KeyCode::BackTab => dialog.focus = QuestionFocus::Options,
+                KeyCode::Enter
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    dialog.focus = QuestionFocus::Actions;
+                }
+                KeyCode::Enter => {
+                    let answer = dialog.current_answer_mut();
+                    if insert_textarea_bounded(
+                        &mut answer.other_input,
+                        "\n",
+                        MAX_QUESTION_OTHER_TEXT_BYTES,
+                    ) {
+                        dialog.validation_error = Some(question_input_limit_message(language));
+                    }
+                }
+                _ => {
+                    let answer = dialog.current_answer_mut();
+                    if is_text_input_key(&key)
+                        && let KeyCode::Char(character) = key.code
+                        && answer
+                            .other_input
+                            .text()
+                            .len()
+                            .saturating_add(character.len_utf8())
+                            > MAX_QUESTION_OTHER_TEXT_BYTES
+                    {
+                        dialog.validation_error = Some(question_input_limit_message(language));
+                        return Vec::new();
+                    }
+                    answer.other_input.input(key);
+                    dialog.validation_error = None;
+                }
+            },
+            QuestionFocus::Actions => {
+                let actions = question_dialog_actions(dialog);
+                match key.code {
+                    KeyCode::Left | KeyCode::Up => {
+                        dialog.action_index = dialog.action_index.saturating_sub(1);
+                    }
+                    KeyCode::Right | KeyCode::Down => {
+                        dialog.action_index =
+                            (dialog.action_index + 1).min(actions.len().saturating_sub(1));
+                    }
+                    KeyCode::BackTab if dialog.action_index == 0 => {
+                        dialog.focus = if dialog.current_answer().other_selected {
+                            QuestionFocus::OtherInput
+                        } else {
+                            QuestionFocus::Options
+                        };
+                    }
+                    KeyCode::BackTab => {
+                        dialog.action_index = dialog.action_index.saturating_sub(1);
+                    }
+                    KeyCode::Tab if dialog.action_index + 1 >= actions.len() => {
+                        dialog.focus = QuestionFocus::Options;
+                    }
+                    KeyCode::Tab => dialog.action_index += 1,
+                    KeyCode::Enter | KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                        return self.activate_question_dialog_action();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    fn activate_question_dialog_action(&mut self) -> Vec<HostAction> {
+        let language = self.renderer_ui_language;
+        let Some(RequestDialog::Question(dialog)) = self.dialog.as_mut() else {
+            return Vec::new();
+        };
+        let actions = question_dialog_actions(dialog);
+        let action = actions
+            .get(dialog.action_index)
+            .copied()
+            .unwrap_or(QuestionDialogAction::Decline);
+        match action {
+            QuestionDialogAction::Previous => {
+                dialog.current = dialog.current.saturating_sub(1);
+                dialog.focus = QuestionFocus::Options;
+                dialog.action_index = 0;
+                dialog.validation_error = None;
+                dialog.preview_scroll = 0;
+                Vec::new()
+            }
+            QuestionDialogAction::Next => {
+                if let Some(error) =
+                    question_dialog_validation_error(dialog, dialog.current, language)
+                {
+                    dialog.validation_error = Some(error);
+                    return Vec::new();
+                }
+                dialog.current = (dialog.current + 1).min(dialog.questions.len() - 1);
+                dialog.focus = QuestionFocus::Options;
+                dialog.action_index = 0;
+                dialog.validation_error = None;
+                dialog.preview_scroll = 0;
+                Vec::new()
+            }
+            QuestionDialogAction::Submit => {
+                if let Some((index, error)) =
+                    dialog.questions.iter().enumerate().find_map(|(index, _)| {
+                        question_dialog_validation_error(dialog, index, language)
+                            .map(|error| (index, error))
+                    })
+                {
+                    dialog.current = index;
+                    dialog.focus = QuestionFocus::Options;
+                    dialog.action_index = 0;
+                    dialog.validation_error = Some(error);
+                    dialog.preview_scroll = 0;
+                    return Vec::new();
+                }
+                let request_id = dialog.request_id.clone();
+                let response = question_dialog_response(dialog, "submitted");
+                self.dialog_response_inflight = true;
+                vec![HostAction::RespondPermission {
+                    request_id,
+                    response,
+                }]
+            }
+            QuestionDialogAction::Decline => {
+                let request_id = dialog.request_id.clone();
+                let response = question_dialog_response(dialog, "declined");
+                self.dialog_response_inflight = true;
+                vec![HostAction::RespondPermission {
+                    request_id,
+                    response,
+                }]
             }
         }
     }
@@ -12074,6 +12649,19 @@ impl TuiApp {
                                 .take_clipboard()
                                 .is_some_and(|text| crate::tui_clipboard::set_text(&text).is_ok())
                     }
+                    Some(RequestDialog::Question(dialog))
+                        if dialog.focus == QuestionFocus::OtherInput =>
+                    {
+                        let answer = dialog.current_answer_mut();
+                        answer
+                            .other_input
+                            .handle_mouse(mouse, input_area, answer.other_input_state)
+                            == crabcode_ratatui_textarea::MouseAction::SelectionFinished
+                            && answer
+                                .other_input
+                                .take_clipboard()
+                                .is_some_and(|text| crate::tui_clipboard::set_text(&text).is_ok())
+                    }
                     // A masked editor paints grapheme-count placeholders,
                     // not the secret's raw cells. Consume pointer input rather
                     // than guessing a cursor mapping or exposing selection.
@@ -12081,6 +12669,7 @@ impl TuiApp {
                     | Some(RequestDialog::Elicitation { .. })
                     | Some(
                         RequestDialog::Permission { .. }
+                        | RequestDialog::Question(_)
                         | RequestDialog::GroveTerms { .. }
                         | RequestDialog::Setup(_),
                     )
@@ -12106,6 +12695,21 @@ impl TuiApp {
                     Some(RequestDialog::GroveTerms {
                         options, selected, ..
                     }) if index < options.len() => *selected = index,
+                    Some(RequestDialog::Question(dialog)) => {
+                        let option_entry_count = dialog.current_question().options.len() + 1;
+                        if index < option_entry_count {
+                            dialog.current_answer_mut().cursor = index;
+                            dialog.focus = QuestionFocus::Options;
+                            dialog.preview_scroll = 0;
+                        } else {
+                            let action_index = index - option_entry_count;
+                            if action_index >= question_dialog_actions(dialog).len() {
+                                return (Vec::new(), false);
+                            }
+                            dialog.action_index = action_index;
+                            dialog.focus = QuestionFocus::Actions;
+                        }
+                    }
                     Some(
                         RequestDialog::Permission { .. }
                         | RequestDialog::Elicitation { .. }
@@ -12223,10 +12827,14 @@ impl TuiApp {
     }
 
     fn open_next_dialog(&mut self) {
-        while let Some(request_id) = self.pending_dialogs.pop_front() {
-            let Some(pending) = self.projection.pending_control(&request_id).cloned() else {
+        while let Some(pending) = self.pending_dialogs.pop_front() {
+            if self
+                .projection
+                .pending_control(&pending.request_id)
+                .is_none()
+            {
                 continue;
-            };
+            }
             match dialog_from_pending_with_language(&pending, self.renderer_ui_language) {
                 Ok(dialog) => {
                     self.setup_picker.reset();
@@ -13183,6 +13791,7 @@ impl TuiApp {
         self.interrupt_pending = false;
         self.turn_abort_pending = None;
         self.turn_abort_result_pending = false;
+        self.turn_interrupt_result_pending = false;
         self.turn_status.finish(TurnOutcome::RuntimeStopped);
         self.clear_setup_secret();
         self.oauth_browser_prompt = None;
@@ -13202,6 +13811,7 @@ impl TuiApp {
         self.interrupt_pending = false;
         self.turn_abort_pending = None;
         self.turn_abort_result_pending = false;
+        self.turn_interrupt_result_pending = false;
         self.turn_status.finish(TurnOutcome::RuntimeStopped);
         self.clear_setup_secret();
         self.oauth_browser_prompt = None;
@@ -14742,6 +15352,409 @@ fn dialog_from_pending(pending: &PendingControl) -> Result<RequestDialog, String
     dialog_from_pending_with_language(pending, UiLanguage::default())
 }
 
+fn question_object_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    label: &str,
+    maximum_utf16_units: usize,
+) -> Result<String, String> {
+    let value = object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(crate::text_safety::trim_ecmascript_whitespace)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{label} omitted non-empty string `{field}`"))?;
+    let length = value.encode_utf16().count();
+    if length > maximum_utf16_units {
+        return Err(format!(
+            "{label} `{field}` has {length} UTF-16 units; maximum is {maximum_utf16_units}"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn question_header_string(
+    object: &serde_json::Map<String, Value>,
+    label: &str,
+) -> Result<String, String> {
+    let value = object
+        .get("header")
+        .and_then(Value::as_str)
+        .map(crate::text_safety::trim_ecmascript_whitespace)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{label} omitted non-empty string `header`"))?;
+    let length = value.chars().count();
+    if length > 12 {
+        return Err(format!(
+            "{label} `header` has {length} Unicode characters; maximum is 12"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn question_object_allows_only(
+    object: &serde_json::Map<String, Value>,
+    allowed_fields: &[&str],
+    label: &str,
+) -> Result<(), String> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed_fields.contains(&field.as_str()))
+    {
+        return Err(format!("{label} contains unknown field `{field}`"));
+    }
+    Ok(())
+}
+
+fn question_identifier(value: &str, label: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().enumerate().all(|(index, byte)| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => true,
+            b'.' | b'_' | b':' | b'-' => index > 0,
+            _ => false,
+        })
+    {
+        return Err(format!(
+            "{label} has invalid `id`; expected 1..=128 ASCII letters, numbers, dot, underscore, colon, or hyphen, starting with a letter or number"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn question_object_optional_id(
+    object: &serde_json::Map<String, Value>,
+    prefix: &str,
+    semantic_suffix: &str,
+    reserved: &HashSet<String>,
+    used: &HashSet<String>,
+    label: &str,
+) -> Result<String, String> {
+    match object.get("id") {
+        None => {
+            let mut collision = 1;
+            loop {
+                let collision_suffix = if collision == 1 {
+                    String::new()
+                } else {
+                    format!("-{collision}")
+                };
+                let suffix = format!("{semantic_suffix}{collision_suffix}");
+                let prefix_limit = 128usize.saturating_sub(suffix.len());
+                let candidate = format!("{}{}", &prefix[..prefix.len().min(prefix_limit)], suffix);
+                if !reserved.contains(&candidate) && !used.contains(&candidate) {
+                    return Ok(candidate);
+                }
+                collision += 1;
+            }
+        }
+        Some(Value::String(value)) => question_identifier(value, label),
+        Some(_) => Err(format!("{label} has invalid optional `id`")),
+    }
+}
+
+fn question_identity(value: &str) -> String {
+    crate::text_safety::trim_ecmascript_whitespace(value)
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn question_dialog_from_pending(
+    pending: &PendingControl,
+    input: Value,
+    agent_id: Option<String>,
+) -> Result<RequestDialog, String> {
+    let input_object = input
+        .as_object()
+        .ok_or_else(|| "AskUserQuestion input must be an object".to_string())?;
+    question_object_allows_only(
+        input_object,
+        &["questions", "metadata"],
+        "AskUserQuestion input",
+    )?;
+    if let Some(metadata) = input_object.get("metadata") {
+        let metadata = metadata
+            .as_object()
+            .ok_or_else(|| "AskUserQuestion metadata must be an object".to_string())?;
+        question_object_allows_only(metadata, &["source"], "AskUserQuestion metadata")?;
+        if let Some(source) = metadata.get("source") {
+            let source = source
+                .as_str()
+                .ok_or_else(|| "AskUserQuestion metadata `source` must be a string".to_string())?;
+            if source.encode_utf16().count() > 200 {
+                return Err(
+                    "AskUserQuestion metadata `source` exceeds the 200 UTF-16 unit limit"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let raw_questions = input_object
+        .get("questions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "AskUserQuestion input omitted array `questions`".to_string())?;
+    if !(1..=4).contains(&raw_questions.len()) {
+        return Err(format!(
+            "AskUserQuestion has {} questions; expected 1..=4",
+            raw_questions.len()
+        ));
+    }
+
+    let explicit_question_ids = raw_questions
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|question| question.get("id"))
+        .filter_map(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let mut question_ids = HashSet::new();
+    let mut question_texts = HashSet::new();
+    let mut questions = Vec::with_capacity(raw_questions.len());
+    let mut answers = Vec::with_capacity(raw_questions.len());
+    let mut normalized_questions = Vec::with_capacity(raw_questions.len());
+    for (question_index, raw_question) in raw_questions.iter().enumerate() {
+        let label = format!("AskUserQuestion question {}", question_index + 1);
+        let raw_question_object = raw_question
+            .as_object()
+            .ok_or_else(|| format!("{label} must be an object"))?;
+        question_object_allows_only(
+            raw_question_object,
+            &[
+                "id",
+                "question",
+                "header",
+                "options",
+                "multiSelect",
+                "minSelections",
+                "maxSelections",
+            ],
+            &label,
+        )?;
+        let question_id = question_object_optional_id(
+            raw_question_object,
+            "question",
+            &format!("-{}", question_index + 1),
+            &explicit_question_ids,
+            &question_ids,
+            &label,
+        )?;
+        if !question_ids.insert(question_id.clone()) {
+            return Err(format!(
+                "AskUserQuestion repeats question id `{question_id}`"
+            ));
+        }
+        let question = question_object_string(raw_question_object, "question", &label, 10_000)?;
+        if !question_texts.insert(question_identity(&question)) {
+            return Err(format!("{label} repeats an earlier question text"));
+        }
+        let header = question_header_string(raw_question_object, &label)?;
+        let multi_select = match raw_question_object.get("multiSelect") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(format!("{label} has non-boolean `multiSelect`")),
+        };
+        let raw_options = raw_question_object
+            .get("options")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{label} omitted array `options`"))?;
+        if !(2..=4).contains(&raw_options.len()) {
+            return Err(format!(
+                "{label} has {} options; expected 2..=4",
+                raw_options.len()
+            ));
+        }
+
+        let explicit_option_ids = raw_options
+            .iter()
+            .filter_map(Value::as_object)
+            .filter_map(|option| option.get("id"))
+            .filter_map(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let mut option_ids = HashSet::new();
+        let mut option_labels = HashSet::new();
+        let mut options = Vec::with_capacity(raw_options.len());
+        let mut normalized_options = Vec::with_capacity(raw_options.len());
+        for (option_index, raw_option) in raw_options.iter().enumerate() {
+            let option_label = format!("{label} option {}", option_index + 1);
+            let raw_option_object = raw_option
+                .as_object()
+                .ok_or_else(|| format!("{option_label} must be an object"))?;
+            question_object_allows_only(
+                raw_option_object,
+                &["id", "label", "description", "recommended", "preview"],
+                &option_label,
+            )?;
+            let option_id = question_object_optional_id(
+                raw_option_object,
+                &question_id,
+                &format!("-option-{}", option_index + 1),
+                &explicit_option_ids,
+                &option_ids,
+                &option_label,
+            )?;
+            if !option_ids.insert(option_id.clone()) {
+                return Err(format!(
+                    "AskUserQuestion question `{question_id}` repeats option id `{option_id}`"
+                ));
+            }
+            let label = question_object_string(raw_option_object, "label", &option_label, 200)?;
+            if !option_labels.insert(question_identity(&label)) {
+                return Err(format!("{option_label} repeats an earlier option label"));
+            }
+            let description =
+                question_object_string(raw_option_object, "description", &option_label, 10_000)?;
+            let preview = match raw_option_object.get("preview") {
+                None => None,
+                Some(Value::String(value))
+                    if value.encode_utf16().count() <= MAX_QUESTION_PREVIEW_UTF16_UNITS
+                        && value.len() <= MAX_QUESTION_PREVIEW_BYTES =>
+                {
+                    Some(value.clone())
+                }
+                Some(Value::String(_)) => {
+                    return Err(format!(
+                        "{option_label} `preview` exceeds the {MAX_QUESTION_PREVIEW_UTF16_UNITS}-UTF-16-unit/{MAX_QUESTION_PREVIEW_BYTES}-byte renderer limit"
+                    ));
+                }
+                Some(_) => return Err(format!("{option_label} has non-string `preview`")),
+            };
+            if multi_select && preview.is_some() {
+                return Err(format!(
+                    "{option_label} may use `preview` only when multiSelect is false"
+                ));
+            }
+            let recommended = match raw_option_object.get("recommended") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err(format!("{option_label} has non-boolean `recommended`")),
+            };
+            options.push(QuestionOption {
+                id: option_id.clone(),
+                label,
+                description,
+                preview,
+                recommended,
+            });
+            let mut normalized_option = raw_option_object.clone();
+            normalized_option.insert("id".to_string(), Value::String(option_id));
+            normalized_option.insert("recommended".to_string(), Value::Bool(recommended));
+            normalized_options.push(Value::Object(normalized_option));
+        }
+
+        let parse_cardinality = |field: &str| -> Result<Option<usize>, String> {
+            match raw_question_object.get(field) {
+                None => Ok(None),
+                Some(Value::Number(value)) => value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .map(Some)
+                    .ok_or_else(|| format!("{label} has invalid non-negative integer `{field}`")),
+                Some(_) => Err(format!(
+                    "{label} has invalid non-negative integer `{field}`"
+                )),
+            }
+        };
+        let explicit_min = parse_cardinality("minSelections")?;
+        let explicit_max = parse_cardinality("maxSelections")?;
+        if !multi_select && (explicit_min.is_some() || explicit_max.is_some()) {
+            return Err(format!(
+                "{label} may use minSelections/maxSelections only when multiSelect is true"
+            ));
+        }
+        let selection_capacity = options.len() + 1;
+        let min_selections = if multi_select {
+            explicit_min.unwrap_or(1)
+        } else {
+            1
+        };
+        let max_selections = if multi_select {
+            explicit_max.unwrap_or(selection_capacity)
+        } else {
+            1
+        };
+        if min_selections > max_selections || max_selections > selection_capacity {
+            return Err(format!(
+                "{label} requires 0 <= minSelections <= maxSelections <= {selection_capacity}"
+            ));
+        }
+
+        answers.push(QuestionAnswerState::new(options.len()));
+        questions.push(QuestionPrompt {
+            id: question_id.clone(),
+            question,
+            header,
+            options,
+            multi_select,
+            min_selections,
+            max_selections,
+        });
+        let mut normalized_question = raw_question_object.clone();
+        normalized_question.insert("id".to_string(), Value::String(question_id));
+        normalized_question.insert("options".to_string(), Value::Array(normalized_options));
+        normalized_question.insert("multiSelect".to_string(), Value::Bool(multi_select));
+        if multi_select {
+            normalized_question.insert("minSelections".to_string(), json!(min_selections));
+            normalized_question.insert("maxSelections".to_string(), json!(max_selections));
+        }
+        normalized_questions.push(Value::Object(normalized_question));
+    }
+
+    let mut normalized_input = input_object.clone();
+    normalized_input.insert("questions".to_string(), Value::Array(normalized_questions));
+    Ok(RequestDialog::Question(QuestionDialog {
+        request_id: pending.request_id.clone(),
+        agent_id,
+        normalized_input: Value::Object(normalized_input),
+        questions,
+        answers,
+        current: 0,
+        focus: QuestionFocus::Options,
+        action_index: 0,
+        validation_error: None,
+        preview_scroll: 0,
+        preview_max_scroll: 0,
+        preview_page_rows: 1,
+    }))
+}
+
+fn permission_input_targets_protected_settings(input: &Value) -> bool {
+    ["file_path", "path"]
+        .into_iter()
+        .filter_map(|field| input.get(field).and_then(Value::as_str))
+        .map(|path| path.replace('\\', "/").to_ascii_lowercase())
+        .any(|path| {
+            path.ends_with("/.crabcode/settings.json")
+                || path.ends_with("/.crabcode/settings.local.json")
+        })
+}
+
+fn permission_suggestion_choice(suggestions: &Value) -> Option<PermissionChoice> {
+    let mut has_session_update = false;
+    let mut has_persistent_update = false;
+    for suggestion in suggestions.as_array()? {
+        match suggestion.get("destination").and_then(Value::as_str) {
+            Some("session") => has_session_update = true,
+            Some("userSettings" | "projectSettings" | "localSettings") => {
+                has_persistent_update = true;
+            }
+            // `cliArg` is not writable by the permission prompt. Unknown or
+            // malformed suggestions also must not advertise a broader scope.
+            Some("cliArg") | Some(_) | None => {}
+        }
+    }
+    if has_persistent_update {
+        Some(PermissionChoice::AllowAlways)
+    } else if has_session_update {
+        Some(PermissionChoice::AllowSession)
+    } else {
+        None
+    }
+}
+
 fn dialog_from_pending_with_language(
     pending: &PendingControl,
     language: UiLanguage,
@@ -14757,17 +15770,20 @@ fn dialog_from_pending_with_language(
             let tool_name =
                 required_control_request_string(&pending.request, "can_use_tool", "tool_name")?;
             required_control_request_string(&pending.request, "can_use_tool", "tool_use_id")?;
-            for field in ["blocked_path", "decision_reason", "title", "agent_id"] {
+            for field in [
+                "blocked_path",
+                "decision_reason",
+                "decision_reason_code",
+                "title",
+            ] {
                 optional_control_request_string(&pending.request, "can_use_tool", field)?;
             }
+            let agent_id =
+                optional_control_request_string(&pending.request, "can_use_tool", "agent_id")?;
             let display_name =
                 optional_control_request_string(&pending.request, "can_use_tool", "display_name")?;
             let description =
-                optional_control_request_string(&pending.request, "can_use_tool", "description")?
-                    .unwrap_or_else(|| match language {
-                        UiLanguage::ZhCn => format!("{tool_name} 需要权限"),
-                        UiLanguage::EnUs => format!("{tool_name} requires permission"),
-                    });
+                optional_control_request_string(&pending.request, "can_use_tool", "description")?;
             let suggestions = match pending.request.get("permission_suggestions") {
                 None => None,
                 Some(Value::Array(_)) => Some(pending.request["permission_suggestions"].clone()),
@@ -14777,13 +15793,31 @@ fn dialog_from_pending_with_language(
                     );
                 }
             };
+            if tool_name == ASK_USER_QUESTION_TOOL_NAME {
+                return question_dialog_from_pending(pending, input, agent_id);
+            }
+            let mut description = description.unwrap_or_else(|| match language {
+                UiLanguage::ZhCn => format!("{tool_name} 需要权限"),
+                UiLanguage::EnUs => format!("{tool_name} requires permission"),
+            });
+            let safety_exception = pending
+                .request
+                .get("decision_reason_code")
+                .and_then(Value::as_str)
+                == Some("safety_check")
+                || permission_input_targets_protected_settings(&input);
+            if safety_exception {
+                description = match language {
+                    UiLanguage::ZhCn => format!("安全保护例外：{description}"),
+                    UiLanguage::EnUs => format!("Safety protection exception: {description}"),
+                };
+            }
             let mut choices = vec![PermissionChoice::AllowOnce];
-            if suggestions
-                .as_ref()
-                .and_then(Value::as_array)
-                .is_some_and(|suggestions| !suggestions.is_empty())
+            if !safety_exception
+                && let Some(suggestion_choice) =
+                    suggestions.as_ref().and_then(permission_suggestion_choice)
             {
-                choices.push(PermissionChoice::AllowAlways);
+                choices.push(suggestion_choice);
             }
             choices.push(PermissionChoice::Deny);
             Ok(RequestDialog::Permission {
@@ -14930,6 +15964,7 @@ fn dialog_from_pending_with_language(
 fn dialog_request_id(dialog: Option<&RequestDialog>) -> Option<&str> {
     match dialog? {
         RequestDialog::Permission { request_id, .. }
+        | RequestDialog::Question(QuestionDialog { request_id, .. })
         | RequestDialog::Elicitation { request_id, .. }
         | RequestDialog::GroveTerms { request_id, .. } => Some(request_id),
         RequestDialog::Setup(dialog) => Some(&dialog.request_id),
@@ -14987,11 +16022,15 @@ fn permission_response(
             "updatedInput": input,
             "decisionClassification": "user_temporary"
         }),
-        PermissionChoice::AllowAlways => {
+        PermissionChoice::AllowSession | PermissionChoice::AllowAlways => {
             let mut response = json!({
                 "behavior": "allow",
                 "updatedInput": input,
-                "decisionClassification": "user_permanent"
+                "decisionClassification": if choice == PermissionChoice::AllowAlways {
+                    "user_permanent"
+                } else {
+                    "user_temporary"
+                }
             });
             if let Some(suggestions) = suggestions {
                 response["updatedPermissions"] = suggestions.clone();
@@ -15004,6 +16043,264 @@ fn permission_response(
             "interrupt": false,
             "decisionClassification": "user_reject"
         }),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuestionDialogAction {
+    Previous,
+    Next,
+    Submit,
+    Decline,
+}
+
+pub(crate) fn question_dialog_actions(dialog: &QuestionDialog) -> Vec<QuestionDialogAction> {
+    let mut actions = Vec::with_capacity(3);
+    if dialog.current > 0 {
+        actions.push(QuestionDialogAction::Previous);
+    }
+    if dialog.current + 1 < dialog.questions.len() {
+        actions.push(QuestionDialogAction::Next);
+    } else {
+        actions.push(QuestionDialogAction::Submit);
+    }
+    actions.push(QuestionDialogAction::Decline);
+    actions
+}
+
+fn question_custom_text(answer: &QuestionAnswerState) -> Option<String> {
+    answer.other_selected.then(|| {
+        crate::text_safety::trim_ecmascript_whitespace(answer.other_input.text()).to_string()
+    })
+}
+
+fn question_answer_selection_count(answer: &QuestionAnswerState) -> usize {
+    answer.selected.iter().filter(|selected| **selected).count()
+        + usize::from(answer.other_selected)
+}
+
+fn question_dialog_updated_input(dialog: &QuestionDialog, status: &str) -> Value {
+    let submitted = status == "submitted";
+    let mut legacy_answers = serde_json::Map::new();
+    let mut answer_ids = serde_json::Map::new();
+    let mut structured_answers = Vec::new();
+    if submitted {
+        for (question, answer) in dialog.questions.iter().zip(&dialog.answers) {
+            let selected_options = question
+                .options
+                .iter()
+                .zip(&answer.selected)
+                .filter(|(_, selected)| **selected)
+                .map(|(option, _)| option)
+                .collect::<Vec<_>>();
+            let selected_option_ids = selected_options
+                .iter()
+                .map(|option| Value::String(option.id.clone()))
+                .collect::<Vec<_>>();
+            let custom_text = question_custom_text(answer).filter(|text| !text.is_empty());
+
+            let mut legacy_values = selected_options
+                .iter()
+                .map(|option| option.label.clone())
+                .collect::<Vec<_>>();
+            if let Some(custom_text) = custom_text.as_ref() {
+                legacy_values.push(custom_text.clone());
+            }
+            legacy_answers.insert(
+                question.question.clone(),
+                Value::String(legacy_values.join(", ")),
+            );
+            answer_ids.insert(
+                question.id.clone(),
+                Value::Array(selected_option_ids.clone()),
+            );
+            let mut structured_answer = serde_json::Map::new();
+            structured_answer.insert("questionId".to_string(), Value::String(question.id.clone()));
+            structured_answer.insert(
+                "selectedOptionIds".to_string(),
+                Value::Array(selected_option_ids),
+            );
+            if let Some(custom_text) = custom_text {
+                structured_answer.insert("customText".to_string(), Value::String(custom_text));
+            }
+            structured_answers.push(Value::Object(structured_answer));
+        }
+    }
+
+    let mut updated_input = dialog
+        .normalized_input
+        .as_object()
+        .cloned()
+        .expect("QuestionDialog normalized input is always an object");
+    updated_input.insert("status".to_string(), Value::String(status.to_string()));
+    updated_input.insert("answers".to_string(), Value::Object(legacy_answers));
+    updated_input.insert("answer_ids".to_string(), Value::Object(answer_ids));
+    updated_input.insert(
+        "response".to_string(),
+        json!({
+            "status": status,
+            "answers": structured_answers,
+        }),
+    );
+    Value::Object(updated_input)
+}
+
+fn question_dialog_response(dialog: &QuestionDialog, status: &str) -> Value {
+    json!({
+        "behavior": "allow",
+        "updatedInput": question_dialog_updated_input(dialog, status),
+        "decisionClassification": "user_temporary"
+    })
+}
+
+fn question_dialog_cancelled_response(dialog: &QuestionDialog) -> Value {
+    let mut updated_input = question_dialog_updated_input(dialog, "cancelled");
+    updated_input["response"]["reason"] = Value::String("session_changed".to_string());
+    json!({
+        "behavior":"allow",
+        "updatedInput":updated_input,
+        "decisionClassification":"user_temporary"
+    })
+}
+
+fn session_changed_dialog_action(dialog: &RequestDialog) -> Option<HostAction> {
+    match dialog {
+        RequestDialog::Question(dialog) => Some(HostAction::RespondPermission {
+            request_id: dialog.request_id.clone(),
+            response: question_dialog_cancelled_response(dialog),
+        }),
+        RequestDialog::Permission { request_id, .. } => Some(HostAction::RespondPermission {
+            request_id: request_id.clone(),
+            response: json!({
+                "behavior":"deny",
+                "message":"The session changed before this permission request was resolved.",
+                "interrupt":false,
+                "decisionClassification":"user_reject"
+            }),
+        }),
+        RequestDialog::Elicitation { request_id, .. } => Some(HostAction::RespondElicitation {
+            request_id: request_id.clone(),
+            response: json!({"action":"cancel"}),
+        }),
+        RequestDialog::GroveTerms { .. }
+        | RequestDialog::Setup(_)
+        | RequestDialog::SetupInput(_) => None,
+    }
+}
+
+fn question_dialog_toggle_current(
+    dialog: &mut QuestionDialog,
+    advance_focus: bool,
+    language: UiLanguage,
+) {
+    let multi_select = dialog.current_question().multi_select;
+    let max_selections = dialog.current_question().max_selections;
+    let option_count = dialog.current_question().options.len();
+    let answer = dialog.current_answer_mut();
+    if answer.cursor == option_count {
+        if multi_select {
+            if !answer.other_selected && question_answer_selection_count(answer) >= max_selections {
+                dialog.validation_error =
+                    Some(question_max_selections_message(language, max_selections));
+                return;
+            }
+            answer.other_selected = !answer.other_selected;
+        } else {
+            answer.selected.fill(false);
+            answer.other_selected = true;
+        }
+        if answer.other_selected && advance_focus {
+            dialog.focus = QuestionFocus::OtherInput;
+        }
+    } else if multi_select {
+        if answer
+            .selected
+            .get(answer.cursor)
+            .is_some_and(|selected| !*selected)
+            && question_answer_selection_count(answer) >= max_selections
+        {
+            dialog.validation_error =
+                Some(question_max_selections_message(language, max_selections));
+            return;
+        }
+        if let Some(selected) = answer.selected.get_mut(answer.cursor) {
+            *selected = !*selected;
+        }
+    } else {
+        answer.selected.fill(false);
+        if let Some(selected) = answer.selected.get_mut(answer.cursor) {
+            *selected = true;
+        }
+        answer.other_selected = false;
+        if advance_focus {
+            dialog.focus = QuestionFocus::Actions;
+        }
+    }
+    dialog.action_index = 0;
+    dialog.validation_error = None;
+    dialog.preview_scroll = 0;
+}
+
+fn question_dialog_validation_error(
+    dialog: &QuestionDialog,
+    index: usize,
+    language: UiLanguage,
+) -> Option<String> {
+    let question = dialog.questions.get(index)?;
+    let answer = dialog.answers.get(index)?;
+    if answer.other_selected
+        && question_custom_text(answer).is_some_and(|custom_text| custom_text.is_empty())
+    {
+        return Some(match language {
+            UiLanguage::ZhCn => format!("“{}”的其他答案不能为空。", question.header),
+            UiLanguage::EnUs => {
+                format!(
+                    "The Other answer for “{}” cannot be empty.",
+                    question.header
+                )
+            }
+        });
+    }
+    let selection_count = question_answer_selection_count(answer);
+    if selection_count < question.min_selections {
+        return Some(match language {
+            UiLanguage::ZhCn => format!(
+                "“{}”至少需选择 {} 项。",
+                question.header, question.min_selections
+            ),
+            UiLanguage::EnUs => format!(
+                "“{}” requires at least {} selection(s).",
+                question.header, question.min_selections
+            ),
+        });
+    }
+    (selection_count > question.max_selections).then(|| match language {
+        UiLanguage::ZhCn => format!(
+            "“{}”最多可选择 {} 项。",
+            question.header, question.max_selections
+        ),
+        UiLanguage::EnUs => format!(
+            "“{}” allows at most {} selection(s).",
+            question.header, question.max_selections
+        ),
+    })
+}
+
+fn question_max_selections_message(language: UiLanguage, maximum: usize) -> String {
+    match language {
+        UiLanguage::ZhCn => format!("最多可选择 {maximum} 项。"),
+        UiLanguage::EnUs => format!("Select at most {maximum} item(s)."),
+    }
+}
+
+fn question_input_limit_message(language: UiLanguage) -> String {
+    match language {
+        UiLanguage::ZhCn => {
+            format!("其他答案已达 {MAX_QUESTION_OTHER_TEXT_BYTES} 字节上限。")
+        }
+        UiLanguage::EnUs => {
+            format!("Other answer reached the {MAX_QUESTION_OTHER_TEXT_BYTES}-byte limit.")
+        }
     }
 }
 
@@ -15355,6 +16652,127 @@ fn parse_required_commands(
     parse_command_entries(commands, response_name)
 }
 
+fn parse_command_catalog_changed_request(
+    request: &Value,
+) -> Result<Vec<SlashCommandChoice>, String> {
+    let request = request
+        .as_object()
+        .ok_or_else(|| "catalog refresh request must be an object".to_string())?;
+    let required = ["subtype", "protocol_version", "commands"];
+    if !required.iter().all(|field| request.contains_key(*field))
+        || request
+            .keys()
+            .any(|field| !required.contains(&field.as_str()))
+    {
+        return Err("catalog refresh request has unknown or missing fields".to_string());
+    }
+    if request.get("subtype").and_then(Value::as_str)
+        != Some(CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE)
+        || request.get("protocol_version").and_then(Value::as_u64)
+            != Some(CRABCODE_TUI_COMMAND_CATALOG_PROTOCOL_VERSION)
+    {
+        return Err("catalog refresh request binding mismatch".to_string());
+    }
+    let entries = request
+        .get("commands")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "catalog refresh `commands` must be an array".to_string())?;
+    if entries.len() > MAX_DIRECT_TUI_COMMAND_CATALOG_ENTRIES {
+        return Err(format!(
+            "catalog refresh `commands` exceeded {MAX_DIRECT_TUI_COMMAND_CATALOG_ENTRIES} entries"
+        ));
+    }
+
+    let mut names = HashSet::with_capacity(entries.len());
+    let mut commands = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| format!("catalog refresh `commands[{index}]` must be an object"))?;
+        let required = ["name", "description", "argumentHint"];
+        let optional = ["hidden", "builtin"];
+        if !required.iter().all(|field| entry.contains_key(*field))
+            || entry.keys().any(|field| {
+                !required.contains(&field.as_str()) && !optional.contains(&field.as_str())
+            })
+        {
+            return Err(format!(
+                "catalog refresh `commands[{index}]` has unknown or missing fields"
+            ));
+        }
+        let string = |field: &str, maximum: usize| -> Result<String, String> {
+            let value = entry.get(field).and_then(Value::as_str).ok_or_else(|| {
+                format!("catalog refresh `commands[{index}].{field}` must be a string")
+            })?;
+            let length = value.encode_utf16().count();
+            if length > maximum {
+                return Err(format!(
+                    "catalog refresh `commands[{index}].{field}` has {length} UTF-16 units; maximum is {maximum}"
+                ));
+            }
+            Ok(value.to_string())
+        };
+        let name = string("name", 512)?;
+        if !command_catalog_invocation_name_roundtrips(&name) {
+            return Err(format!(
+                "catalog refresh `commands[{index}].name` must be one exact invocation token"
+            ));
+        }
+        if !names.insert(name.clone()) {
+            return Err(format!(
+                "catalog refresh `commands[{index}].name` duplicates `{name}`"
+            ));
+        }
+        let description = string("description", 16_384)?;
+        let argument_hint = string("argumentHint", 4_096)?;
+        let optional_true = |field: &str| -> Result<bool, String> {
+            match entry.get(field) {
+                None => Ok(false),
+                Some(Value::Bool(true)) => Ok(true),
+                Some(_) => Err(format!(
+                    "catalog refresh `commands[{index}].{field}` must be true when present"
+                )),
+            }
+        };
+        commands.push(SlashCommandChoice {
+            name,
+            description,
+            argument_hint,
+            hidden: optional_true("hidden")?,
+            builtin: optional_true("builtin")?,
+        });
+    }
+    Ok(commands)
+}
+
+fn command_catalog_invocation_name_roundtrips(name: &str) -> bool {
+    let whitespace_free = |value: &str| {
+        !value
+            .chars()
+            .any(crate::text_safety::is_ecmascript_whitespace)
+    };
+    if let Some(prefix) = name.strip_suffix(" (MCP)") {
+        !prefix.is_empty() && whitespace_free(prefix)
+    } else {
+        !name.is_empty() && whitespace_free(name)
+    }
+}
+
+/// Authentication transitions return account identity and the command catalog
+/// as one authority snapshot. Validate both before mutating either renderer
+/// field so a malformed refresh cannot leave auth and discovery out of sync.
+fn parse_auth_catalog_response(
+    response: &Value,
+    response_name: &str,
+) -> Result<(String, Vec<SlashCommandChoice>), String> {
+    let account = response
+        .get("account")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| format!("{response_name} omitted object account"))?;
+    let commands = parse_required_commands(response, response_name)?;
+    Ok((bounded_pretty_json(account), commands))
+}
+
 /// The direct control response does not expose the fixed historical
 /// `hook_count`, `lsp_count`, or plugin-only command/MCP counts. Project only
 /// exact array cardinalities already present on the existing response and
@@ -15408,10 +16826,10 @@ fn reload_plugins_safe_count_summary(
     if error_count > 0 {
         match ui_language {
             UiLanguage::ZhCn => summary.push_str(&format!(
-                "\n加载期间发生 {error_count} 个错误。运行 /doctor 查看详情。"
+                "\n加载期间发生 {error_count} 个错误。请查看插件加载诊断后重试。"
             )),
             UiLanguage::EnUs => summary.push_str(&format!(
-                "\n{error_count} error{} during load. Run /doctor for details.",
+                "\n{error_count} error{} during load. Review the plugin load diagnostics and retry.",
                 if error_count == 1 { "" } else { "s" }
             )),
         }
@@ -15438,6 +16856,13 @@ fn parse_command_entries(
                     format!("{response_name} `commands[{index}].{field}` must be a string")
                 })
             };
+            let optional_boolean = |field: &str| match command.get(field) {
+                None => Ok(false),
+                Some(Value::Bool(value)) => Ok(*value),
+                Some(_) => Err(format!(
+                    "{response_name} `commands[{index}].{field}` must be a boolean"
+                )),
+            };
             let name = required_string("name")?;
             // The public SDK shape historically permits any string, but an
             // empty/whitespace token cannot be invoked by CrabCode's existing
@@ -15450,6 +16875,8 @@ fn parse_command_entries(
                 name: name.to_string(),
                 description: required_string("description")?.to_string(),
                 argument_hint: required_string("argumentHint")?.to_string(),
+                hidden: optional_boolean("hidden")?,
+                builtin: optional_boolean("builtin")?,
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -15867,7 +17294,8 @@ fn help_text(commands: &[SlashCommandChoice], ui_language: UiLanguage) -> String
              J/K 跳到下一条/上一条回复 · PageUp/PageDown 滚动\n\
              g 到顶部 · G 跟随最新内容 · Tab 返回输入区\n\n\
              本地 TUI 命令\n\
-             /help /quit /exit /model [id] /login\n\
+             /help /quit /exit /find [text] /model [id] /color <color|default> /rename [name]\n\
+             /login /logout\n\
              /bug <问题描述> · /feedback <反馈内容>\n\
              /usage · /plugin|/plugins [subcommand] · /marketplace [list|add|remove|update]\n\
              /mcp [enable|disable [server-name]] | /mcp reconnect <server-name> | /context\n\
@@ -15888,7 +17316,8 @@ fn help_text(commands: &[SlashCommandChoice], ui_language: UiLanguage) -> String
              J/K next/previous response · PageUp/PageDown scroll\n\
              g top · G follow live · Tab returns to composer\n\n\
              Local TUI commands\n\
-             /help /quit /exit /model [id] /login\n\
+             /help /quit /exit /find [text] /model [id] /color <color|default> /rename [name]\n\
+             /login /logout\n\
              /bug <description> · /feedback <description>\n\
              /usage · /plugin|/plugins [subcommand] · /marketplace [list|add|remove|update]\n\
              /mcp [enable|disable [server-name]] | /mcp reconnect <server-name> | /context\n\
@@ -15914,7 +17343,7 @@ fn help_tab_documents(
         if !seen.insert(command.name.as_str()) {
             continue;
         }
-        if fixed_historical_builtin_command(&command.name) {
+        if command.builtin {
             builtins.push(command);
         } else {
             custom.push(command);
@@ -15960,13 +17389,6 @@ fn help_tab_documents(
     ]
 }
 
-fn fixed_historical_builtin_command(name: &str) -> bool {
-    fixed_local_completion_contains(name)
-        || KNOWN_UNAVAILABLE_LOCAL_COMMANDS
-            .tokens()
-            .any(|fixed| fixed == name)
-}
-
 fn format_help_command_tab(
     title: &str,
     commands: &[&SlashCommandChoice],
@@ -16006,6 +17428,7 @@ fn purpose_label(purpose: &OutboundPurpose) -> &str {
         OutboundPurpose::SetModel => "Set model",
         OutboundPurpose::LoginStart => "Start login",
         OutboundPurpose::LoginWait => "Complete login",
+        OutboundPurpose::Logout => "Logout",
         OutboundPurpose::McpStatus => "MCP status",
         OutboundPurpose::McpStatusForBulkToggle { .. } => "MCP bulk-toggle status",
         OutboundPurpose::McpStatusRefresh => "MCP status refresh",
@@ -16029,16 +17452,20 @@ pub(crate) fn localized_permission_mode_label(
     match (ui_language, mode) {
         (UiLanguage::ZhCn, Some("default")) => "标准审批",
         (UiLanguage::ZhCn, Some("acceptEdits")) => "自动接受编辑",
-        (UiLanguage::ZhCn, Some("bypassPermissions")) => "跳过所有审批",
+        (UiLanguage::ZhCn, Some("bypassPermissions")) => "常规操作自动批准（敏感操作仍确认）",
         (UiLanguage::ZhCn, Some("plan")) => "只规划",
         (UiLanguage::ZhCn, Some("dontAsk")) => "仅执行已批准",
+        (UiLanguage::ZhCn, Some("auto")) => "自动模式",
         (UiLanguage::ZhCn, Some(_)) => "自定义",
         (UiLanguage::ZhCn, None) => "未知",
         (UiLanguage::EnUs, Some("default")) => "standard",
         (UiLanguage::EnUs, Some("acceptEdits")) => "accept edits",
-        (UiLanguage::EnUs, Some("bypassPermissions")) => "skip all approvals",
+        (UiLanguage::EnUs, Some("bypassPermissions")) => {
+            "routine actions auto-approved (sensitive actions still confirm)"
+        }
         (UiLanguage::EnUs, Some("plan")) => "plan only",
         (UiLanguage::EnUs, Some("dontAsk")) => "approved only",
+        (UiLanguage::EnUs, Some("auto")) => "auto",
         (UiLanguage::EnUs, Some(_)) => "custom",
         (UiLanguage::EnUs, None) => "unknown",
     }
@@ -16056,6 +17483,7 @@ fn localized_purpose_label(purpose: &OutboundPurpose, ui_language: UiLanguage) -
         OutboundPurpose::SetModel => "切换模型",
         OutboundPurpose::LoginStart => "开始登录",
         OutboundPurpose::LoginWait => "完成登录",
+        OutboundPurpose::Logout => "退出登录",
         OutboundPurpose::McpStatus => "MCP 状态",
         OutboundPurpose::McpStatusForBulkToggle { .. } => "MCP 批量切换状态",
         OutboundPurpose::McpStatusRefresh => "刷新 MCP 状态",
@@ -16099,7 +17527,8 @@ pub fn permission_choice_labels(dialog: &RequestDialog) -> Vec<&'static str> {
         .iter()
         .map(|choice| match choice {
             PermissionChoice::AllowOnce => "Allow once",
-            PermissionChoice::AllowAlways => "Always allow",
+            PermissionChoice::AllowSession => "Allow by rule for session",
+            PermissionChoice::AllowAlways => "Save rule and allow",
             PermissionChoice::Deny => "Deny",
         })
         .collect()
@@ -16569,6 +17998,596 @@ mod tests {
         })
     }
 
+    fn question_pending(input: Value) -> PendingControl {
+        PendingControl {
+            request_id: "question-request-1".to_string(),
+            subtype: "can_use_tool".to_string(),
+            request: json!({
+                "subtype":"can_use_tool",
+                "tool_name":ASK_USER_QUESTION_TOOL_NAME,
+                "tool_use_id":"question-tool-1",
+                "agent_id":"worker-a",
+                "input":input
+            }),
+            raw_sequence: 1,
+        }
+    }
+
+    fn basic_question_input() -> Value {
+        json!({
+            "questions":[{
+                "question":"Which deployment?",
+                "header":"Deploy",
+                "options":[
+                    {
+                        "label":"Staging",
+                        "description":"Deploy to staging",
+                        "recommended":true,
+                        "preview":"staging preview\nline two"
+                    },
+                    {"label":"Production","description":"Deploy to production"}
+                ],
+                "multiSelect":false
+            }]
+        })
+    }
+
+    fn parsed_question(input: Value) -> RequestDialog {
+        dialog_from_pending_with_language(&question_pending(input), UiLanguage::EnUs)
+            .expect("valid AskUserQuestion dialog")
+    }
+
+    #[test]
+    fn question_parser_allocates_collision_safe_ids_without_preselecting_recommended() {
+        let dialog = parsed_question(json!({
+            "questions":[
+                {
+                    "question":"First question?",
+                    "header":"First",
+                    "options":[
+                        {"label":"Alpha","description":"First option"},
+                        {
+                            "id":"question-1-2-option-1",
+                            "label":"Beta",
+                            "description":"Second option",
+                            "recommended":true
+                        }
+                    ]
+                },
+                {
+                    "id":"question-1",
+                    "question":"Second question?",
+                    "header":"Second",
+                    "options":[
+                        {"label":"Gamma","description":"Third option"},
+                        {"label":"Delta","description":"Fourth option"}
+                    ]
+                }
+            ]
+        }));
+        let RequestDialog::Question(dialog) = dialog else {
+            panic!("AskUserQuestion must use the specialized question dialog");
+        };
+        assert_eq!(dialog.agent_id.as_deref(), Some("worker-a"));
+        assert_eq!(dialog.questions[0].id, "question-1-2");
+        assert_eq!(dialog.questions[0].options[0].id, "question-1-2-option-1-2");
+        assert_eq!(dialog.questions[1].id, "question-1");
+        assert!(dialog.questions[0].options[1].recommended);
+        assert!(dialog.answers.iter().all(|answer| {
+            !answer.other_selected && answer.selected.iter().all(|selected| !selected)
+        }));
+        assert_eq!(
+            dialog.normalized_input["questions"][0]["id"],
+            "question-1-2"
+        );
+        assert_eq!(
+            dialog.normalized_input["questions"][0]["options"][0]["id"],
+            "question-1-2-option-1-2"
+        );
+        assert_eq!(
+            dialog.normalized_input["questions"][1]["options"][0]["recommended"],
+            false
+        );
+    }
+
+    #[test]
+    fn question_parser_bounds_generated_option_ids_for_maximum_parent_and_collision() {
+        let question_id = "q".repeat(128);
+        let reserved_base = format!("{}-option-1", "q".repeat(119));
+        let generated_after_collision = format!("{}-option-1-2", "q".repeat(117));
+        let dialog = parsed_question(json!({
+            "questions":[{
+                "id":question_id,
+                "question":"Which color?",
+                "header":"Color",
+                "options":[
+                    {"label":"Red","description":"Use red."},
+                    {
+                        "id":reserved_base,
+                        "label":"Blue",
+                        "description":"Use blue."
+                    }
+                ]
+            }]
+        }));
+        let RequestDialog::Question(question_dialog) = &dialog else {
+            panic!("AskUserQuestion must use the specialized question dialog");
+        };
+        assert_eq!(question_dialog.questions[0].id, question_id);
+        assert_eq!(
+            question_dialog.questions[0].options[0].id,
+            generated_after_collision
+        );
+        assert_eq!(question_dialog.questions[0].options[0].id.len(), 128);
+        assert_eq!(question_dialog.questions[0].options[1].id, reserved_base);
+        question_identifier(
+            &question_dialog.questions[0].options[0].id,
+            "generated option",
+        )
+        .expect("generated option remains a valid protocol identifier");
+
+        let mut app = app();
+        app.dialog = Some(dialog);
+        assert!(
+            app.handle_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_empty()
+        );
+        let actions = app.handle_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let [HostAction::RespondPermission { response, .. }] = actions.as_slice() else {
+            panic!("bounded generated ID must remain submittable");
+        };
+        assert_eq!(
+            response["updatedInput"]["response"]["answers"][0]["questionId"],
+            question_id
+        );
+        assert_eq!(
+            response["updatedInput"]["response"]["answers"][0]["selectedOptionIds"],
+            json!([generated_after_collision])
+        );
+    }
+
+    #[test]
+    fn question_parser_normalizes_identity_per_unicode_scalar_and_ecmascript_trim() {
+        let duplicate_labels = [
+            ("ΟΣ", "οσ"),
+            ("İ", "i\u{0307}"),
+            ("\u{10400}", "\u{10428}"),
+            ("\u{feff}\u{00a0}Red\u{2029}", "red"),
+        ];
+
+        for (first, second) in duplicate_labels {
+            let input = json!({"questions":[{
+                "question":"Question?",
+                "header":"Header",
+                "options":[
+                    {"label":first,"description":"First description"},
+                    {"label":second,"description":"Second description"}
+                ]
+            }]});
+            assert!(
+                dialog_from_pending(&question_pending(input)).is_err(),
+                "`{first}` and `{second}` must share the TS/Rust normalized identity"
+            );
+        }
+    }
+
+    #[test]
+    fn question_parser_enforces_identity_and_renderer_resource_bounds() {
+        let invalid_inputs = [
+            json!({
+                "questions":[{
+                    "question":"Question?","header":"Header",
+                    "options":[
+                        {"label":"A","description":"A description"},
+                        {"label":"B","description":"B description"}
+                    ]
+                }],
+                "untrustedResponse":{"status":"submitted"}
+            }),
+            json!({
+                "questions":[{
+                    "question":"Question?","header":"Header",
+                    "options":[
+                        {"label":"A","description":"A description"},
+                        {"label":"B","description":"B description"}
+                    ]
+                }],
+                "metadata":{"source":"test","unknown":true}
+            }),
+            json!({"questions":[{
+                "id":"bad id",
+                "question":"Question?","header":"Header",
+                "options":[
+                    {"label":"A","description":"A description"},
+                    {"label":"B","description":"B description"}
+                ]
+            }]}),
+            json!({"questions":[{
+                "question":"Question?","header":"thirteen chars",
+                "options":[
+                    {"label":"A","description":"A description"},
+                    {"label":"B","description":"B description"}
+                ]
+            }]}),
+            json!({"questions":[{
+                "question":"Question?","header":"Header",
+                "options":[
+                    {"label":"Ａlpha","description":"A description"},
+                    {"label":"alpha","description":"B description"}
+                ]
+            }]}),
+            json!({"questions":[{
+                "question":"Question?","header":"Header",
+                "options":[
+                    {"label":"A","description":"A description","preview":"x".repeat(100_001)},
+                    {"label":"B","description":"B description"}
+                ]
+            }]}),
+            json!({"questions":[{
+                "question":"Question?","header":"Header",
+                "options":[
+                    {"label":"A","description":"A description","preview":"😀".repeat(25_001)},
+                    {"label":"B","description":"B description"}
+                ]
+            }]}),
+            json!({"questions":[{
+                "question":"Question?","header":"Header",
+                "options":[
+                    {"label":"😀".repeat(101),"description":"A description"},
+                    {"label":"B","description":"B description"}
+                ]
+            }]}),
+            json!({"questions":[{
+                "question":"Question?","header":"Header","multiSelect":true,
+                "options":[
+                    {"label":"A","description":"A description","preview":"preview"},
+                    {"label":"B","description":"B description"}
+                ]
+            }]}),
+        ];
+        for input in invalid_inputs {
+            assert!(
+                dialog_from_pending(&question_pending(input)).is_err(),
+                "invalid question input must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn question_single_select_submits_canonical_and_compatibility_answers() {
+        let mut app = app();
+        app.dialog = Some(parsed_question(basic_question_input()));
+
+        assert!(
+            app.handle_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_empty(),
+            "selecting an option moves focus to actions"
+        );
+        let actions = app.handle_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let [
+            HostAction::RespondPermission {
+                request_id,
+                response,
+            },
+        ] = actions.as_slice()
+        else {
+            panic!("question submission must reuse the permission response transport");
+        };
+        assert_eq!(request_id, "question-request-1");
+        assert_eq!(response["behavior"], "allow");
+        assert_eq!(response["decisionClassification"], "user_temporary");
+        let updated = &response["updatedInput"];
+        assert_eq!(updated["status"], "submitted");
+        assert_eq!(updated["response"]["status"], "submitted");
+        assert_eq!(
+            updated["response"]["answers"][0]["questionId"],
+            "question-1"
+        );
+        assert_eq!(
+            updated["response"]["answers"][0]["selectedOptionIds"],
+            json!(["question-1-option-1"])
+        );
+        assert_eq!(
+            updated["answer_ids"]["question-1"],
+            json!(["question-1-option-1"])
+        );
+        assert_eq!(updated["answers"]["Which deployment?"], "Staging");
+    }
+
+    #[test]
+    fn question_dialog_owns_backtab_and_literal_input_without_confirmation_leakage() {
+        let mut app = app();
+        app.dialog = Some(parsed_question(basic_question_input()));
+
+        let contexts = app.active_keybinding_contexts();
+        assert!(contexts.contains(&CrabcodeKeybindingContext::Global));
+        assert!(
+            !contexts.contains(&CrabcodeKeybindingContext::Confirmation),
+            "the specialized question state machine must receive its own BackTab and text keys"
+        );
+
+        assert!(
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::BackTab,
+                KeyModifiers::SHIFT,
+            )))
+            .is_empty()
+        );
+        assert!(matches!(
+            app.dialog.as_ref(),
+            Some(RequestDialog::Question(dialog))
+                if dialog.focus == QuestionFocus::Actions
+        ));
+        assert!(
+            !app.status.contains("confirm:cycleMode"),
+            "Confirmation's historical mode-cycle binding must not consume question navigation"
+        );
+
+        assert!(
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::BackTab,
+                KeyModifiers::SHIFT,
+            )))
+            .is_empty()
+        );
+        let Some(RequestDialog::Question(dialog)) = app.dialog.as_mut() else {
+            panic!("question dialog retained")
+        };
+        assert_eq!(dialog.focus, QuestionFocus::Options);
+        dialog.current_answer_mut().cursor = dialog.current_question().options.len();
+
+        assert!(
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .is_empty()
+        );
+        assert!(
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )))
+            .is_empty()
+        );
+        assert!(matches!(
+            app.dialog.as_ref(),
+            Some(RequestDialog::Question(dialog))
+                if dialog.focus == QuestionFocus::OtherInput
+                    && dialog.current_answer().other_input.text() == "y"
+        ));
+    }
+
+    #[test]
+    fn question_multi_select_enforces_cardinality_and_serializes_other_text() {
+        let mut app = app();
+        app.dialog = Some(parsed_question(json!({
+            "questions":[{
+                "question":"Choose targets",
+                "header":"Targets",
+                "multiSelect":true,
+                "minSelections":2,
+                "maxSelections":2,
+                "options":[
+                    {"label":"Linux","description":"Linux target"},
+                    {"label":"macOS","description":"macOS target"}
+                ]
+            }]
+        })));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(app.handle_dialog_key(key(KeyCode::Char(' '))).is_empty());
+        assert!(app.handle_dialog_key(key(KeyCode::Down)).is_empty());
+        assert!(app.handle_dialog_key(key(KeyCode::Char(' '))).is_empty());
+        assert!(app.handle_dialog_key(key(KeyCode::Down)).is_empty());
+        assert!(app.handle_dialog_key(key(KeyCode::Char(' '))).is_empty());
+        let RequestDialog::Question(dialog) = app.dialog.as_ref().expect("question retained")
+        else {
+            panic!("question dialog expected");
+        };
+        assert!(!dialog.current_answer().other_selected);
+        assert!(
+            dialog.validation_error.is_some(),
+            "third selection is blocked"
+        );
+
+        assert!(app.handle_dialog_key(key(KeyCode::Up)).is_empty());
+        assert!(app.handle_dialog_key(key(KeyCode::Char(' '))).is_empty());
+        assert!(app.handle_dialog_key(key(KeyCode::Down)).is_empty());
+        assert!(app.handle_dialog_key(key(KeyCode::Enter)).is_empty());
+        let RequestDialog::Question(dialog) = app.dialog.as_mut().expect("question retained")
+        else {
+            panic!("question dialog expected");
+        };
+        assert_eq!(dialog.focus, QuestionFocus::OtherInput);
+        dialog
+            .current_answer_mut()
+            .other_input
+            .insert_str("Windows");
+        assert!(app.handle_dialog_key(key(KeyCode::Tab)).is_empty());
+        let actions = app.handle_dialog_key(key(KeyCode::Enter));
+        let [HostAction::RespondPermission { response, .. }] = actions.as_slice() else {
+            panic!("valid multi-select response expected");
+        };
+        let answer = &response["updatedInput"]["response"]["answers"][0];
+        assert_eq!(answer["selectedOptionIds"], json!(["question-1-option-1"]));
+        assert_eq!(answer["customText"], "Windows");
+        assert_eq!(
+            response["updatedInput"]["answers"]["Choose targets"],
+            "Linux, Windows"
+        );
+    }
+
+    #[test]
+    fn question_zero_minimum_allows_explicit_empty_structured_answer() {
+        let mut app = app();
+        app.dialog = Some(parsed_question(json!({
+            "questions":[{
+                "question":"Optional targets",
+                "header":"Targets",
+                "multiSelect":true,
+                "minSelections":0,
+                "maxSelections":0,
+                "options":[
+                    {"label":"Linux","description":"Linux target"},
+                    {"label":"macOS","description":"macOS target"}
+                ]
+            }]
+        })));
+        assert!(
+            app.handle_dialog_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                .is_empty()
+        );
+        let actions = app.handle_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let [HostAction::RespondPermission { response, .. }] = actions.as_slice() else {
+            panic!("minSelections=0 must permit an explicit empty answer");
+        };
+        assert_eq!(
+            response["updatedInput"]["response"]["answers"][0]["selectedOptionIds"],
+            json!([])
+        );
+        assert_eq!(
+            response["updatedInput"]["response"]["answers"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn question_other_paste_is_utf8_safe_and_bounded_to_twenty_kilobytes() {
+        let mut app = app();
+        app.dialog = Some(parsed_question(basic_question_input()));
+        let RequestDialog::Question(dialog) = app.dialog.as_mut().expect("question") else {
+            panic!("question dialog expected");
+        };
+        let other_index = dialog.current_question().options.len();
+        dialog.current_answer_mut().cursor = other_index;
+        question_dialog_toggle_current(dialog, true, UiLanguage::EnUs);
+        assert_eq!(dialog.focus, QuestionFocus::OtherInput);
+
+        assert!(app.handle_paste("é".repeat(10_001)).is_empty());
+        let RequestDialog::Question(dialog) = app.dialog.as_ref().expect("question") else {
+            panic!("question dialog expected");
+        };
+        assert_eq!(dialog.current_answer().other_input.text().len(), 20_000);
+        assert!(
+            dialog
+                .current_answer()
+                .other_input
+                .text()
+                .is_char_boundary(20_000)
+        );
+        assert!(
+            dialog
+                .validation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("20000-byte"))
+        );
+    }
+
+    #[test]
+    fn question_escape_declines_with_empty_canonical_and_compatibility_answers() {
+        let mut app = app();
+        app.dialog = Some(parsed_question(basic_question_input()));
+        let actions = app.handle_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let [HostAction::RespondPermission { response, .. }] = actions.as_slice() else {
+            panic!("Esc must emit a deterministic declined terminal response");
+        };
+        assert_eq!(response["behavior"], "allow");
+        assert_eq!(response["updatedInput"]["status"], "declined");
+        assert_eq!(response["updatedInput"]["response"]["status"], "declined");
+        assert_eq!(response["updatedInput"]["response"]["answers"], json!([]));
+        assert_eq!(response["updatedInput"]["answers"], json!({}));
+        assert_eq!(response["updatedInput"]["answer_ids"], json!({}));
+    }
+
+    #[test]
+    fn session_projection_reset_terminally_resolves_active_and_queued_reverse_controls() {
+        let mut app = app();
+        app.dialog = Some(parsed_question(basic_question_input()));
+        app.pending_dialogs.push_back(PendingControl {
+            request_id: "queued-permission".to_string(),
+            subtype: "can_use_tool".to_string(),
+            request: json!({
+                "subtype":"can_use_tool",
+                "tool_name":"Write",
+                "tool_use_id":"queued-write",
+                "input":{"file_path":"notes.md"}
+            }),
+            raw_sequence: 2,
+        });
+        let mut queued_question = question_pending(basic_question_input());
+        queued_question.request_id = "queued-question".to_string();
+        app.pending_dialogs.push_back(queued_question);
+        app.pending_dialogs.push_back(PendingControl {
+            request_id: "queued-elicitation".to_string(),
+            subtype: "elicitation".to_string(),
+            request: json!({
+                "subtype":"elicitation",
+                "mcp_server_name":"server",
+                "message":"Choose",
+                "requested_schema":{}
+            }),
+            raw_sequence: 3,
+        });
+
+        let actions = app.reset_renderer_session_projection_state();
+        assert_eq!(actions.len(), 4);
+        assert!(matches!(
+            &actions[0],
+            HostAction::RespondPermission { request_id, response }
+                if request_id == "question-request-1"
+                    && response["behavior"] == "allow"
+                    && response["updatedInput"]["status"] == "cancelled"
+                    && response["updatedInput"]["response"]["status"] == "cancelled"
+                    && response["updatedInput"]["response"]["reason"] == "session_changed"
+                    && response["updatedInput"]["response"]["answers"] == json!([])
+        ));
+        assert!(matches!(
+            &actions[1],
+            HostAction::RespondPermission { request_id, response }
+                if request_id == "queued-permission"
+                    && response["behavior"] == "deny"
+                    && response["decisionClassification"] == "user_reject"
+        ));
+        assert!(matches!(
+            &actions[2],
+            HostAction::RespondPermission { request_id, response }
+                if request_id == "queued-question"
+                    && response["behavior"] == "allow"
+                    && response["updatedInput"]["response"]["status"] == "cancelled"
+        ));
+        assert!(matches!(
+            &actions[3],
+            HostAction::RespondElicitation { request_id, response }
+                if request_id == "queued-elicitation" && response["action"] == "cancel"
+        ));
+        assert!(app.dialog.is_none());
+        assert!(app.pending_dialogs.is_empty());
+        assert!(!app.dialog_response_inflight());
+    }
+
+    #[test]
+    fn session_projection_reset_does_not_duplicate_a_reserved_dialog_response() {
+        let mut app = app();
+        app.dialog = Some(parsed_question(basic_question_input()));
+        let reserved = app.handle_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            reserved.as_slice(),
+            [HostAction::RespondPermission { request_id, .. }]
+                if request_id == "question-request-1"
+        ));
+        assert!(app.dialog_response_inflight());
+
+        let duplicate = app.reset_renderer_session_projection_state();
+        assert!(
+            duplicate.is_empty(),
+            "the dispatcher already owns the reserved terminal response"
+        );
+        assert!(app.dialog.is_none());
+        assert!(!app.dialog_response_inflight());
+    }
+
     #[test]
     fn unexpected_child_exit_does_not_overwrite_the_preceding_protocol_fatal() {
         let mut app = app();
@@ -16776,6 +18795,83 @@ mod tests {
                 content: Value::String("second turn".to_string()),
                 priority: None,
             }]
+        );
+    }
+
+    #[test]
+    fn ordinary_interrupt_ack_and_failure_have_terminal_and_retry_safe_lifecycles() {
+        let mut acknowledged = app();
+        start_request_activity(&mut acknowledged);
+        acknowledged.interrupt_pending = true;
+        acknowledged.turn_status.cancel(Instant::now());
+        assert!(
+            acknowledged
+                .apply_control_response(
+                    OutboundPurpose::Interrupt,
+                    true,
+                    json!({"response":{}}),
+                    1,
+                )
+                .is_empty()
+        );
+        assert!(!acknowledged.interrupt_pending);
+        assert!(acknowledged.turn_interrupt_result_pending);
+        assert_eq!(acknowledged.status, "Interrupt acknowledged");
+
+        assert!(
+            acknowledged
+                .handle_projection_effect(ProjectionEffect::TurnCompleted {
+                    subtype: "success".to_string(),
+                    is_error: false,
+                    raw_sequence: 2,
+                })
+                .is_empty()
+        );
+        assert!(!acknowledged.turn_interrupt_result_pending);
+        assert_eq!(
+            acknowledged.status, "Interrupt acknowledged",
+            "the cancelled turn's late result cannot overwrite its terminal presentation"
+        );
+
+        let mut rejected = app();
+        start_request_activity(&mut rejected);
+        rejected.interrupt_pending = true;
+        rejected.turn_status.cancel(Instant::now());
+        assert!(
+            rejected
+                .apply_control_response(
+                    OutboundPurpose::Interrupt,
+                    false,
+                    json!({"error":"runtime refused interrupt"}),
+                    3,
+                )
+                .is_empty()
+        );
+        assert!(!rejected.interrupt_pending);
+        assert!(!rejected.turn_interrupt_result_pending);
+        assert_eq!(
+            rejected.turn_status.state(),
+            crate::turn_lifecycle::AgentState::TurnRunning,
+            "a rejected interrupt leaves the original turn live and retryable"
+        );
+        assert_eq!(
+            rejected.cancel_active_turn(),
+            vec![HostAction::Interrupt],
+            "the interrupt latch must be released after a correlated rejection"
+        );
+
+        let mut delivery_failed = app();
+        start_request_activity(&mut delivery_failed);
+        let action = delivery_failed.cancel_active_turn().remove(0);
+        delivery_failed.action_failed(&action, "writer queue closed");
+        assert!(!delivery_failed.interrupt_pending);
+        assert_eq!(
+            delivery_failed.turn_status.state(),
+            crate::turn_lifecycle::AgentState::TurnRunning
+        );
+        assert_eq!(
+            delivery_failed.cancel_active_turn(),
+            vec![HostAction::Interrupt]
         );
     }
 
@@ -18334,6 +20430,129 @@ mod tests {
     }
 
     #[test]
+    fn permission_suggestion_scope_controls_choices_labels_and_classification() {
+        let pending = |request_id: &str, destination: &str| PendingControl {
+            request_id: request_id.to_string(),
+            subtype: "can_use_tool".to_string(),
+            request: json!({
+                "subtype":"can_use_tool",
+                "tool_name":"Write",
+                "tool_use_id":format!("tool-{request_id}"),
+                "input":{"file_path":"notes.md"},
+                "permission_suggestions":[{
+                    "type":"addRules",
+                    "rules":[{"toolName":"Write"}],
+                    "behavior":"allow",
+                    "destination":destination
+                }]
+            }),
+            raw_sequence: 1,
+        };
+
+        let session =
+            dialog_from_pending_with_language(&pending("session", "session"), UiLanguage::EnUs)
+                .expect("session suggestion");
+        assert_eq!(
+            permission_choice_labels(&session),
+            vec!["Allow once", "Allow by rule for session", "Deny"]
+        );
+        let RequestDialog::Permission {
+            input, suggestions, ..
+        } = &session
+        else {
+            panic!("permission dialog expected");
+        };
+        assert_eq!(
+            permission_response(PermissionChoice::AllowSession, input, suggestions)["decisionClassification"],
+            "user_temporary"
+        );
+
+        let persistent = dialog_from_pending_with_language(
+            &pending("persistent", "projectSettings"),
+            UiLanguage::EnUs,
+        )
+        .expect("persistent suggestion");
+        assert_eq!(
+            permission_choice_labels(&persistent),
+            vec!["Allow once", "Save rule and allow", "Deny"]
+        );
+        let RequestDialog::Permission {
+            input, suggestions, ..
+        } = &persistent
+        else {
+            panic!("permission dialog expected");
+        };
+        assert_eq!(
+            permission_response(PermissionChoice::AllowAlways, input, suggestions)["decisionClassification"],
+            "user_permanent"
+        );
+
+        let unwritable =
+            dialog_from_pending_with_language(&pending("unwritable", "cliArg"), UiLanguage::EnUs)
+                .expect("cliArg suggestion remains one-shot only");
+        assert_eq!(
+            permission_choice_labels(&unwritable),
+            vec!["Allow once", "Deny"]
+        );
+    }
+
+    #[test]
+    fn safety_check_and_protected_settings_never_offer_scoped_allow() {
+        let pending = |request_id: &str, input: Value, safety_check: bool| {
+            let mut request = json!({
+                "subtype":"can_use_tool",
+                "tool_name":"Write",
+                "tool_use_id":format!("tool-{request_id}"),
+                "input":input,
+                "description":"Write configuration",
+                "permission_suggestions":[{
+                    "type":"addRules",
+                    "rules":[{"toolName":"Write"}],
+                    "behavior":"allow",
+                    "destination":"userSettings"
+                }]
+            });
+            if safety_check {
+                request["decision_reason_code"] = Value::String("safety_check".to_string());
+            }
+            PendingControl {
+                request_id: request_id.to_string(),
+                subtype: "can_use_tool".to_string(),
+                request,
+                raw_sequence: 1,
+            }
+        };
+
+        for pending in [
+            pending("safety", json!({"file_path":"ordinary.md"}), true),
+            pending(
+                "settings",
+                json!({"file_path":"/workspace/.crabcode/settings.json"}),
+                false,
+            ),
+        ] {
+            let RequestDialog::Permission {
+                choices,
+                description,
+                ..
+            } = dialog_from_pending_with_language(&pending, UiLanguage::EnUs)
+                .expect("protected permission request")
+            else {
+                panic!("permission dialog expected");
+            };
+            assert_eq!(
+                choices,
+                vec![PermissionChoice::AllowOnce, PermissionChoice::Deny]
+            );
+            assert!(
+                description
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Safety protection exception"))
+            );
+        }
+    }
+
+    #[test]
     fn configured_direct_renderer_emits_the_existing_initialize_exactly_once() {
         let workspace = tempfile::tempdir().expect("workspace");
         let canonical = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
@@ -18423,10 +20642,52 @@ mod tests {
     fn context_usage_response_opens_product_visualization_and_malformed_roles_stop() {
         let payload = crate::context_visualization::minimal_test_control_response();
         let mut context = app();
+        assert_eq!(
+            context.handle_local_command("/context"),
+            Some(vec![HostAction::SendControl {
+                request: json!({"subtype":"get_context_usage"}),
+                purpose: OutboundPurpose::ContextUsage,
+            }]),
+            "the exact renderer-owned command must enter the existing typed control lane"
+        );
+        context
+            .record_control_request("context-usage-1".to_string(), OutboundPurpose::ContextUsage);
+        let correlated_value = json!({
+            "type":"control_response",
+            "response":{
+                "subtype":"success",
+                "request_id":"context-usage-1",
+                "response":payload["response"].clone()
+            }
+        });
+        let mut correlated = match raw(
+            1,
+            correlated_value.clone(),
+            EnvelopeClass::ControlResponse {
+                request_id: "context-usage-1".to_string(),
+                outcome: "success".to_string(),
+            },
+        ) {
+            RuntimeEvent::Envelope(envelope) => envelope,
+            _ => unreachable!(),
+        };
+        correlated.correlation = Some(RequestCorrelation::OutboundResponseMatched {
+            request_id: "context-usage-1".to_string(),
+            request_subtype: "get_context_usage".to_string(),
+        });
         assert!(
             context
-                .apply_control_response(OutboundPurpose::ContextUsage, true, payload.clone(), 1)
+                .handle_runtime_event(RuntimeEvent::Envelope(correlated))
                 .is_empty()
+        );
+        assert_eq!(
+            context
+                .projection
+                .raw_envelopes()
+                .last()
+                .map(|raw| &raw.value),
+            Some(&correlated_value),
+            "the typed overlay must not replace the lossless correlated response journal"
         );
         let overlay = context.overlay.as_ref().expect("context overlay");
         assert_eq!(overlay.kind, OverlayKind::Context);
@@ -18462,6 +20723,70 @@ mod tests {
         assert!(malformed.fatal.as_deref().is_some_and(|reason| {
             reason.contains("unknown historical theme role `futureColor`")
         }));
+    }
+
+    #[test]
+    fn context_usage_error_is_visible_without_replacing_the_last_good_terminal_state() {
+        let payload = crate::context_visualization::minimal_test_control_response();
+        let mut context_app = app();
+        assert!(
+            context_app
+                .apply_control_response(OutboundPurpose::ContextUsage, true, payload, 1)
+                .is_empty()
+        );
+        let established_overlay = context_app.overlay.clone();
+        let established_usage = context_app.live_context_usage();
+
+        assert!(
+            context_app
+                .apply_control_response(
+                    OutboundPurpose::ContextUsage,
+                    false,
+                    json!({"error":"fixture usage unavailable"}),
+                    2,
+                )
+                .is_empty()
+        );
+        assert_eq!(context_app.overlay, established_overlay);
+        assert_eq!(context_app.live_context_usage(), established_usage);
+        assert!(context_app.fatal.is_none());
+        assert_eq!(
+            context_app.status,
+            "Context usage failed: fixture usage unavailable"
+        );
+
+        context_app.action_failed(
+            &HostAction::SendControl {
+                request: json!({"subtype":"get_context_usage"}),
+                purpose: OutboundPurpose::ContextUsage,
+            },
+            "fixture writer queue closed",
+        );
+        assert_eq!(context_app.overlay, established_overlay);
+        assert_eq!(context_app.live_context_usage(), established_usage);
+        assert!(context_app.fatal.is_none());
+        assert_eq!(
+            context_app.status,
+            "Runtime action failed; composer restored: fixture writer queue closed"
+        );
+
+        let mut fresh = app();
+        assert!(
+            fresh
+                .apply_control_response(
+                    OutboundPurpose::ContextUsage,
+                    false,
+                    json!({"error":"fixture first request failed"}),
+                    3,
+                )
+                .is_empty()
+        );
+        assert!(fresh.overlay.is_none());
+        assert!(fresh.live_context_usage().is_none());
+        assert_eq!(
+            fresh.status,
+            "Context usage failed: fixture first request failed"
+        );
     }
 
     #[test]
@@ -18700,13 +21025,27 @@ mod tests {
         app.apply_control_response(
             OutboundPurpose::LoginWait,
             true,
-            json!({"response": {"account": {"email": "new@example.com"}}}),
+            json!({"response": {
+                "account": {"email": "new@example.com"},
+                "commands": [{
+                    "name":"subscriber-command",
+                    "description":"Available after login",
+                    "argumentHint":"",
+                    "builtin":true
+                }]
+            }}),
             1,
         );
         assert!(
             app.account_summary
                 .as_deref()
                 .is_some_and(|summary| summary.contains("new@example.com"))
+        );
+        assert!(app.runtime_catalog_contains("/subscriber-command"));
+        assert!(
+            app.completion_commands
+                .iter()
+                .any(|command| command.name == "subscriber-command")
         );
 
         // Authentication remains an existing backend control for the fixed
@@ -18727,6 +21066,128 @@ mod tests {
         );
         assert!(app.fatal.is_some());
         assert!(app.take_link_open_request().is_none());
+    }
+
+    #[test]
+    fn logout_response_refreshes_account_and_catalog_without_quitting() {
+        let mut app = app();
+        assert_eq!(
+            app.handle_local_command("/logout"),
+            Some(vec![HostAction::SendControl {
+                request: json!({"subtype":"crabcode_tui_logout"}),
+                purpose: OutboundPurpose::Logout,
+            }])
+        );
+        assert_eq!(app.handle_local_command("/logout now"), Some(Vec::new()));
+        assert_eq!(app.status, "Usage: /logout");
+
+        assert!(
+            app.apply_control_response(
+                OutboundPurpose::Logout,
+                true,
+                json!({"response":{
+                    "account":{"email":null,"subscriptionType":null},
+                    "commands":[{
+                        "name":"public-after-logout",
+                        "description":"Available while signed out",
+                        "argumentHint":"",
+                        "builtin":true
+                    }]
+                }}),
+                1,
+            )
+            .is_empty()
+        );
+        assert!(
+            app.account_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("subscriptionType"))
+        );
+        assert!(app.runtime_catalog_contains("/public-after-logout"));
+        assert!(
+            app.completion_commands
+                .iter()
+                .any(|command| command.name == "public-after-logout")
+        );
+        assert!(!app.should_quit);
+        assert!(app.fatal.is_none());
+        assert!(app.status.contains("catalog refreshed"));
+    }
+
+    #[test]
+    fn logout_degraded_success_atomically_revokes_old_account_and_catalog() {
+        let mut app = app();
+        assert!(
+            app.account_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("u@example.com"))
+        );
+        assert!(app.runtime_catalog_contains("/compact"));
+
+        assert!(
+            app.apply_control_response(
+                OutboundPurpose::Logout,
+                true,
+                json!({"response":{"account":{},"commands":[]}}),
+                1,
+            )
+            .is_empty()
+        );
+
+        assert_eq!(app.account_summary.as_deref(), Some("{}"));
+        assert!(!app.runtime_catalog_contains("/compact"));
+        assert!(app.commands.is_empty());
+        assert!(
+            app.completion_commands
+                .iter()
+                .all(|command| command.name != "compact")
+        );
+        assert!(!app.should_quit);
+        assert!(app.fatal.is_none());
+    }
+
+    #[test]
+    fn logout_uncommitted_error_preserves_old_account_and_catalog() {
+        let mut app = app();
+        let old_account = app.account_summary.clone();
+        let old_commands = app.commands.clone();
+
+        assert!(
+            app.apply_control_response(
+                OutboundPurpose::Logout,
+                false,
+                json!({"error":"credential cleanup did not commit"}),
+                1,
+            )
+            .is_empty()
+        );
+
+        assert_eq!(app.account_summary, old_account);
+        assert_eq!(app.commands, old_commands);
+        assert!(app.runtime_catalog_contains("/compact"));
+        assert!(!app.should_quit);
+        assert!(app.fatal.is_none());
+        assert!(app.status.contains("Logout failed"));
+    }
+
+    #[test]
+    fn logout_malformed_response_fails_closed_without_partial_auth_catalog_update() {
+        let mut app = app();
+        let old_account = app.account_summary.clone();
+        let old_commands = app.commands.clone();
+
+        assert!(
+            app.apply_control_response(
+                OutboundPurpose::Logout,
+                true,
+                json!({"response":{"account":{"email":null}}}),
+                1,
+            )
+            .is_empty()
+        );
+        assert!(app.fatal.is_some());
+        assert_eq!(app.account_summary, old_account);
+        assert_eq!(app.commands, old_commands);
     }
 
     #[test]
@@ -24023,6 +26484,8 @@ mod tests {
                 name: "valid".to_string(),
                 description: "Exact fixed-schema command".to_string(),
                 argument_hint: "<value>".to_string(),
+                hidden: false,
+                builtin: false,
             }]
         );
 
@@ -24061,6 +26524,24 @@ mod tests {
                     "name": 7,
                     "description": "Wrong required-field type",
                     "argumentHint": ""
+                }),
+            ),
+            (
+                "wrong hidden type",
+                json!({
+                    "name": "wrong-hidden",
+                    "description": "Wrong optional metadata type",
+                    "argumentHint": "",
+                    "hidden": "yes"
+                }),
+            ),
+            (
+                "wrong builtin type",
+                json!({
+                    "name": "wrong-builtin",
+                    "description": "Wrong optional metadata type",
+                    "argumentHint": "",
+                    "builtin": 1
                 }),
             ),
         ] {
@@ -24630,11 +27111,15 @@ mod tests {
                     name: "review".to_string(),
                     description: "Review a change".to_string(),
                     argument_hint: "<path>".to_string(),
+                    hidden: false,
+                    builtin: false,
                 },
                 SlashCommandChoice {
                     name: "reload".to_string(),
                     description: "Reload context".to_string(),
                     argument_hint: String::new(),
+                    hidden: false,
+                    builtin: false,
                 }
             ]
         );
@@ -24755,6 +27240,7 @@ mod tests {
             "feedback",
             "help",
             "login",
+            "logout",
             "marketplace",
             "mcp",
             "model",
@@ -24801,7 +27287,27 @@ mod tests {
                 .all(|token| !UNAVAILABLE_LOCAL_COMMAND_TOKENS.contains(token)),
             "implemented and unavailable local command sets must be disjoint"
         );
-        for boundary_token in ["chrome", "desktop", "mobile", "remote", "bridge-kick"] {
+        for boundary_token in [
+            "chrome",
+            "compact-history",
+            "desktop",
+            "init",
+            "insights",
+            "local-models",
+            "mobile",
+            "pr-comments",
+            "proxy",
+            "remote",
+            "bridge-kick",
+            "office",
+            "rc",
+            "remote-control",
+            "remote-status",
+            "review",
+            "security-review",
+            "statusline",
+            "vision",
+        ] {
             assert!(
                 UNAVAILABLE_LOCAL_COMMAND_TOKENS.contains(&boundary_token),
                 "non-TUI boundary token {boundary_token} must fail closed"
@@ -24849,13 +27355,57 @@ mod tests {
         );
         assert_eq!(
             logout_app.handle_local_command("/logout"),
-            None,
-            "logout is available only when the initialize catalog grants the existing backend command authority"
+            Some(vec![HostAction::SendControl {
+                request: json!({"subtype":"crabcode_tui_logout"}),
+                purpose: OutboundPurpose::Logout,
+            }]),
+            "logout remains renderer-owned even if a stale runtime advertises the same name"
         );
         assert_eq!(
             logout_app.handle_local_command("/logout unexpected"),
+            Some(Vec::new()),
+            "renderer-owned logout rejects invented arguments"
+        );
+    }
+
+    #[test]
+    fn compact_short_alias_is_runtime_owned_when_advertised_and_fail_closed_otherwise() {
+        let mut unavailable = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        let actions = unavailable
+            .handle_local_command("/com preserve goals")
+            .expect("known compact alias must be renderer-guarded without runtime authority");
+        assert!(actions.is_empty());
+        assert!(unavailable.status.contains("命令未发送"));
+
+        let mut advertised = TuiApp::new(
+            &json!({"commands":[{
+                "name":"com",
+                "description":"Compact the conversation",
+                "argumentHint":"<instructions>",
+                "builtin":true
+            }]}),
+            InitialSessionRequest::New,
             None,
-            "the fixed historical first-wins router gives one owner the full invocation, including its arguments"
+        );
+        advertised.release_startup_barrier_for_test();
+        advertised.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
+        assert!(advertised.runtime_catalog_contains("/com"));
+        assert!(
+            advertised
+                .completion_commands
+                .iter()
+                .any(|command| command.name == "com")
+        );
+        advertised.composer.set_text("/com preserve goals");
+        advertised
+            .composer
+            .set_cursor(advertised.composer.text().len());
+        assert_eq!(
+            advertised.submit_composer(),
+            vec![HostAction::SendUser {
+                content: Value::String("/com preserve goals".to_string()),
+                priority: None,
+            }]
         );
     }
 
@@ -24900,7 +27450,10 @@ mod tests {
             "/help",
             "/quit",
             "/exit",
+            "/find [text]",
             "/model",
+            "/color <color|default>",
+            "/rename [name]",
             "/bug <description>",
             "/feedback <description>",
             "/usage",
@@ -24908,6 +27461,7 @@ mod tests {
             "/plugins",
             "/marketplace",
             "/login",
+            "/logout",
             "/mcp",
             "/context",
             "/reload-plugins",
@@ -24994,6 +27548,25 @@ mod tests {
         let english_mcp =
             McpSettingsState::from_servers(std::slice::from_ref(&server), UiLanguage::EnUs);
         assert_eq!(english_mcp.server_menu_options(&server)[0].label, "Enable");
+    }
+
+    #[test]
+    fn help_command_success_and_dismissal_are_renderer_local_and_terminal() {
+        for key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ] {
+            let mut app = app();
+            assert_eq!(app.handle_local_command("/help ignored"), Some(Vec::new()));
+            assert!(app.overlay.as_ref().is_some_and(|overlay| {
+                overlay.kind == OverlayKind::Help && !overlay.help_tabs.is_empty()
+            }));
+
+            assert!(app.handle_overlay_key(key).is_empty());
+            assert!(app.overlay.is_none());
+            assert!(!app.should_quit);
+            assert!(app.fatal.is_none());
+        }
     }
 
     #[test]
@@ -25240,7 +27813,7 @@ mod tests {
 
     #[test]
     fn typed_quit_aliases_exit_immediately_without_keybinding_confirmation() {
-        for command in ["/quit", "/exit"] {
+        for command in ["/quit", "/exit", "/quit ignored", "/exit ignored"] {
             let mut app = app();
             app.pending_action_confirmation = Some((TuiActionId::Quit, Instant::now()));
 
@@ -25270,6 +27843,7 @@ mod tests {
                 "plugins" => "/plugins",
                 "marketplace" => "/marketplace",
                 "login" => "/login",
+                "logout" => "/logout",
                 "mcp" => "/mcp",
                 "context" => "/context",
                 "reload-plugins" => "/reload-plugins",
@@ -25294,7 +27868,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_first_wins_for_local_collisions_except_reserved_bug_reporting() {
+    fn runtime_first_wins_for_non_reserved_local_collisions() {
         for (name, _, _) in FIXED_LOCAL_COMMAND_COMPLETIONS {
             if reserved_private_local_command(name) {
                 continue;
@@ -25375,6 +27949,104 @@ mod tests {
             assert!(app.usage_plugin_management.is_some());
             assert!(!app.should_quit);
             assert!(app.fatal.is_none());
+        }
+    }
+
+    #[test]
+    fn plugin_command_aliases_settle_fail_and_cancel_on_their_correlated_panel() {
+        for command in ["/plugin", "/plugins", "/marketplace"] {
+            let mut success = app();
+            let action = success
+                .handle_local_command(command)
+                .expect("renderer plugin panel")
+                .remove(0);
+            let request_id = admit_private_action(&mut success, &action);
+            assert!(
+                success
+                    .handle_private_runtime_result(
+                        Some(request_id.clone()),
+                        Some("plugin_marketplace_inventory_snapshot".to_string()),
+                        None,
+                        &json!({
+                            "result": {
+                                "kind": "plugin_marketplace_inventory_snapshot",
+                                "marketplaces": [],
+                                "empty_reason": "no-marketplaces-configured",
+                                "truncated": false
+                            }
+                        }),
+                    )
+                    .is_empty()
+            );
+            assert!(!success.pending_private_runtime.contains_key(&request_id));
+            assert!(
+                success
+                    .usage_plugin_management
+                    .as_ref()
+                    .is_some_and(|management| !management.is_busy())
+            );
+            assert!(success.fatal.is_none());
+
+            let mut failed = app();
+            let action = failed
+                .handle_local_command(command)
+                .expect("renderer plugin panel")
+                .remove(0);
+            let request_id = admit_private_action(&mut failed, &action);
+            failed.action_failed(&action, "writer-full");
+            assert!(!failed.pending_private_runtime.contains_key(&request_id));
+            assert!(
+                failed
+                    .usage_plugin_management
+                    .as_ref()
+                    .and_then(UsagePluginManagementState::notice)
+                    .is_some_and(|notice| notice.contains("writer-full"))
+            );
+            assert!(failed.fatal.is_none());
+
+            let mut cancelled = app();
+            let action = cancelled
+                .handle_local_command(command)
+                .expect("renderer plugin panel")
+                .remove(0);
+            let request_id = admit_private_action(&mut cancelled, &action);
+            assert!(
+                cancelled
+                    .usage_plugin_management
+                    .as_ref()
+                    .is_some_and(UsagePluginManagementState::is_busy)
+            );
+            assert!(
+                cancelled
+                    .handle_usage_plugin_management_key(KeyEvent::new(
+                        KeyCode::Esc,
+                        KeyModifiers::NONE,
+                    ))
+                    .is_empty()
+            );
+            assert!(cancelled.usage_plugin_management.is_none());
+            assert!(cancelled.pending_private_runtime.contains_key(&request_id));
+            assert!(
+                cancelled
+                    .handle_private_runtime_result(
+                        Some(request_id.clone()),
+                        Some("plugin_marketplace_inventory_snapshot".to_string()),
+                        None,
+                        &json!({
+                            "result": {
+                                "kind": "plugin_marketplace_inventory_snapshot",
+                                "marketplaces": [],
+                                "empty_reason": "no-marketplaces-configured",
+                                "truncated": false
+                            }
+                        }),
+                    )
+                    .is_empty()
+            );
+            assert!(!cancelled.pending_private_runtime.contains_key(&request_id));
+            assert!(cancelled.usage_plugin_management.is_none());
+            assert!(!cancelled.should_quit);
+            assert!(cancelled.fatal.is_none());
         }
     }
 
@@ -25696,11 +28368,15 @@ mod tests {
                 name: "model".to_string(),
                 description: "Switch model".to_string(),
                 argument_hint: "[model]".to_string(),
+                hidden: false,
+                builtin: true,
             },
             SlashCommandChoice {
                 name: "project-workflow".to_string(),
                 description: "Project-local workflow".to_string(),
                 argument_hint: String::new(),
+                hidden: false,
+                builtin: false,
             },
         ];
         app.open_help();
@@ -25734,6 +28410,251 @@ mod tests {
                 .as_ref()
                 .map(|overlay| overlay.window.active_tab),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn catalog_metadata_hides_discovery_without_revoking_typed_dispatch_and_partitions_help() {
+        let mut app = TuiApp::new(
+            &json!({"commands":[
+                {
+                    "name":"hidden-builtin",
+                    "description":"Typed compatibility command",
+                    "argumentHint":"",
+                    "hidden":true,
+                    "builtin":true
+                },
+                {
+                    "name":"visible-builtin",
+                    "description":"Visible built-in command",
+                    "argumentHint":"<value>",
+                    "builtin":true
+                },
+                {
+                    "name":"workspace-command",
+                    "description":"Workspace command",
+                    "argumentHint":""
+                }
+            ]}),
+            InitialSessionRequest::New,
+            None,
+        );
+        app.release_startup_barrier_for_test();
+        app.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
+
+        assert!(app.runtime_catalog_contains("/hidden-builtin"));
+        assert!(
+            !app.completion_commands
+                .iter()
+                .any(|command| command.name == "hidden-builtin")
+        );
+        app.composer.set_text("/hidden-builtin exact");
+        app.composer.set_cursor(app.composer.text().len());
+        assert_eq!(
+            app.submit_composer(),
+            vec![HostAction::SendUser {
+                content: Value::String("/hidden-builtin exact".to_string()),
+                priority: None,
+            }]
+        );
+
+        app.open_help();
+        let help = app.overlay.as_ref().expect("help overlay");
+        assert!(help.help_tabs[1].body.contains("/visible-builtin <value>"));
+        assert!(!help.help_tabs[1].body.contains("hidden-builtin"));
+        assert!(help.help_tabs[2].body.contains("/workspace-command"));
+        assert!(!help.help_tabs[2].body.contains("visible-builtin"));
+    }
+
+    #[test]
+    fn background_catalog_refresh_atomically_updates_dispatch_palette_help_and_ack() {
+        let mut app = TuiApp::new(
+            &json!({"commands":[{
+                "name":"old-command",
+                "description":"Old command",
+                "argumentHint":""
+            }]}),
+            InitialSessionRequest::New,
+            None,
+        );
+        app.release_startup_barrier_for_test();
+        app.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
+        app.composer.set_text("/fresh-command");
+        app.composer.set_cursor(app.composer.text().len());
+        app.refresh_command_palette();
+        assert!(app.command_palette.matches.is_empty());
+        app.open_help();
+        app.overlay.as_mut().expect("help").window.active_tab = 2;
+
+        let request = json!({
+            "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+            "protocol_version":CRABCODE_TUI_COMMAND_CATALOG_PROTOCOL_VERSION,
+            "commands":[
+                {
+                    "name":"fresh-command",
+                    "description":"Fresh built-in",
+                    "argumentHint":"<value>",
+                    "builtin":true
+                },
+                {
+                    "name":"hidden-command",
+                    "description":"Exact dispatch only",
+                    "argumentHint":"",
+                    "hidden":true
+                },
+                {
+                    "name":"mcp:tool (MCP)",
+                    "description":"MCP command",
+                    "argumentHint":""
+                }
+            ]
+        });
+        let actions = app.handle_runtime_event(raw(
+            91,
+            json!({
+                "type":"control_request",
+                "request_id":"catalog-refresh-1",
+                "request":request.clone()
+            }),
+            EnvelopeClass::ControlRequest {
+                request_id: "catalog-refresh-1".to_string(),
+                subtype: CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE.to_string(),
+            },
+        ));
+
+        assert_eq!(
+            actions,
+            vec![HostAction::RespondStartupInteraction {
+                request_id: "catalog-refresh-1".to_string(),
+                subtype: CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE.to_string(),
+                response: json!({"protocol_version":1,"received":true}),
+            }]
+        );
+        assert!(!app.runtime_catalog_contains("/old-command"));
+        assert!(app.runtime_catalog_contains("/fresh-command"));
+        assert!(app.runtime_catalog_contains("/hidden-command"));
+        assert!(app.runtime_catalog_contains("/mcp:tool (MCP)"));
+        assert!(
+            app.completion_commands
+                .iter()
+                .any(|command| command.name == "fresh-command")
+        );
+        assert!(
+            !app.completion_commands
+                .iter()
+                .any(|command| command.name == "hidden-command")
+        );
+        assert!(
+            app.completion_commands
+                .iter()
+                .any(|command| command.name == "mcp:tool (MCP)")
+        );
+        assert_eq!(
+            app.visible_command_suggestions()
+                .next()
+                .map(|(_, command)| command.name.as_str()),
+            Some("fresh-command")
+        );
+        let help = app.overlay.as_ref().expect("open Help was refreshed");
+        assert_eq!(help.window.active_tab, 2, "active Help tab is preserved");
+        assert!(help.help_tabs[1].body.contains("/fresh-command <value>"));
+        assert!(!help.help_tabs[1].body.contains("hidden-command"));
+        assert!(!help.help_tabs[2].body.contains("old-command"));
+        assert!(
+            app.projection
+                .pending_control("catalog-refresh-1")
+                .is_some()
+        );
+
+        app.action_succeeded(&actions[0]);
+        assert!(
+            app.projection
+                .pending_control("catalog-refresh-1")
+                .is_none()
+        );
+        app.overlay = None;
+        app.composer.set_text("/hidden-command exact");
+        app.composer.set_cursor(app.composer.text().len());
+        assert_eq!(
+            app.submit_composer(),
+            vec![HostAction::SendUser {
+                content: Value::String("/hidden-command exact".to_string()),
+                priority: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn catalog_refresh_is_fail_closed_before_initialize_or_on_malformed_snapshot() {
+        let old_commands = json!({"commands":[{
+            "name":"old-command",
+            "description":"Old command",
+            "argumentHint":""
+        }]});
+        let valid_request = json!({
+            "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+            "protocol_version":CRABCODE_TUI_COMMAND_CATALOG_PROTOCOL_VERSION,
+            "commands":[{
+                "name":"fresh-command",
+                "description":"Fresh command",
+                "argumentHint":""
+            }]
+        });
+
+        let mut pre_initialize = TuiApp::new(&old_commands, InitialSessionRequest::New, None);
+        assert!(
+            pre_initialize
+                .handle_projection_effect(ProjectionEffect::ReverseControlOpened(PendingControl {
+                    request_id: "catalog-too-early".to_string(),
+                    subtype: CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE.to_string(),
+                    request: valid_request,
+                    raw_sequence: 1,
+                }))
+                .is_empty()
+        );
+        assert!(pre_initialize.fatal.is_some());
+        assert!(pre_initialize.runtime_catalog_contains("/old-command"));
+        assert!(!pre_initialize.runtime_catalog_contains("/fresh-command"));
+
+        let mut malformed = TuiApp::new(&old_commands, InitialSessionRequest::New, None);
+        malformed.release_startup_barrier_for_test();
+        malformed.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
+        assert!(
+            malformed
+                .handle_projection_effect(ProjectionEffect::ReverseControlOpened(PendingControl {
+                    request_id: "catalog-duplicate".to_string(),
+                    subtype: CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE.to_string(),
+                    request: json!({
+                        "subtype":CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE,
+                        "protocol_version":1,
+                        "commands":[
+                            {"name":"duplicate","description":"","argumentHint":""},
+                            {"name":"duplicate","description":"","argumentHint":""}
+                        ]
+                    }),
+                    raw_sequence: 2,
+                }))
+                .is_empty()
+        );
+        assert!(malformed.fatal.is_some());
+        assert!(malformed.runtime_catalog_contains("/old-command"));
+        assert!(!malformed.runtime_catalog_contains("/duplicate"));
+
+        let mut ack_failed = TuiApp::new(&old_commands, InitialSessionRequest::New, None);
+        ack_failed.action_failed(
+            &HostAction::RespondStartupInteraction {
+                request_id: "catalog-ack-failed".to_string(),
+                subtype: CRABCODE_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE.to_string(),
+                response: json!({"protocol_version":1,"received":true}),
+            },
+            "fixture writer closed",
+        );
+        assert!(
+            ack_failed
+                .fatal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("catalog-ack-failed")),
+            "a refresh whose ACK cannot be delivered must not leave the publisher waiting forever"
         );
     }
 
@@ -26516,7 +29437,7 @@ mod tests {
         let summary = reload_overlay.body.as_str();
         assert_eq!(
             summary,
-            "Reloaded: 1 enabled plugin · 2 available commands · 1 available agent · 1 reported MCP server\n2 errors during load. Run /doctor for details."
+            "Reloaded: 1 enabled plugin · 2 available commands · 1 available agent · 1 reported MCP server\n2 errors during load. Review the plugin load diagnostics and retry."
         );
         assert_eq!(app.status, summary);
         for secret in [
@@ -26585,6 +29506,8 @@ mod tests {
             name: "goal".to_string(),
             description: "Run an acceptance goal".to_string(),
             argument_hint: "<objective>".to_string(),
+            hidden: false,
+            builtin: false,
         });
         app.composer.set_text("/goal ship the renderer");
         app.composer.set_cursor("/goal ship the renderer".len());
@@ -28001,11 +30924,15 @@ mod tests {
                 name: "color".to_string(),
                 description: "runtime color".to_string(),
                 argument_hint: "<runtime>".to_string(),
+                hidden: false,
+                builtin: false,
             },
             SlashCommandChoice {
                 name: "rename".to_string(),
                 description: "runtime rename".to_string(),
                 argument_hint: "<runtime>".to_string(),
+                hidden: false,
+                builtin: false,
             },
         ]);
         collision.rebuild_completion_commands();
@@ -28068,7 +30995,6 @@ mod tests {
     fn renderer_private_local_command_matrix_never_reserves_chat_delivery() {
         for command in [
             "/model manage",
-            "/local-models",
             "/usage",
             "/plugin",
             "/plugins",
@@ -28311,6 +31237,8 @@ mod tests {
             name: "local-models".to_string(),
             description: "Manage local models".to_string(),
             argument_hint: "[subcommand]".to_string(),
+            hidden: false,
+            builtin: true,
         });
         panel_app.rebuild_completion_commands();
 
@@ -28341,6 +31269,8 @@ mod tests {
                 name: "local-models".to_string(),
                 description: "Manage local models".to_string(),
                 argument_hint: "[subcommand]".to_string(),
+                hidden: false,
+                builtin: true,
             });
             app.rebuild_completion_commands();
 
@@ -28696,5 +31626,57 @@ mod tests {
         );
         assert!(app.fatal.is_none());
         assert!(!app.should_quit);
+    }
+
+    /// Single hermetic release-gate entry point for the renderer-owned half of
+    /// the slash-command lifecycle contract.  The called tests execute the
+    /// production parser/dispatchers and correlated response handlers; this is
+    /// deliberately not a source-marker inventory.
+    #[test]
+    fn direct_tui_command_lifecycle_executable_evidence_suite() {
+        local_command_sets_are_unique_disjoint_and_fail_closed();
+        every_retained_non_exit_local_command_keeps_the_tui_alive();
+        local_completion_registry_is_separate_from_runtime_dispatch_ownership();
+        initialize_commands_preserve_metadata_and_leave_execution_to_the_backend_slash_resolver();
+        runtime_first_wins_for_non_reserved_local_collisions();
+        catalog_metadata_hides_discovery_without_revoking_typed_dispatch_and_partitions_help();
+        help_lists_retained_local_command_surfaces();
+        unavailable_local_tokens_fail_closed_without_changing_the_viewport();
+
+        typed_quit_aliases_exit_immediately_without_keybinding_confirmation();
+        find_is_renderer_local_and_minimal_mode_fails_without_dispatch();
+        accepted_transcript_search_navigation_wraps_and_escape_closes();
+        help_command_success_and_dismissal_are_renderer_local_and_terminal();
+        renderer_owned_commands_help_and_mcp_menu_follow_the_closed_locale();
+
+        btw_uses_the_existing_side_question_control_with_runtime_first_wins();
+        side_question_control_response_projects_only_the_existing_response_shape();
+        side_question_input_preserves_historical_dismiss_and_three_row_scroll();
+        context_usage_response_opens_product_visualization_and_malformed_roles_stop();
+        context_usage_error_is_visible_without_replacing_the_last_good_terminal_state();
+        login_and_mcp_auth_use_control_protocol_and_open_only_valid_urls();
+        logout_response_refreshes_account_and_catalog_without_quitting();
+        logout_malformed_response_fails_closed_without_partial_auth_catalog_update();
+        direct_control_commands_emit_only_existing_sdk_shapes();
+        mcp_status_opens_a_native_safe_projection_without_raw_json_or_ide();
+        malformed_mcp_projection_fails_closed_without_partial_state();
+        direct_control_responses_refresh_client_state_without_inventing_backend_state();
+        malformed_initialize_and_reload_command_catalogs_fail_closed_atomically();
+
+        bug_and_feedback_commands_submit_only_the_description_and_report_feedback_id();
+        bug_report_guard_clears_on_error_unconfirmed_and_send_failure();
+        bug_command_rejects_empty_oversized_or_control_text_and_reports_runtime_failure();
+        retained_color_and_rename_commit_only_correlated_authority_results_without_exiting();
+        retained_send_failure_is_retryable_and_uncorrelated_late_result_is_ignored();
+        renderer_private_local_command_matrix_never_reserves_chat_delivery();
+
+        native_usage_and_plugin_panels_are_exact_no_collision_fallbacks();
+        plugin_command_aliases_settle_fail_and_cancel_on_their_correlated_panel();
+        usage_management_applies_only_its_correlated_closed_result();
+        usage_private_failures_are_request_local_and_retryable();
+        busy_usage_management_escape_closes_only_panel_and_consumes_late_result();
+        model_management_selects_authoritative_reference_through_existing_set_model_control();
+        model_private_writer_failure_clears_busy_state_without_closing_or_leaking_payload();
+        busy_model_management_escape_closes_only_panel_and_late_result_is_consumed();
     }
 }

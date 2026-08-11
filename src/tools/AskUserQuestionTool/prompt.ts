@@ -25,7 +25,7 @@ Use the optional \`preview\` field on options when presenting concrete artifacts
 - Formatted code snippets showing different implementations
 - Visual comparisons or diagrams
 
-Preview content must be a self-contained HTML fragment (no <html>/<body> wrapper, no <script> or <style> tags — use inline style attributes instead). Do not use previews for simple preference questions where labels and descriptions suffice. Note: previews are only supported for single-select questions (not multiSelect).
+Preview content must be a self-contained, inert HTML fragment. Do not use document wrappers, scripts, stylesheets, embedded content, forms, event-handler attributes, links, images, remote resources, or URL-bearing CSS. Simple inline styles are allowed. Do not use previews for simple preference questions where labels and descriptions suffice. Note: previews are only supported for single-select questions (not multiSelect).
 `,
 } as const
 
@@ -38,7 +38,8 @@ export const ASK_USER_QUESTION_TOOL_PROMPT = `Use this tool when you need to ask
 Usage notes:
 - Users will always be able to select "Other" to provide custom text input
 - Use multiSelect: true to allow multiple answers to be selected for a question
-- If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label
+- If you recommend a specific option, make it first and set \`recommended: true\`. Keep the visible label clean; recommendation metadata is only a visual hint and the host must never preselect it.
+- For multi-select questions, use \`minSelections\` and \`maxSelections\` when the default range (1 through all listed options plus Other) is not appropriate. Custom Other text counts as one selection.
 
 Plan mode note: In plan mode, use this tool to clarify requirements or choose between approaches BEFORE finalizing your plan. Do NOT use this tool to ask "Is my plan ready?" or "Should I proceed?" - use ${EXIT_PLAN_MODE_TOOL_NAME} for plan approval. IMPORTANT: Do not reference "the plan" in your questions (e.g., "Do you have feedback about the plan?", "Does the plan look good?") because the user cannot see the plan in the UI until you call ${EXIT_PLAN_MODE_TOOL_NAME}. If you need plan approval, use ${EXIT_PLAN_MODE_TOOL_NAME} instead.
 `

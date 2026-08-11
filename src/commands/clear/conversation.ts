@@ -54,6 +54,7 @@ export async function clearConversation({
   getAppState,
   setAppState,
   setConversationId,
+  abortController,
 }: {
   setMessages: (updater: (prev: Message[]) => Message[]) => void
   readFileState: FileStateCache
@@ -62,16 +63,32 @@ export async function clearConversation({
   getAppState?: () => AppState
   setAppState?: (f: (prev: AppState) => AppState) => void
   setConversationId?: (id: UUID) => void
+  abortController: AbortController
 }): Promise<void> {
+  // Cancellation is supported only before the destructive commit point below.
+  // Once messages/caches/session identity start changing, the transaction must
+  // finish so the renderer and persistence layer cannot observe a half-clear.
+  abortController.signal.throwIfAborted()
+
   // Execute SessionEnd hooks before clearing (bounded by
   // CRABCODE_SESSIONEND_HOOKS_TIMEOUT_MS, default 1.5s)
   const sessionEndTimeoutMs = getSessionEndHookTimeoutMs()
+  const sessionEndSignal = AbortSignal.any([
+    abortController.signal,
+    AbortSignal.timeout(sessionEndTimeoutMs),
+  ])
   await executeSessionEndHooks('clear', {
     getAppState,
     setAppState,
-    signal: AbortSignal.timeout(sessionEndTimeoutMs),
+    signal: sessionEndSignal,
     timeoutMs: sessionEndTimeoutMs,
   })
+  abortController.signal.throwIfAborted()
+
+  // Validate and restore the original cwd before the first destructive
+  // mutation. A missing/unreadable project root is therefore a clean failure:
+  // the old messages and session identity remain authoritative.
+  setCwd(getOriginalCwd())
 
   // Signal to inference that this conversation's cache can be evicted.
   const lastRequestId = getLastMainRequestId()
@@ -126,7 +143,6 @@ export async function clearConversation({
   // tracking) is retained so those agents keep functioning.
   clearSessionCaches(preservedAgentIds)
 
-  setCwd(getOriginalCwd())
   readFileState.clear()
   discoveredSkillNames?.clear()
   loadedNestedMemoryPaths?.clear()

@@ -20,6 +20,7 @@ import {
   getCodeEditToolDecisionCounter,
   getStatsStore,
 } from '../../bootstrap/state.js'
+import { assertInteractivePermissionDecisionResolved } from '../../cli/directTuiPermissionBridge.js'
 import {
   buildCodeEditToolAttributes,
   isCodeEditingTool,
@@ -39,6 +40,7 @@ import { FILE_EDIT_TOOL_NAME } from '../../tools/FileEditTool/constants.js'
 import { FILE_READ_TOOL_NAME } from '../../tools/FileReadTool/prompt.js'
 import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
 import { NOTEBOOK_EDIT_TOOL_NAME } from '../../tools/NotebookEditTool/constants.js'
+import { ASK_USER_QUESTION_TOOL_NAME } from '../../tools/AskUserQuestionTool/prompt.js'
 import { POWERSHELL_TOOL_NAME } from '../../tools/PowerShellTool/toolName.js'
 import { parseGitCommitId } from '../../tools/shared/gitOperationTracking.js'
 import { minimalDiffResultForStrippedSubagent } from './subagentDiffPreserve.js'
@@ -680,6 +682,32 @@ export function buildSchemaNotSentHint(
   )
 }
 
+/**
+ * Interactive question payloads are conversation content. They can contain
+ * free-form answers, notes, and previews, so no ordinary or detailed tracing
+ * mode may serialize either their input or result.
+ */
+export function shouldRedactToolTelemetryContent(toolName: string): boolean {
+  return toolName === ASK_USER_QUESTION_TOOL_NAME
+}
+
+/**
+ * Validate a replacement input at the authority boundary that produced it.
+ * Hooks may only produce the model-visible input shape. Only the correlated
+ * permission host may produce host-only fields such as user answers.
+ */
+export function parseToolUpdatedInput(
+  tool: Pick<Tool, 'inputSchema' | 'permissionUpdatedInputSchema'>,
+  candidate: Record<string, unknown>,
+  source: 'hook' | 'permissionHost',
+) {
+  const schema =
+    source === 'permissionHost'
+      ? (tool.permissionUpdatedInputSchema ?? tool.inputSchema)
+      : tool.inputSchema
+  return schema.safeParse(candidate)
+}
+
 async function checkPermissionsAndCallTool(
   tool: Tool,
   toolUseID: string,
@@ -695,6 +723,9 @@ async function checkPermissionsAndCallTool(
     progress: ToolProgress<ToolProgressData> | ProgressMessage<HookProgress>,
   ) => void,
 ): Promise<MessageUpdateLazy[]> {
+  const containsPrivateQuestionContent = shouldRedactToolTelemetryContent(
+    tool.name,
+  )
   // Validate input types with zod (surprisingly, the model is not great at generating valid input)
   const parsedInput = tool.inputSchema.safeParse(input)
   if (!parsedInput.success) {
@@ -740,15 +771,19 @@ async function checkPermissionsAndCallTool(
     }
 
     logForDebugging(
-      `${tool.name} tool input error: ${errorContent.slice(0, 200)}`,
+      containsPrivateQuestionContent
+        ? `${tool.name} tool input error: details redacted`
+        : `${tool.name} tool input error: ${errorContent.slice(0, 200)}`,
     )
     logEvent('tengu_tool_use_error', {
       error:
         'InputValidationError' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-      errorDetails: errorContent.slice(
-        0,
-        2000,
-      ) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      errorDetails: (containsPrivateQuestionContent
+        ? 'Interactive question validation details redacted'
+        : errorContent.slice(
+            0,
+            2000,
+          )) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       messageID:
         messageId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       toolName: sanitizeToolNameForAnalytics(tool.name),
@@ -796,14 +831,17 @@ async function checkPermissionsAndCallTool(
   )
   if (isValidCall?.result === false) {
     logForDebugging(
-      `${tool.name} tool validation error: ${isValidCall.message?.slice(0, 200)}`,
+      containsPrivateQuestionContent
+        ? `${tool.name} tool validation error: details redacted`
+        : `${tool.name} tool validation error: ${isValidCall.message?.slice(0, 200)}`,
     )
     logEvent('tengu_tool_use_error', {
       messageID:
         messageId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       toolName: sanitizeToolNameForAnalytics(tool.name),
-      error:
-        isValidCall.message as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      error: (containsPrivateQuestionContent
+        ? 'ToolValidationError'
+        : isValidCall.message) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       errorCode: isValidCall.errorCode,
       isMcp: tool.isMcp ?? false,
 
@@ -863,6 +901,46 @@ async function checkPermissionsAndCallTool(
   }
 
   const resultingMessages: MessageUpdateLazy[] = []
+  const rejectInvalidUpdatedInput = (
+    errorContent: string,
+    source: 'hook' | 'permission',
+  ): MessageUpdateLazy[] => {
+    logForDebugging(
+      containsPrivateQuestionContent
+        ? `${tool.name} ${source} updatedInput validation error: details redacted`
+        : `${tool.name} ${source} updatedInput validation error: ${errorContent.slice(0, 200)}`,
+      { level: 'error' },
+    )
+    logEvent('tengu_tool_use_error', {
+      error:
+        'UpdatedInputValidationError' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      errorDetails: (containsPrivateQuestionContent
+        ? 'Interactive question updatedInput validation details redacted'
+        : errorContent.slice(
+            0,
+            2000,
+          )) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      messageID:
+        messageId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      toolName: sanitizeToolNameForAnalytics(tool.name),
+      isMcp: tool.isMcp ?? false,
+    })
+    resultingMessages.push({
+      message: createUserMessage({
+        content: [
+          {
+            type: 'tool_result',
+            content: `<tool_use_error>UpdatedInputValidationError: ${errorContent}</tool_use_error>`,
+            is_error: true,
+            tool_use_id: toolUseID,
+          },
+        ],
+        toolUseResult: `UpdatedInputValidationError: ${errorContent}`,
+        sourceToolAssistantUUID: assistantMessage.uuid,
+      }),
+    })
+    return resultingMessages
+  }
 
   // Defense-in-depth: strip _simulatedSedEdit from model-provided Bash input.
   // This field is internal-only — it must only be injected by the permission
@@ -906,6 +984,7 @@ async function checkPermissionsAndCallTool(
   let shouldPreventContinuation = false
   let stopReason: string | undefined
   let hookPermissionResult: PermissionResult | undefined
+  let hookUpdatedInputReceived = false
   const preToolHookInfos: StopHookInfo[] = []
   const preToolHookStart = Date.now()
   await toolUseContext.revalidateSideEffectAuthority?.({
@@ -954,6 +1033,7 @@ async function checkPermissionsAndCallTool(
         // Hook provided updatedInput without making a permission decision (passthrough)
         // Update processedInput so it's used in the normal permission flow
         processedInput = result.updatedInput
+        hookUpdatedInputReceived = true
         break
       case 'preventContinuation':
         shouldPreventContinuation = result.shouldPreventContinuation
@@ -977,6 +1057,54 @@ async function checkPermissionsAndCallTool(
           }),
         })
         return resultingMessages
+    }
+  }
+  if (hookUpdatedInputReceived) {
+    const reparsed = parseToolUpdatedInput(tool, processedInput, 'hook')
+    if (!reparsed.success) {
+      return rejectInvalidUpdatedInput(
+        formatZodValidationError(tool.name, reparsed.error),
+        'hook',
+      )
+    }
+    processedInput = reparsed.data
+  }
+  const hookResultWithUpdatedInput =
+    hookPermissionResult &&
+    'updatedInput' in hookPermissionResult &&
+    hookPermissionResult.updatedInput !== undefined
+      ? hookPermissionResult
+      : undefined
+  if (hookResultWithUpdatedInput) {
+    const reparsed = parseToolUpdatedInput(
+      tool,
+      hookResultWithUpdatedInput.updatedInput!,
+      'hook',
+    )
+    if (!reparsed.success) {
+      return rejectInvalidUpdatedInput(
+        formatZodValidationError(tool.name, reparsed.error),
+        'hook',
+      )
+    }
+    // A PreToolUse hook may adjust a question request, but it cannot stand in
+    // for the user. Remove its allow-side replacement before permission
+    // resolution so requiresUserInteraction still opens the correlated host
+    // dialog. Forged response fields have already failed the model schema.
+    if (
+      containsPrivateQuestionContent &&
+      hookResultWithUpdatedInput.behavior === 'allow'
+    ) {
+      processedInput = reparsed.data
+      hookPermissionResult = {
+        ...hookResultWithUpdatedInput,
+        updatedInput: undefined,
+      }
+    } else {
+      hookPermissionResult = {
+        ...hookResultWithUpdatedInput,
+        updatedInput: reparsed.data,
+      }
     }
   }
   const preToolHookDurationMs = Date.now() - preToolHookStart
@@ -1028,7 +1156,9 @@ async function checkPermissionsAndCallTool(
   startToolSpan(
     tool.name,
     toolAttributes,
-    isBetaTracingEnabled() ? jsonStringify(processedInput) : undefined,
+    isBetaTracingEnabled() && !containsPrivateQuestionContent
+      ? jsonStringify(processedInput)
+      : undefined,
   )
   startToolBlockedOnUserSpan()
 
@@ -1109,6 +1239,18 @@ async function checkPermissionsAndCallTool(
         hookEvent: 'PermissionRequest',
       }),
     })
+  }
+
+  try {
+    assertInteractivePermissionDecisionResolved(permissionDecision)
+  } catch (error) {
+    logForDebugging(
+      'Native TUI permission bridge left an unresolved ask; aborting tool execution',
+      { level: 'error' },
+    )
+    endToolBlockedOnUserSpan('reject', 'permission_bridge_invariant')
+    endToolSpan()
+    throw error
   }
 
   if (permissionDecision.behavior !== 'allow') {
@@ -1254,13 +1396,38 @@ async function checkPermissionsAndCallTool(
   // Use the updated input from permissions if provided
   // (Don't overwrite if undefined - processedInput may have been modified by passthrough hooks)
   if (permissionDecision.updatedInput !== undefined) {
-    processedInput = permissionDecision.updatedInput
+    const updatedInputSource =
+      permissionDecision.decisionReason?.type === 'hook'
+        ? 'hook'
+        : 'permissionHost'
+    const reparsed = parseToolUpdatedInput(
+      tool,
+      permissionDecision.updatedInput,
+      updatedInputSource,
+    )
+    if (!reparsed.success) {
+      endToolBlockedOnUserSpan('reject', 'updated_input_validation')
+      endToolSpan()
+      return rejectInvalidUpdatedInput(
+        formatZodValidationError(tool.name, reparsed.error),
+        permissionDecision.decisionReason?.type === 'hook'
+          ? 'hook'
+          : 'permission',
+      )
+    }
+    processedInput = reparsed.data
   }
 
   // Prepare tool parameters for logging in tool_result event.
   // Gated by OTEL_LOG_TOOL_DETAILS — tool parameters can contain sensitive
   // content (bash commands, MCP server names, etc.) so they're opt-in only.
-  const telemetryToolInput = extractToolInputForTelemetry(processedInput)
+  // User answers, free-text "Other" values, notes, and previews are
+  // conversation content, not operational telemetry. Keep them out even when
+  // the broad OTEL_LOG_TOOL_DETAILS diagnostic switch is enabled.
+  const telemetryToolInput =
+    containsPrivateQuestionContent
+      ? undefined
+      : extractToolInputForTelemetry(processedInput)
   let toolParameters: Record<string, unknown> = {}
   if (isToolDetailsLoggingEnabled()) {
     if (tool.name === BASH_TOOL_NAME && 'command' in processedInput) {
@@ -1419,8 +1586,9 @@ async function checkPermissionsAndCallTool(
 
     endToolExecutionSpan({ success: true })
     // Pass tool result for new_context logging
-    const toolResultStr =
-      safeResultData && typeof safeResultData === 'object'
+    const toolResultStr = containsPrivateQuestionContent
+      ? undefined
+      : safeResultData && typeof safeResultData === 'object'
         ? jsonStringify(safeResultData)
         : String(safeResultData ?? '')
     endToolSpan(toolResultStr)
@@ -1831,9 +1999,11 @@ async function checkPermissionsAndCallTool(
     if (!(error instanceof AbortError)) {
       const errorMsg = errorMessage(error)
       logForDebugging(
-        `${tool.name} tool error (${durationMs}ms): ${errorMsg.slice(0, 200)}`,
+        containsPrivateQuestionContent
+          ? `${tool.name} tool error (${durationMs}ms): details redacted`
+          : `${tool.name} tool error (${durationMs}ms): ${errorMsg.slice(0, 200)}`,
       )
-      if (!(error instanceof ShellError)) {
+      if (!(error instanceof ShellError) && !containsPrivateQuestionContent) {
         logError(error)
       }
       logEvent('tengu_tool_use_error', {
@@ -1876,7 +2046,9 @@ async function checkPermissionsAndCallTool(
         use_id: toolUseID,
         success: 'false',
         duration_ms: String(durationMs),
-        error: errorMessage(error),
+        error: containsPrivateQuestionContent
+          ? 'AskUserQuestionError'
+          : errorMessage(error),
         ...(Object.keys(toolParameters).length > 0 && {
           tool_parameters: jsonStringify(toolParameters),
         }),

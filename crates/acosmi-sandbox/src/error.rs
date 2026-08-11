@@ -45,7 +45,7 @@ pub enum SandboxError {
     },
 
     /// Landlock LSM operation failed.
-    #[error("landlock {operation} failed")]
+    #[error("landlock {operation} failed: {source}")]
     Landlock {
         operation: String,
         #[source]

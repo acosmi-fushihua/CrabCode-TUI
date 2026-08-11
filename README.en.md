@@ -14,7 +14,7 @@ CrabCode TUI is CrabCode's terminal-only open-source edition. Rust owns the term
 
 The stable version is always the public GitHub `latest` Release. Ordinary installation is one command and does not require GitHub CLI:
 
-macOS / Linux:
+macOS:
 
 ```bash
 curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.sh | sh
@@ -26,7 +26,7 @@ Windows PowerShell:
 irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex
 ```
 
-The installer verifies the release SHA-256 and package per-file manifest. Users who require additional GitHub build-provenance verification can download the matching assets from [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest) and run `gh attestation verify`; that audit flow is no longer presented as the ordinary installer. Release archives support macOS/Linux arm64 and x64 plus Windows x64, and bundle `crabcode`, the native TUI, Bun, memory/cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge.
+The installer verifies the release SHA-256 and package per-file manifest. Users who require additional GitHub build-provenance verification can download the matching assets from [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest) and run `gh attestation verify`; that audit flow is no longer presented as the ordinary installer. Release archives are provided only for macOS arm64, macOS x64, and Windows x64, and bundle `crabcode`, the native TUI, Bun, memory/cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge. Linux users can still build from source.
 
 The open-source TUI and GUI have separate programs, installation roots, and release chains. For state isolation during same-machine testing or multi-product use, set `CRABCODE_CONFIG_DIR` to an absolute dedicated directory; the same authority covers Rust, TypeScript, memory, cron, and renderer diagnostics. Upgrades retain the historical default state location so existing TUI sessions and settings are not silently abandoned.
 
@@ -183,7 +183,7 @@ bun run test:account-bridge
 bun run smoke:tui
 ```
 
-`bun run ci` runs the full local validation. Release CI additionally builds on five native platforms, verifies Account Bridge signatures, writes a per-file manifest, collects dependency licenses, validates the install layout, and produces SHA-256 files plus GitHub build provenance for release assets.
+`bun run ci` runs the full local validation. Release CI additionally builds on macOS arm64, macOS x64, and Windows x64, verifies Account Bridge signatures, writes a per-file manifest, collects dependency licenses, validates the install layout, and produces SHA-256 files plus GitHub build provenance for release assets.
 
 ## Open source and licenses
 

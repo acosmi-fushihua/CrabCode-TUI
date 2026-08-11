@@ -31,6 +31,7 @@ import {
   buildEffectiveSystemPrompt,
   type SystemPrompt,
 } from '../../utils/systemPrompt.js'
+import { createCompactProgressLifecycle } from './progressLifecycle.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const reactiveCompact = feature('REACTIVE_COMPACT')
@@ -51,6 +52,13 @@ export const call: LocalCommandCall = async (args, context) => {
   }
 
   const customInstructions = args.trim()
+  const progressLifecycle = createCompactProgressLifecycle(
+    context.onCompactProgress,
+  )
+  const compactContext: ToolUseContext = {
+    ...context,
+    onCompactProgress: progressLifecycle.emit,
+  }
 
   try {
     // Try session memory compaction first if no custom instructions
@@ -58,7 +66,9 @@ export const call: LocalCommandCall = async (args, context) => {
     if (!customInstructions) {
       const sessionMemoryResult = await trySessionMemoryCompaction(
         messages,
-        context.agentId,
+        compactContext.agentId,
+        undefined,
+        compactContext,
       )
       if (sessionMemoryResult) {
         getUserContext.cache.clear?.()
@@ -67,8 +77,8 @@ export const call: LocalCommandCall = async (args, context) => {
         // as a break. compactConversation does this internally; SM-compact doesn't.
         if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
           notifyCompaction(
-            context.options.querySource ?? 'compact',
-            context.agentId,
+            compactContext.options.querySource ?? 'compact',
+            compactContext.agentId,
           )
         }
         markPostCompaction()
@@ -78,7 +88,7 @@ export const call: LocalCommandCall = async (args, context) => {
         return {
           type: 'compact',
           compactionResult: sessionMemoryResult,
-          displayText: buildDisplayText(context),
+          displayText: buildDisplayText(compactContext),
         }
       }
     }
@@ -88,7 +98,7 @@ export const call: LocalCommandCall = async (args, context) => {
     if (reactiveCompact?.isReactiveOnlyMode()) {
       return await compactViaReactive(
         messages,
-        context,
+        compactContext,
         customInstructions,
         reactiveCompact,
       )
@@ -96,13 +106,16 @@ export const call: LocalCommandCall = async (args, context) => {
 
     // Fall back to traditional compaction
     // Run microcompact first to reduce tokens before summarization
-    const microcompactResult = await microcompactMessages(messages, context)
+    const microcompactResult = await microcompactMessages(
+      messages,
+      compactContext,
+    )
     const messagesForCompact = microcompactResult.messages
 
     const result = await compactConversation(
       messagesForCompact,
-      context,
-      await getCacheSharingParams(context, messagesForCompact),
+      compactContext,
+      await getCacheSharingParams(compactContext, messagesForCompact),
       false,
       customInstructions,
       false,
@@ -121,7 +134,10 @@ export const call: LocalCommandCall = async (args, context) => {
     return {
       type: 'compact',
       compactionResult: result,
-      displayText: buildDisplayText(context, result.userDisplayMessage),
+      displayText: buildDisplayText(
+        compactContext,
+        result.userDisplayMessage,
+      ),
     }
   } catch (error) {
     if (abortController.signal.aborted) {
@@ -134,6 +150,9 @@ export const call: LocalCommandCall = async (args, context) => {
       logError(error)
       throw new Error(`Error during compaction: ${error}`)
     }
+  } finally {
+    progressLifecycle.finish()
+    compactContext.setSDKStatus?.(null)
   }
 }
 

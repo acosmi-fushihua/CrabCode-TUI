@@ -26,13 +26,11 @@ import initVerifiers from 'src/commands/init-verifiers.js'
 import insights from 'src/commands/insights/index.js'
 import installSlackApp from 'src/commands/install-slack-app/index.js'
 import localModels from 'src/commands/local-models/index.js'
-import logout from 'src/commands/logout/headless.js'
 import outputStyle from 'src/commands/output-style/index.js'
 import prComments from 'src/commands/pr_comments/index.js'
 import proactive from 'src/commands/proactive.js'
 import proxy from 'src/commands/proxy/index.js'
 import releaseNotes from 'src/commands/release-notes/index.js'
-import reloadPlugins from 'src/commands/reload-plugins/index.js'
 import review from 'src/commands/reviewCommand.js'
 import securityReview from 'src/commands/security-review.js'
 import smallModel from 'src/commands/smallmodel/index.js'
@@ -156,8 +154,6 @@ const DIRECT_TUI_INSTALL_SLACK_APP =
   projectDirectRendererNeutralLocal(installSlackApp)
 const DIRECT_TUI_PROACTIVE =
   projectDirectRendererNeutralLocal(proactive)
-const DIRECT_TUI_RELOAD_PLUGINS =
-  projectDirectRendererNeutralLocal(reloadPlugins)
 const DIRECT_TUI_CLEAR =
   projectDirectRendererNeutralLocal(clear)
 const DIRECT_TUI_SMALLMODEL =
@@ -218,7 +214,6 @@ const DIRECT_TUI_BUILTINS: readonly Command[] = [
   prComments,
   proxy,
   releaseNotes,
-  DIRECT_TUI_RELOAD_PLUGINS,
   directTuiStatusline,
   review,
   securityReview,
@@ -230,9 +225,25 @@ const DIRECT_TUI_BUILTINS: readonly Command[] = [
   ...(feature('PROACTIVE') || feature('KAIROS')
     ? [DIRECT_TUI_PROACTIVE]
     : []),
-  ...(!isUsing3PServices() ? [logout] : []),
   ...ANT_RENDERER_NEUTRAL_BUILTINS,
 ]
+
+/**
+ * These invocation names are owned by the Rust renderer in the direct TUI.
+ * Exclude a discovered command that claims either canonical name or an alias
+ * so runtime discovery cannot silently shadow the renderer's control-backed
+ * lifecycle.
+ */
+const DIRECT_TUI_RENDERER_OWNED_INVOCATIONS = new Set([
+  'logout',
+  'reload-plugins',
+])
+
+function claimsDirectTuiRendererOwnedInvocation(command: Command): boolean {
+  return [command.name, ...(command.aliases ?? [])].some(name =>
+    DIRECT_TUI_RENDERER_OWNED_INVOCATIONS.has(name),
+  )
+}
 
 const HEADLESS_BUILTIN_NAMES = new Set(
   HEADLESS_BUILTINS.flatMap(command => [
@@ -256,6 +267,19 @@ const HEADLESS_SUBSCRIBER_GATED_NAMES = new Set(
 
 export function getDirectTuiBuiltInCommandNames(): ReadonlySet<string> {
   return DIRECT_TUI_BUILTIN_NAMES
+}
+
+/**
+ * Return the exact built-in command objects that feed the direct-TUI catalog.
+ *
+ * This is intentionally the pre-availability inventory: callers that execute
+ * commands must continue to use `getDirectTuiCommands()`.  Keeping a read-only
+ * view of the actual objects lets release audits bind every advertised token
+ * to its production execution kind without evaluating account, feature, or
+ * network gates and without maintaining a second hand-written registry.
+ */
+export function getDirectTuiBuiltInCommandDefinitions(): readonly Command[] {
+  return DIRECT_TUI_BUILTINS
 }
 
 export function installDirectTuiCommandSurface(): void {
@@ -386,15 +410,27 @@ async function getCommandsForSurface(
     false,
 ): Promise<Command[]> {
   const allCommands = await loadCommands(cwd)
-  const baseCommands = allCommands.filter(
-    command =>
+  const eligibleForSurface = (command: Command) =>
       !excludeCommand(command) &&
       meetsHeadlessAvailabilityRequirement(command) &&
       isCommandEnabled(command) &&
       ((command.type === 'prompt' && !command.disableNonInteractive) ||
         (command.type === 'local' && command.supportsNonInteractive) ||
-        includeRendererNeutralLocalJsx(command)),
+        includeRendererNeutralLocalJsx(command))
+
+  const filteredCommands = allCommands.filter(eligibleForSurface)
+
+  // Discovery is first-wins, but eligibility is a surface concern. An
+  // ineligible discovered command with a built-in's stable name must not
+  // remove the healthy built-in before this surface gets a chance to filter
+  // it. Restore only missing eligible built-ins; an eligible discovered
+  // command continues to own the collision.
+  const claimedStableNames = new Set(filteredCommands.map(command => command.name))
+  const fallbackBuiltins = builtins.filter(
+    command =>
+      eligibleForSurface(command) && !claimedStableNames.has(command.name),
   )
+  const baseCommands = [...filteredCommands, ...fallbackBuiltins]
 
   const dynamicSkills = getDynamicSkills()
   if (dynamicSkills.length === 0) return baseCommands
@@ -436,7 +472,7 @@ export function getDirectTuiCommands(cwd: string): Promise<Command[]> {
     cwd,
     loadAllDirectTuiCommands,
     DIRECT_TUI_BUILTINS,
-    () => false,
+    claimsDirectTuiRendererOwnedInvocation,
     isDirectTuiRendererNeutralLocalJsx,
   )
 }

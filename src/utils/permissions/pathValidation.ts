@@ -17,6 +17,7 @@ import {
   checkReadableInternalPath,
   matchingRuleForInput,
   pathInAllowedWorkingPath,
+  pathInTrustedRoot,
   pathInWorkingPath,
 } from './filesystem.js'
 import type { PermissionDecisionReason } from './PermissionResult.js'
@@ -98,7 +99,10 @@ export function expandTilde(path: string): string {
  * Respects the deny-within-allow list: paths in denyWithinAllow (like
  * .crabcode/settings.json) are still blocked even if their parent is in allowOnly.
  */
-export function isPathInSandboxWriteAllowlist(resolvedPath: string): boolean {
+export function isPathInSandboxWriteAllowlist(
+  resolvedPath: string,
+  precomputedPathsToCheck?: readonly string[],
+): boolean {
   if (!SandboxManager.isSandboxingEnabled()) {
     return false
   }
@@ -111,14 +115,15 @@ export function isPathInSandboxWriteAllowlist(resolvedPath: string): boolean {
   // and none may be denied. Config paths are session-stable, so memoize
   // their resolution to avoid N × config.length redundant syscalls per
   // command with N write targets (matching getResolvedWorkingDirPaths).
-  const pathsToCheck = getPathsForPermissionCheck(resolvedPath)
+  const pathsToCheck =
+    precomputedPathsToCheck ?? getPathsForPermissionCheck(resolvedPath)
   const resolvedAllow = allowOnly.flatMap(getResolvedSandboxConfigPath)
   const resolvedDeny = denyWithinAllow.flatMap(getResolvedSandboxConfigPath)
   return pathsToCheck.every(p => {
     for (const denyPath of resolvedDeny) {
       if (pathInWorkingPath(p, denyPath)) return false
     }
-    return resolvedAllow.some(allowPath => pathInWorkingPath(p, allowPath))
+    return resolvedAllow.some(allowPath => pathInTrustedRoot(p, allowPath))
   })
 }
 
@@ -132,13 +137,11 @@ const getResolvedSandboxConfigPath: (inputPath: string) => string[] = memoize(
 /**
  * Checks if a resolved path is allowed for the given operation type.
  *
- * @param precomputedPathsToCheck - Optional cached result of
- *   `getPathsForPermissionCheck(resolvedPath)`. When `resolvedPath` is the
- *   output of `realpathSync` (canonical path, all symlinks resolved), this
- *   is trivially `[resolvedPath]` and passing it here skips 5 redundant
- *   syscalls per inner check. Do NOT pass this for non-canonical paths
- *   (nonexistent files, UNC paths, etc.) — parent-directory symlink
- *   resolution is still required for those.
+ * @param precomputedPathsToCheck - Full cached identity chain derived from
+ *   the original absolute user path via `getPathsForPermissionCheck`. Callers
+ *   must retain lexical, intermediate-symlink, and canonical forms; passing
+ *   only `[resolvedPath]` loses rule identity and internal config-root
+ *   carve-outs when the selected root is itself a symlink.
  */
 export function isPathAllowed(
   resolvedPath: string,
@@ -148,18 +151,23 @@ export function isPathAllowed(
 ): PathCheckResult {
   // Determine which permission type to check based on operation
   const permissionType = operationType === 'read' ? 'read' : 'edit'
+  const pathsToCheck =
+    precomputedPathsToCheck ?? getPathsForPermissionCheck(resolvedPath)
 
-  // 1. Check deny rules first (they take precedence)
-  const denyRule = matchingRuleForInput(
-    resolvedPath,
-    context,
-    permissionType,
-    'deny',
-  )
-  if (denyRule !== null) {
-    return {
-      allowed: false,
-      decisionReason: { type: 'rule', rule: denyRule },
+  // 1. Check deny rules against every lexical/intermediate/canonical identity.
+  // A rule on either a symlink alias or its physical target must win.
+  for (const pathToCheck of pathsToCheck) {
+    const denyRule = matchingRuleForInput(
+      pathToCheck,
+      context,
+      permissionType,
+      'deny',
+    )
+    if (denyRule !== null) {
+      return {
+        allowed: false,
+        decisionReason: { type: 'rule', rule: denyRule },
+      }
     }
   }
 
@@ -168,7 +176,11 @@ export function isPathAllowed(
   // and internal editable paths live under ~/.crabcode/ — matching the ordering in
   // checkWritePermissionForTool (filesystem.ts step 1.5)
   if (operationType !== 'read') {
-    const internalEditResult = checkEditableInternalPath(resolvedPath, {})
+    const internalEditResult = checkEditableInternalPath(
+      resolvedPath,
+      {},
+      pathsToCheck,
+    )
     if (internalEditResult.behavior === 'allow') {
       return {
         allowed: true,
@@ -183,7 +195,7 @@ export function isPathAllowed(
   if (operationType !== 'read') {
     const safetyCheck = checkPathSafetyForAutoEdit(
       resolvedPath,
-      precomputedPathsToCheck,
+      pathsToCheck,
     )
     if (!safetyCheck.safe) {
       return {
@@ -203,7 +215,7 @@ export function isPathAllowed(
   const isInWorkingDir = pathInAllowedWorkingPath(
     resolvedPath,
     context,
-    precomputedPathsToCheck,
+    pathsToCheck,
   )
   if (isInWorkingDir) {
     if (operationType === 'read' || context.mode === 'acceptEdits') {
@@ -215,7 +227,11 @@ export function isPathAllowed(
   // 3.5. For read operations, check internal readable paths (project temp dir, session memory, etc.)
   // This allows reading agent output files without explicit permission
   if (operationType === 'read') {
-    const internalReadResult = checkReadableInternalPath(resolvedPath, {})
+    const internalReadResult = checkReadableInternalPath(
+      resolvedPath,
+      {},
+      pathsToCheck,
+    )
     if (internalReadResult.behavior === 'allow') {
       return {
         allowed: true,
@@ -235,7 +251,7 @@ export function isPathAllowed(
   if (
     operationType !== 'read' &&
     !isInWorkingDir &&
-    isPathInSandboxWriteAllowlist(resolvedPath)
+    isPathInSandboxWriteAllowlist(resolvedPath, pathsToCheck)
   ) {
     return {
       allowed: true,
@@ -247,16 +263,16 @@ export function isPathAllowed(
   }
 
   // 4. Check allow rules for the operation type
-  const allowRule = matchingRuleForInput(
-    resolvedPath,
-    context,
-    permissionType,
-    'allow',
+  // Positive rules are identity-strict: every observed form must be covered.
+  // This prevents an allow on a lexical alias from authorizing a different
+  // physical identity. Permission suggestions already persist both forms.
+  const allowRules = pathsToCheck.map(pathToCheck =>
+    matchingRuleForInput(pathToCheck, context, permissionType, 'allow'),
   )
-  if (allowRule !== null) {
+  if (allowRules.length > 0 && allowRules.every(rule => rule !== null)) {
     return {
       allowed: true,
-      decisionReason: { type: 'rule', rule: allowRule },
+      decisionReason: { type: 'rule', rule: allowRules[0]! },
     }
   }
 
@@ -279,7 +295,8 @@ export function validateGlobPattern(
     const absolutePath = isAbsolute(cleanPath)
       ? cleanPath
       : resolve(cwd, cleanPath)
-    const { resolvedPath, isCanonical } = safeResolvePath(
+    const pathsToCheck = getPathsForPermissionCheck(absolutePath)
+    const { resolvedPath } = safeResolvePath(
       getFsImplementation(),
       absolutePath,
     )
@@ -287,7 +304,7 @@ export function validateGlobPattern(
       resolvedPath,
       toolPermissionContext,
       operationType,
-      isCanonical ? [resolvedPath] : undefined,
+      pathsToCheck,
     )
     return {
       allowed: result.allowed,
@@ -300,7 +317,8 @@ export function validateGlobPattern(
   const absoluteBasePath = isAbsolute(basePath)
     ? basePath
     : resolve(cwd, basePath)
-  const { resolvedPath, isCanonical } = safeResolvePath(
+  const pathsToCheck = getPathsForPermissionCheck(absoluteBasePath)
+  const { resolvedPath } = safeResolvePath(
     getFsImplementation(),
     absoluteBasePath,
   )
@@ -308,7 +326,7 @@ export function validateGlobPattern(
     resolvedPath,
     toolPermissionContext,
     operationType,
-    isCanonical ? [resolvedPath] : undefined,
+    pathsToCheck,
   )
   return {
     allowed: result.allowed,
@@ -468,7 +486,11 @@ export function validatePath(
   const absolutePath = isAbsolute(cleanPath)
     ? cleanPath
     : resolve(cwd, cleanPath)
-  const { resolvedPath, isCanonical } = safeResolvePath(
+  // Preserve the full identity chain. Passing only `[resolvedPath]` when
+  // realpath succeeds loses lexical aliases, intermediate symlinks, and the
+  // selected config-root spelling used by internal memory carve-outs/rules.
+  const pathsToCheck = getPathsForPermissionCheck(absolutePath)
+  const { resolvedPath } = safeResolvePath(
     getFsImplementation(),
     absolutePath,
   )
@@ -477,7 +499,7 @@ export function validatePath(
     resolvedPath,
     toolPermissionContext,
     operationType,
-    isCanonical ? [resolvedPath] : undefined,
+    pathsToCheck,
   )
   return {
     allowed: result.allowed,

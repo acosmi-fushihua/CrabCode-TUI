@@ -45,6 +45,13 @@ respond_to_control_request() {
         *'"subtype":"interrupt"'*)
             printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"interrupted":true}}}\n' "$request_id"
             ;;
+        *'"subtype":"crabcode_tui_logout"'*)
+            if [ "$mode" = "logout-error" ]; then
+                printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"fixture logout refused"}}\n' "$request_id"
+            else
+                printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"account":{"apiProvider":"firstParty","tokenSource":"none"},"commands":[{"name":"login","description":"Sign in","argumentHint":""}]}}}\n' "$request_id"
+            fi
+            ;;
         *'"subtype":"end_session"'*)
             printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"ended":true}}}\n' "$request_id"
             exit 0
@@ -126,6 +133,18 @@ case "$mode" in
         printf '{"type":"assistant","broken":\n'
         read_stdin
         ;;
+    lone-high-surrogate)
+        printf '%s\n' '{"type":"future_unicode_projection","value":"\ud800"}'
+        read_stdin
+        ;;
+    lone-low-surrogate)
+        printf '%s\n' '{"type":"future_unicode_projection","value":"\udc00"}'
+        read_stdin
+        ;;
+    projected-surrogates)
+        printf '%s\n' '{"type":"future_unicode_projection","high":"\ufffd","low":"\ufffd","escaped_pair":"\ud83d\ude00","emoji":"😀","literal":"\\ud800"}'
+        read_stdin
+        ;;
     oversized)
         printf '%s' '{"type":"assistant","blob":"'
         index=0
@@ -149,6 +168,9 @@ case "$mode" in
         read_stdin
         ;;
     interrupt)
+        read_stdin
+        ;;
+    logout|logout-error)
         read_stdin
         ;;
     crash)
@@ -722,6 +744,8 @@ fn spawn_uses_exact_fixed_protocol_arguments_and_preserves_every_field_in_order(
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        "--permission-prompt-tool",
+        "stdio",
         "--model",
         "best",
     ];
@@ -1072,6 +1096,54 @@ fn malformed_json_and_oversized_stdout_fail_closed() {
 }
 
 #[test]
+fn lone_surrogate_ndjson_fails_closed_and_scalar_projection_is_lossless() {
+    for (mode, raw) in [
+        (
+            "lone-high-surrogate",
+            r#"{"type":"future_unicode_projection","value":"\ud800"}"#,
+        ),
+        (
+            "lone-low-surrogate",
+            r#"{"type":"future_unicode_projection","value":"\udc00"}"#,
+        ),
+    ] {
+        assert!(
+            serde_json::from_str::<Value>(raw).is_err(),
+            "serde_json must reject legacy NDJSON containing a lone surrogate"
+        );
+        let fixture = Fixture::create();
+        let runtime = SdkRuntime::spawn(fixture.config(mode)).expect("spawn runtime");
+        assert!(matches!(
+            recv(&runtime),
+            RuntimeEvent::Fatal(ref fatal)
+                if fatal.reason.contains("invalid stdout NDJSON")
+        ));
+        assert!(matches!(recv(&runtime), RuntimeEvent::ChildExited(_)));
+    }
+
+    let fixture = Fixture::create();
+    let mut runtime =
+        SdkRuntime::spawn(fixture.config("projected-surrogates")).expect("spawn runtime");
+    let projected = envelope(recv(&runtime));
+    assert!(matches!(
+        projected.classification,
+        EnvelopeClass::Unclassified {
+            ref observed_type,
+            ref observed_system_subtype,
+        } if observed_type.as_deref() == Some("future_unicode_projection")
+            && observed_system_subtype.is_none()
+    ));
+    assert_eq!(projected.value["high"], "\u{fffd}");
+    assert_eq!(projected.value["low"], "\u{fffd}");
+    assert_eq!(projected.value["escaped_pair"], "😀");
+    assert_eq!(projected.value["emoji"], "😀");
+    assert_eq!(projected.value["literal"], r"\ud800");
+    runtime
+        .shutdown("end-projected-surrogates", Some("unicode-projection"))
+        .expect("projected scalar values keep the runtime live");
+}
+
+#[test]
 fn permission_and_elicitation_responses_are_exact_and_request_correlated() {
     let fixture = Fixture::create();
     let mut runtime = SdkRuntime::spawn(fixture.config("reverse")).expect("spawn runtime");
@@ -1333,6 +1405,126 @@ fn interrupt_and_shutdown_use_correlated_control_requests() {
             })
         ]
     );
+}
+
+#[test]
+fn direct_tui_logout_control_is_exact_correlated_and_keeps_the_child_live() {
+    let fixture = Fixture::create();
+    let mut runtime = SdkRuntime::spawn(fixture.config("logout")).expect("spawn runtime");
+    let request_id = "logout-exact-完整";
+    let request = json!({"subtype":"crabcode_tui_logout"});
+
+    let delivery_id = runtime
+        .submit_control_request(request_id, request.clone())
+        .expect("queue direct TUI logout control");
+    let completion = recv_outbound_completions(&runtime, 1, Duration::from_secs(2))
+        .pop()
+        .expect("logout writer completion");
+    assert_eq!(completion.id, delivery_id);
+    assert_eq!(
+        completion.result.expect("logout writer ACK").value,
+        json!({
+            "type":"control_request",
+            "request_id":request_id,
+            "request":request,
+        })
+    );
+
+    let response = envelope(recv(&runtime));
+    assert_eq!(
+        response.value,
+        json!({
+            "type":"control_response",
+            "response":{
+                "subtype":"success",
+                "request_id":request_id,
+                "response":{
+                    "account":{"apiProvider":"firstParty","tokenSource":"none"},
+                    "commands":[{"name":"login","description":"Sign in","argumentHint":""}],
+                },
+            },
+        })
+    );
+    assert!(matches!(
+        response.correlation,
+        Some(RequestCorrelation::OutboundResponseMatched {
+            ref request_id,
+            ref request_subtype,
+        }) if request_id == "logout-exact-完整" && request_subtype == "crabcode_tui_logout"
+    ));
+
+    let invalid = runtime
+        .submit_control_request(
+            "logout-invalid",
+            json!({"subtype":"crabcode_tui_logout", "unexpected":true}),
+        )
+        .expect_err("the private logout control has no argument surface");
+    assert!(invalid.to_string().contains("unknown or missing fields"));
+
+    let interrupt = runtime
+        .submit_interrupt("after-logout-interrupt")
+        .expect("runtime remains writable after logout");
+    recv_outbound_completions(&runtime, 1, Duration::from_secs(2))
+        .pop()
+        .expect("post-logout interrupt writer completion")
+        .result
+        .expect("post-logout interrupt writer ACK");
+    let interrupt_response = envelope(recv(&runtime));
+    assert!(matches!(
+        interrupt_response.correlation,
+        Some(RequestCorrelation::OutboundResponseMatched {
+            ref request_id,
+            ref request_subtype,
+        }) if request_id == "after-logout-interrupt" && request_subtype == "interrupt"
+    ));
+    assert_ne!(interrupt, delivery_id);
+
+    runtime
+        .shutdown("end-logout-live", Some("test"))
+        .expect("logout does not terminate the child");
+}
+
+#[test]
+fn direct_tui_logout_error_is_correlated_and_keeps_the_child_live() {
+    let fixture = Fixture::create();
+    let mut runtime = SdkRuntime::spawn(fixture.config("logout-error")).expect("spawn runtime");
+    let receipt = runtime
+        .send_control_request(
+            "logout-error-correlated",
+            json!({"subtype":"crabcode_tui_logout"}),
+        )
+        .expect("send direct TUI logout control");
+    assert_eq!(receipt.value["request"]["subtype"], "crabcode_tui_logout");
+
+    let response = envelope(recv(&runtime));
+    assert_eq!(response.value["response"]["subtype"], "error");
+    assert_eq!(
+        response.value["response"]["error"],
+        "fixture logout refused"
+    );
+    assert!(matches!(
+        response.correlation,
+        Some(RequestCorrelation::OutboundResponseMatched {
+            ref request_id,
+            ref request_subtype,
+        }) if request_id == "logout-error-correlated" && request_subtype == "crabcode_tui_logout"
+    ));
+
+    runtime
+        .interrupt("after-logout-error")
+        .expect("runtime remains writable after a logout error");
+    let interrupt_response = envelope(recv(&runtime));
+    assert!(matches!(
+        interrupt_response.correlation,
+        Some(RequestCorrelation::OutboundResponseMatched {
+            ref request_id,
+            ref request_subtype,
+        }) if request_id == "after-logout-error" && request_subtype == "interrupt"
+    ));
+
+    runtime
+        .shutdown("end-logout-error-live", Some("test"))
+        .expect("logout failure does not terminate the child");
 }
 
 #[test]
@@ -1765,6 +1957,8 @@ fn reserved_protocol_arguments_are_rejected_before_spawn() {
         "--include-hook-events",
         "--include-hook-events=false",
         "--no-include-hook-events",
+        "--permission-prompt-tool",
+        "--permission-prompt-tool=stdio",
     ] {
         let mut config = fixture.config("fields");
         config.runtime_args = vec![OsString::from(argument)];
@@ -1793,12 +1987,15 @@ fn complete_backend_adapter_transport_contract_is_lossless() {
     reverse_control_error_is_exact_and_closes_only_the_matching_request();
     keep_alive_and_environment_update_have_exact_typed_stdin_wires();
     interrupt_and_shutdown_use_correlated_control_requests();
+    direct_tui_logout_control_is_exact_correlated_and_keeps_the_child_live();
+    direct_tui_logout_error_is_correlated_and_keeps_the_child_live();
     graceful_shutdown_pumps_and_preserves_full_stdout_and_stderr_backlogs();
     pending_control_request_state_is_bounded_in_both_directions();
     additive_unknown_presentation_events_are_raw_and_runtime_remains_live();
     unknown_control_subtype_is_raw_then_fatal_and_terminated();
     additive_unknown_event_is_retained_before_unexpected_child_exit();
     malformed_json_and_oversized_stdout_fail_closed();
+    lone_surrogate_ndjson_fails_closed_and_scalar_projection_is_lossless();
     spawn_failure_and_unexpected_child_exit_are_explicit();
 }
 

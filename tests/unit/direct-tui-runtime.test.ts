@@ -362,6 +362,12 @@ describe('dedicated native TUI runtime boundary', () => {
     )
     expect(bootstrap).toContain("outputFormat: 'stream-json'")
     expect(bootstrap).toContain('verbose: true')
+    expect(bootstrap).toContain(
+      'permissionPromptToolName: DIRECT_TUI_PERMISSION_PROMPT_TOOL_NAME',
+    )
+    expect(bootstrap).not.toContain(
+      'permissionPromptToolName: options.permissionPromptTool',
+    )
     expect(bootstrap).toContain('setIsInteractive(true)')
     expect(bootstrap).toContain("setClientType('cli')")
     expect(bootstrap).toContain('setUsesStructuredIoTransport(true)')
@@ -383,6 +389,7 @@ describe('dedicated native TUI runtime boundary', () => {
       "connectMcpConfigs(store, { ide: config }, 'IDE')",
     )
     expect(core).toContain('processOwnedAccountBridge: true')
+    expect(core).toContain('withDirectTuiPermissionBridge(args[7])')
     expect(core).not.toContain('sessionControl')
     expect(core).not.toContain('session_list')
     expect(core).toContain('interactiveProductSession: true')

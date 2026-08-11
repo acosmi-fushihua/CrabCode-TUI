@@ -586,10 +586,50 @@ function applyPreservedSegmentRelinks(
   // absolute — otherwise the stale preserved chain becomes a phantom leaf.
   const segIsLive = lastSegBoundaryIdx === absoluteLastBoundaryIdx
 
+  // Stable reason codes for the fail-soft telemetry below. Keep numeric values
+  // append-only so dashboards can distinguish old clients without logging the
+  // untrusted UUID metadata itself.
+  const RELINK_FAILURE = {
+    malformedMetadata: 1,
+    brokenTailWalk: 2,
+    missingAnchor: 3,
+    anchorBeforeBoundary: 4,
+    anchorInsideSegment: 5,
+    preservedEntryAfterBoundary: 6,
+  } as const
+  const logBrokenRelink = (reason: number, walkSteps: number): void => {
+    logEvent('tengu_relink_walk_broken', {
+      reason,
+      tailInTranscript:
+        typeof lastSeg.tailUuid === 'string' &&
+        messages.has(lastSeg.tailUuid),
+      headInTranscript:
+        typeof lastSeg.headUuid === 'string' &&
+        messages.has(lastSeg.headUuid),
+      anchorInTranscript:
+        typeof lastSeg.anchorUuid === 'string' &&
+        messages.has(lastSeg.anchorUuid),
+      walkSteps,
+      transcriptSize: messages.size,
+    })
+  }
+
   // Validate tail→head BEFORE mutating so malformed metadata is a true
   // no-op (walk stops at headUuid, doesn't need the relink to run first).
   const preservedUuids = new Set<string>()
   if (segIsLive) {
+    if (
+      typeof lastSeg.headUuid !== 'string' ||
+      lastSeg.headUuid.length === 0 ||
+      typeof lastSeg.anchorUuid !== 'string' ||
+      lastSeg.anchorUuid.length === 0 ||
+      typeof lastSeg.tailUuid !== 'string' ||
+      lastSeg.tailUuid.length === 0
+    ) {
+      logBrokenRelink(RELINK_FAILURE.malformedMetadata, 0)
+      return
+    }
+
     const walkSeen = new Set<string>()
     let cur = messages.get(lastSeg.tailUuid)
     let reachedHead = false
@@ -608,13 +648,39 @@ function applyPreservedSegmentRelinks(
       // the full pre-compact history. Known cause: mid-turn-yielded
       // attachment pushed to mutableMessages but never recordTranscript'd
       // (SDK subprocess restarted before next turn's qe:420 flush).
-      logEvent('tengu_relink_walk_broken', {
-        tailInTranscript: messages.has(lastSeg.tailUuid),
-        headInTranscript: messages.has(lastSeg.headUuid),
-        anchorInTranscript: messages.has(lastSeg.anchorUuid),
-        walkSteps: walkSeen.size,
-        transcriptSize: messages.size,
+      logBrokenRelink(RELINK_FAILURE.brokenTailWalk, walkSeen.size)
+      return
+    }
+
+    // The endpoint walk alone is insufficient: a corrupt anchor can still
+    // make us prune the original history and then attach the preserved head
+    // to a missing/soon-to-be-pruned parent. The anchor is always the latest
+    // boundary itself (prefix-preserving) or a summary written after it
+    // (suffix-preserving). Every preserved message was already on disk before
+    // the boundary. Validate all of those invariants before any Map mutation.
+    const anchorIdx = entryIndex.get(lastSeg.anchorUuid)
+    if (anchorIdx === undefined) {
+      logBrokenRelink(RELINK_FAILURE.missingAnchor, walkSeen.size)
+      return
+    }
+    if (preservedUuids.has(lastSeg.anchorUuid)) {
+      logBrokenRelink(RELINK_FAILURE.anchorInsideSegment, walkSeen.size)
+      return
+    }
+    if (anchorIdx < absoluteLastBoundaryIdx) {
+      logBrokenRelink(RELINK_FAILURE.anchorBeforeBoundary, walkSeen.size)
+      return
+    }
+    if (
+      [...preservedUuids].some(uuid => {
+        const idx = entryIndex.get(uuid)
+        return idx === undefined || idx >= absoluteLastBoundaryIdx
       })
+    ) {
+      logBrokenRelink(
+        RELINK_FAILURE.preservedEntryAfterBoundary,
+        walkSeen.size,
+      )
       return
     }
   }

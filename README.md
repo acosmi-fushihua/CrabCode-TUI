@@ -14,7 +14,7 @@ CrabCode TUI 是 CrabCode 的纯终端开源版本。Rust 进程独占终端、�
 
 稳定版始终以 GitHub `latest` Release 的公开资产为准。普通安装只需要一条命令，不需要 GitHub CLI：
 
-macOS / Linux：
+macOS：
 
 ```bash
 curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.sh | sh
@@ -26,7 +26,7 @@ Windows PowerShell：
 irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex
 ```
 
-安装器会校验发布级 SHA-256 和包内逐文件 manifest。需要额外验证 GitHub build provenance 的用户，可从 [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest) 下载对应资产后运行 `gh attestation verify`；该审计流程不再冒充普通安装入口。正式包支持 macOS/Linux arm64、x64 和 Windows x64，并内含 `crabcode`、原生 TUI、Bun、Memory/cron 侧车、ripgrep、浏览器后端、图像原生库和 Account Bridge。
+安装器会校验发布级 SHA-256 和包内逐文件 manifest。需要额外验证 GitHub build provenance 的用户，可从 [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest) 下载对应资产后运行 `gh attestation verify`；该审计流程不再冒充普通安装入口。正式包仅提供 macOS arm64、macOS x64 和 Windows x64，并内含 `crabcode`、原生 TUI、Bun、Memory/cron 侧车、ripgrep、浏览器后端、图像原生库和 Account Bridge。Linux 用户仍可从源码构建。
 
 开源 TUI 与 GUI 的程序、安装目录和发布链完全分离。为避免同机测试或多产品复用默认 `~/.crabcode` 状态根，隔离运行时显式设置绝对路径 `CRABCODE_CONFIG_DIR`；该变量同时约束 Rust、TypeScript、memory、cron 与 renderer diagnostics。升级版继续保留默认状态位置，避免破坏既有 TUI 会话与配置。
 
@@ -185,7 +185,7 @@ bun run test:account-bridge
 bun run smoke:tui
 ```
 
-`bun run ci` 执行完整本地校验。发行工作流还会在五个原生平台构建、验证 Account Bridge 签名、生成逐文件清单、收集依赖许可、验证安装布局并为发布资产生成 SHA-256 与 GitHub 构建来源证明。
+`bun run ci` 执行完整本地校验。发行工作流还会在 macOS arm64、macOS x64 与 Windows x64 三个原生平台构建、验证 Account Bridge 签名、生成逐文件清单、收集依赖许可、验证安装布局并为发布资产生成 SHA-256 与 GitHub 构建来源证明。
 
 ## 开源与许可证
 

@@ -43,6 +43,10 @@ const TEST_ONLY_BLOCK_PHYSICAL_MODIFIER_PROBE: &str =
     "CRABCODE_TUI_TEST_ONLY_BLOCK_PHYSICAL_MODIFIER_PROBE";
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
+// These tests all mutate real PTY ownership, process-wide signal handlers,
+// and terminal modes. Running them concurrently creates load/order flakes
+// that do not represent a supported product lifecycle.
+
 const DIRECT_RUNTIME_FIXTURE: &str = r#"#!/bin/sh
 set -eu
 
@@ -982,6 +986,7 @@ fn assert_setup_response<'a>(
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn conflicting_cli_modes_fail_before_runtime_and_raw_mode() {
     let output = run_to_pre_raw_exit("fullscreen", None, |command| {
         command.arg("--minimal");
@@ -996,6 +1001,7 @@ fn conflicting_cli_modes_fail_before_runtime_and_raw_mode() {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn missing_runtime_bundle_and_spawn_failure_are_reported_before_raw_mode() {
     let missing = PathBuf::from(format!(
         "/private/tmp/cctui-no-runtime-{}.js",
@@ -1031,6 +1037,7 @@ fn missing_runtime_bundle_and_spawn_failure_are_reported_before_raw_mode() {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn direct_initialize_rejection_and_malformed_frames_fail_closed_inside_one_terminal_lifecycle() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -1088,6 +1095,7 @@ fn direct_initialize_rejection_and_malformed_frames_fail_closed_inside_one_termi
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn untrusted_workspace_uses_one_cwd_only_decision_before_initialize_ready_boundary() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -1330,6 +1338,7 @@ fn untrusted_workspace_uses_one_cwd_only_decision_before_initialize_ready_bounda
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn workspace_trust_escape_exits_cleanly_without_initialize_response() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -1507,6 +1516,7 @@ fn workspace_trust_escape_exits_cleanly_without_initialize_response() {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn fullscreen_resize_suspend_resume_and_signal_exit_restore_terminal_protocol() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -1704,6 +1714,7 @@ impl ExternalResumeCutoverCase {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn external_sigstop_resume_discards_pre_cutover_tty_input() {
     for case in [
         ExternalResumeCutoverCase {
@@ -2101,6 +2112,7 @@ fn assert_external_resume_cutover(case: &ExternalResumeCutoverCase) {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn external_editor_child_handoff_preserves_live_terminal_generation() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -2301,6 +2313,7 @@ printf 'edited-by-pty' > "$1"
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn missing_custom_keybinding_authority_cannot_enable_quick_search_or_file_editor() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -2462,6 +2475,7 @@ printf 'UNEXPECTED_FILE_EDITOR_LAUNCH\n'
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn no_alt_screen_mode_preserves_main_screen_and_forwards_runtime_arguments() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -2645,6 +2659,7 @@ fn no_alt_screen_mode_preserves_main_screen_and_forwards_runtime_arguments() {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn direct_runtime_crash_fail_closes_and_terminal_stays_recoverable() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -2746,6 +2761,7 @@ fn direct_runtime_crash_fail_closes_and_terminal_stays_recoverable() {
 
 #[cfg(feature = "terminal-lifecycle-tests")]
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn error_and_panic_after_raw_mode_restore_terminal_once() {
     for fault in ["error", "panic"] {
         let canonical_cwd = std::env::current_dir()
@@ -2841,6 +2857,7 @@ fn error_and_panic_after_raw_mode_restore_terminal_once() {
 
 #[cfg(feature = "terminal-lifecycle-tests")]
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn fatal_memory_signals_restore_terminal_and_preserve_signal_disposition() {
     for (fault, signal) in [("sigbus", libc::SIGBUS), ("sigsegv", libc::SIGSEGV)] {
         let canonical_cwd = std::env::current_dir()
@@ -2938,6 +2955,7 @@ fn fatal_memory_signals_restore_terminal_and_preserve_signal_disposition() {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn second_signal_restores_and_reaps_when_the_ui_thread_is_blocked() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -3032,6 +3050,7 @@ fn second_signal_restores_and_reaps_when_the_ui_thread_is_blocked() {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn closing_the_pty_master_reaps_the_direct_runtime_child() {
     for attempt in 1..=3 {
         let canonical_cwd = std::env::current_dir()
@@ -3104,6 +3123,7 @@ fn closing_the_pty_master_reaps_the_direct_runtime_child() {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn help_exits_before_direct_runtime_and_terminal_ownership() {
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -3138,6 +3158,7 @@ fn help_exits_before_direct_runtime_and_terminal_ownership() {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn minimal_mode_never_enters_alt_screen_and_restores_after_signal() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -3393,12 +3414,14 @@ fn assert_signal_during_renderer_setup(signal_count: usize) {
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn signal_during_renderer_setup_never_injects_end_session_before_runtime_handoff() {
     assert_signal_during_renderer_setup(1);
     assert_signal_during_renderer_setup(2);
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn oauth_success_notification_uses_the_ordered_writer_without_new_runtime_wire() {
     let canonical_cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
@@ -3541,6 +3564,7 @@ fn oauth_success_notification_uses_the_ordered_writer_without_new_runtime_wire()
 }
 
 #[test]
+#[serial_test::serial(terminal_lifecycle)]
 fn oauth_copy_uses_the_resumed_generation_and_precedes_the_next_renderer_frame() {
     const EXPECTED_OSC52: &str =
         "\u{1b}]52;c;aHR0cHM6Ly9hY29zbWkudGVzdC9sb2dpbj9mbG93PW9yZGVyZWQtY29weQ==\u{7}";

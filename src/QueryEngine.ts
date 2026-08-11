@@ -45,11 +45,17 @@ import type {
   AccountBridgeRuntimeAccess,
   CrabCodeThinkingMode,
 } from './services/accountBridge/types.js'
-import { type Tools, type ToolUseContext, toolMatchesName } from './Tool.js'
+import {
+  type CompactProgressEvent,
+  type Tools,
+  type ToolUseContext,
+  toolMatchesName,
+} from './Tool.js'
 import { resolveAgentTools } from './tools/AgentTool/agentToolUtils.js'
 import type { AgentDefinition } from './tools/AgentTool/loadAgentsDir.js'
 import { SYNTHETIC_OUTPUT_TOOL_NAME } from './tools/SyntheticOutputTool/SyntheticOutputTool.js'
 import type { Message } from './types/message.js'
+import type { CompactProgress } from './types/tools.js'
 import type { OrphanedPermission } from './types/textInputTypes.js'
 import { createAbortController } from './utils/abortController.js'
 import type { AttributionState } from './utils/commitAttribution.js'
@@ -70,7 +76,11 @@ import {
 import { headlessProfilerCheckpoint } from './utils/headlessProfiler.js'
 import { registerStructuredOutputEnforcement } from './utils/hooks/hookHelpers.js'
 import { getInMemoryErrors } from './utils/log.js'
-import { countToolCalls, SYNTHETIC_MESSAGES } from './utils/messages.js'
+import {
+  countToolCalls,
+  createProgressMessage,
+  SYNTHETIC_MESSAGES,
+} from './utils/messages.js'
 import {
   getMainLoopModel,
   parseUserSpecifiedModel,
@@ -149,6 +159,19 @@ const snipProjection = feature('HISTORY_SNIP')
 export { createAutomationTurnSurfaceLock }
 
 export type QueryEngineInputMode = 'prompt' | 'bash'
+
+function toCompactProgressData(
+  event: CompactProgressEvent,
+): CompactProgress {
+  if (event.type === 'hooks_start') {
+    return {
+      type: 'compact_progress',
+      phase: event.type,
+      hookType: event.hookType,
+    }
+  }
+  return { type: 'compact_progress', phase: event.type }
+}
 
 export type QueryEngineSubmitOptions = {
   uuid?: string
@@ -498,6 +521,7 @@ export class QueryEngine {
       registerStructuredOutputEnforcement(setAppState, getSessionId())
     }
 
+    const compactProgressToolUseID = `compact-progress-${randomUUID()}`
     let processUserInputContext: ProcessUserInputContext = {
       messages: this.mutableMessages,
       // Slash commands that mutate the message array (e.g. /force-snip)
@@ -549,6 +573,17 @@ export class QueryEngine {
       discoveredSkillNames: this.discoveredSkillNames,
       setInProgressToolUseIDs: () => {},
       setResponseLength: () => {},
+      onCompactProgress: this.config.onQueryEvent
+        ? event => {
+            this.config.onQueryEvent?.(
+              createProgressMessage({
+                toolUseID: compactProgressToolUseID,
+                parentToolUseID: compactProgressToolUseID,
+                data: toCompactProgressData(event),
+              }),
+            )
+          }
+        : undefined,
       updateFileHistoryState: (
         updater: (prev: FileHistoryState) => FileHistoryState,
       ) => {
@@ -591,6 +626,7 @@ export class QueryEngine {
       automationFailure,
       model: modelFromUserInput,
       resultText,
+      localCommandOutcome,
     } = await processUserInput({
       input: prompt,
       mode: inputMode,
@@ -938,15 +974,11 @@ export class QueryEngine {
         }
       }
 
-      yield {
-        type: 'result',
-        subtype: 'success',
-        is_error: false,
+      const terminalResultBase = {
+        type: 'result' as const,
         duration_ms: Date.now() - startTime,
         duration_api_ms: getTotalAPIDuration(),
         num_turns: messages.length - 1,
-        result: resultText ?? '',
-        stop_reason: null,
         session_id: getSessionId(),
         total_cost_usd: getTotalCost(),
         usage: this.totalUsage,
@@ -957,6 +989,24 @@ export class QueryEngine {
           initialAppState.fastMode,
         ),
         uuid: randomUUID(),
+      }
+      if (localCommandOutcome) {
+        yield {
+          ...terminalResultBase,
+          subtype: 'error_during_execution',
+          is_error: true,
+          stop_reason:
+            localCommandOutcome.status === 'cancelled' ? 'interrupted' : null,
+          errors: [localCommandOutcome.message],
+        }
+      } else {
+        yield {
+          ...terminalResultBase,
+          subtype: 'success',
+          is_error: false,
+          result: resultText ?? '',
+          stop_reason: null,
+        }
       }
       return
     }
