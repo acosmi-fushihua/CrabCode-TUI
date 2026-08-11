@@ -11,6 +11,10 @@
   endpoint, and the package test validates and consumes that runtime authority.
   This keeps Windows 8.3 aliases such as `RUNNER~1` from diverging from Rust's
   canonical long path such as `runneradmin`.
+- Pins every packaged Bun runtime to 1.3.14 after a local archive replay proved
+  that 1.3.11 cannot parse the explicit-resource-management syntax in the
+  current minified runtime. The upgrade covers both Mac arm64 and Windows
+  before the sole hosted native job is triggered.
 - Reduces hosted release allocation to one Windows job after a cheap signed
   source gate. Both macOS archives are reproducibly cross-checked, replayed,
   and signed on the audited local Apple Silicon release host, published first,
@@ -25,6 +29,9 @@
 - 删除发布测试夹具中重复实现的端点推导。私有原生回放现在直接返回 launcher 已
   选定的 Memory IPC 地址，成品测试只校验并使用该运行时权威值，避免 Windows
   `RUNNER~1` 等 8.3 短路径与 Rust 规范化后的 `runneradmin` 长路径产生不同哈希。
+- 本地真实归档回放证明 Bun 1.3.11 无法解析当前压缩运行时中的显式资源管理语法，
+  因此将所有发布包内 Bun 统一锁定到 1.3.14；升级同时覆盖 Mac arm64 与 Windows，
+  并在唯一托管原生任务触发前完成验证。
 - 托管发版资源收敛为低成本签名源码门禁之后的唯一 Windows job。两个 macOS 包
   均在已审计的本地 Apple Silicon 发版机上完成可复现装配、成品回放与签名并先行
   发布；Windows 包在唯一托管任务通过后追加。Linux 仍不属于公开发版范围。

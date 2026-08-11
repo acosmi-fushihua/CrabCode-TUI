@@ -10,8 +10,8 @@ const bunLicensePins = Object.freeze({
 })
 
 export const defaultBunRelease = Object.freeze({
-  version: '1.3.11',
-  license: bunLicensePins['1.3.11'],
+  version: '1.3.14',
+  license: bunLicensePins['1.3.14'],
 })
 
 export const x64DarwinBunRelease = Object.freeze({

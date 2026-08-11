@@ -52,7 +52,7 @@ const platforms = Object.freeze({
     archiveExtension: 'tar.gz',
     bunAsset: 'bun-darwin-aarch64.zip',
     bunRoot: 'bun-darwin-aarch64',
-    bunSha256: '6f5a3467ed9caec4795bf78cd476507d9f870c7d57b86c945fcb338126772ffc',
+    bunSha256: 'd8b96221828ad6f97ac7ac0ab7e95872341af763001e8803e8267652c2652620',
     ripgrepAsset: 'ripgrep-14.1.1-aarch64-apple-darwin.tar.gz',
     ripgrepRoot: 'ripgrep-14.1.1-aarch64-apple-darwin',
     ripgrepSha256: '24ad76777745fbff131c8fbc466742b011f925bfa4fffa2ded6def23b5b937be',
@@ -64,10 +64,8 @@ const platforms = Object.freeze({
     rustTarget: 'x86_64-apple-darwin',
     executableExtension: '',
     archiveExtension: 'tar.gz',
-    // Bun 1.3.11 standard and baseline both deadlock while evaluating the
-    // complete top-level-await runtime graph on GitHub's native Intel runner.
-    // 1.3.14 contains the upstream ESM/TLA deadlock fixes and remains baseline
-    // so the public package also covers conservative x64 CPUs.
+    // The baseline build covers conservative x64 CPUs while retaining the
+    // Bun 1.3.14 parser and ESM/TLA fixes used by every public package.
     bunVersion: x64DarwinBunRelease.version,
     bunAsset: x64DarwinBunRelease.asset,
     bunRoot: x64DarwinBunRelease.root,
@@ -85,7 +83,7 @@ const platforms = Object.freeze({
     archiveExtension: 'tar.gz',
     bunAsset: 'bun-linux-aarch64.zip',
     bunRoot: 'bun-linux-aarch64',
-    bunSha256: 'd13944da12a53ecc74bf6a720bd1d04c4555c038dfe422365356a7be47691fdf',
+    bunSha256: 'a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b',
     ripgrepAsset: 'ripgrep-14.1.1-aarch64-unknown-linux-gnu.tar.gz',
     ripgrepRoot: 'ripgrep-14.1.1-aarch64-unknown-linux-gnu',
     ripgrepSha256: 'c827481c4ff4ea10c9dc7a4022c8de5db34a5737cb74484d62eb94a95841ab2f',
@@ -99,7 +97,7 @@ const platforms = Object.freeze({
     archiveExtension: 'tar.gz',
     bunAsset: 'bun-linux-x64.zip',
     bunRoot: 'bun-linux-x64',
-    bunSha256: '8611ba935af886f05a6f38740a15160326c15e5d5d07adef966130b4493607ed',
+    bunSha256: '951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f',
     ripgrepAsset: 'ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz',
     ripgrepRoot: 'ripgrep-14.1.1-x86_64-unknown-linux-musl',
     ripgrepSha256: '4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e',
@@ -113,7 +111,7 @@ const platforms = Object.freeze({
     archiveExtension: 'zip',
     bunAsset: 'bun-windows-x64.zip',
     bunRoot: 'bun-windows-x64',
-    bunSha256: '066f8694f8b7d8df592452746d18f01710d4053e93030922dbc6e8c34a8c4b9f',
+    bunSha256: '0a0620930b6675d7ba440e81f4e0e00d3cfbe096c4b140d3fff02205e9e18922',
     ripgrepAsset: 'ripgrep-14.1.1-x86_64-pc-windows-msvc.zip',
     ripgrepRoot: 'ripgrep-14.1.1-x86_64-pc-windows-msvc',
     ripgrepSha256: 'd0f534024c42afd6cb4d38907c25cd2b249b79bbe6cc1dbee8e3e37c2b6e25a1',
