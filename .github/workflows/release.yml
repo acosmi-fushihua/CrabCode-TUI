@@ -18,14 +18,23 @@ on:
         description: Failed canonical release run containing the completed 100/100 replay evidence
         required: true
         type: string
+      candidate_run_id:
+        description: Prior release run whose preserved Windows artifact is reused without rebuilding
+        required: false
+        type: string
+      candidate_windows_sha256:
+        description: SHA-256 of the preserved Windows ZIP selected by candidate_run_id
+        required: false
+        type: string
       recovery_strategy:
-        description: Reuse exact bytes when available, or rebuild the same signed source with deterministic Windows linking
+        description: Rebuild and bind exact bytes, rebuild deterministically, or reuse a preserved artifact without compiling
         required: true
         default: exact-bytes
         type: choice
         options:
           - exact-bytes
           - deterministic-rebuild
+          - preserved-artifact
 
 permissions:
   actions: read
@@ -42,6 +51,8 @@ env:
   RELEASE_TOOLING_SHA: ${{ github.sha }}
   EXPECTED_WINDOWS_SHA256: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_windows_sha256 || '' }}
   EVIDENCE_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.evidence_run_id || '' }}
+  CANDIDATE_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_run_id || '' }}
+  CANDIDATE_WINDOWS_SHA256: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_windows_sha256 || '' }}
   RECOVERY_STRATEGY: ${{ github.event_name == 'workflow_dispatch' && inputs.recovery_strategy || 'tag-release' }}
   CRABCODE_RELEASE_BUILD: '1'
   CRABCODE_BUILD_MINIFY: '1'
@@ -135,7 +146,22 @@ jobs:
             echo "::error::evidence run id must be a positive decimal integer"; exit 1;
           }
           case "${RECOVERY_STRATEGY}" in
-            exact-bytes|deterministic-rebuild) ;;
+            exact-bytes|deterministic-rebuild)
+              test -z "${CANDIDATE_RUN_ID}" && test -z "${CANDIDATE_WINDOWS_SHA256}" || {
+                echo "::error::candidate inputs are only valid for preserved-artifact recovery"; exit 1;
+              }
+              ;;
+            preserved-artifact)
+              [[ "${CANDIDATE_RUN_ID}" =~ ^[1-9][0-9]*$ ]] || {
+                echo "::error::candidate run id must be a positive decimal integer"; exit 1;
+              }
+              [[ "${CANDIDATE_WINDOWS_SHA256}" =~ ^[a-f0-9]{64}$ ]] || {
+                echo "::error::candidate Windows SHA-256 must be 64 lowercase hexadecimal characters"; exit 1;
+              }
+              test "${CANDIDATE_RUN_ID}" != "${GITHUB_RUN_ID}" || {
+                echo "::error::candidate run must be an earlier completed release run"; exit 1;
+              }
+              ;;
             *) echo "::error::unsupported Windows recovery strategy: ${RECOVERY_STRATEGY}"; exit 1 ;;
           esac
           test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" || {
@@ -168,6 +194,51 @@ jobs:
             echo "::error::evidence run did not enter the subsequent installer gate"; exit 1;
           }
 
+      - name: Verify preserved Windows candidate provenance
+        if: github.event_name == 'workflow_dispatch' && inputs.recovery_strategy == 'preserved-artifact'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN="repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}"
+          test "$(gh api "${RUN}" --jq .event)" = 'workflow_dispatch'
+          test "$(gh api "${RUN}" --jq .path)" = '.github/workflows/release.yml'
+          test "$(gh api "${RUN}" --jq .head_branch)" = 'main'
+          test "$(gh api "${RUN}" --jq .conclusion)" = 'failure'
+          CANDIDATE_HEAD="$(gh api "${RUN}" --jq .head_sha)"
+          git merge-base --is-ancestor "${CANDIDATE_HEAD}" origin/main || {
+            echo "::error::candidate workflow commit is not on enterprise main"; exit 1;
+          }
+
+          JOBS="${RUNNER_TEMP}/windows-candidate-jobs.json"
+          gh api "${RUN}/jobs?per_page=100" > "${JOBS}"
+          jq -e '.jobs[] | select(.name == "Verify tagged pure-TUI source" and .conclusion == "success")' "${JOBS}" >/dev/null
+          for STEP in \
+            'Build native Rust TUI product closure' \
+            'Assemble and verify one compiled product closure' \
+            'Verify package archive shape' \
+            'Run actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
+          do
+            jq -e --arg step "${STEP}" \
+              '.jobs[] | select(.name == "Build and verify x64-win32") | .steps[] | select(.name == $step and .conclusion == "success")' \
+              "${JOBS}" >/dev/null
+          done
+
+          ARTIFACTS="${RUNNER_TEMP}/windows-candidate-artifacts.json"
+          gh api "${RUN}/artifacts?per_page=100" > "${ARTIFACTS}"
+          test "$(jq '[.artifacts[] | select(.name == "release-x64-win32" and (.expired | not) and .size_in_bytes > 0)] | length' "${ARTIFACTS}")" = '1'
+
+          LOG="${RUNNER_TEMP}/windows-candidate.log"
+          gh run view "${CANDIDATE_RUN_ID}" --repo "${GITHUB_REPOSITORY}" --log > "${LOG}"
+          HASH_MATCHES="$(grep -F -c "\"sha256\": \"${CANDIDATE_WINDOWS_SHA256}\"" "${LOG}")"
+          test "${HASH_MATCHES}" -ge 2 || {
+            echo "::error::candidate run does not contain two matching assembly hashes"; exit 1;
+          }
+          grep -Fq "RELEASE_TAG: ${RELEASE_TAG}" "${LOG}" || {
+            echo "::error::candidate run was not bound to ${RELEASE_TAG}"; exit 1;
+          }
+
       - name: Assert installer encodings
         shell: bash
         run: |
@@ -185,9 +256,9 @@ jobs:
   # After this job succeeds, its attested ZIP is downloaded and appended to the
   # already-public mutable release together with install.ps1 and fresh checksums.
   # A manual recovery remains bound to the prior 100/100 evidence and immutable
-  # signed source. Exact-byte recovery additionally binds the ZIP digest. When
-  # the original runner did not preserve its ZIP, deterministic-rebuild removes
-  # PE linker timestamps and performs installer-first plus one direct replay.
+  # signed source. Preserved-artifact recovery reuses a verified candidate from
+  # an earlier trusted run and skips Rust entirely. When no candidate exists,
+  # deterministic-rebuild removes PE/PDB variability before compiling once.
   build-windows:
     name: Build and verify x64-win32
     needs: verify-source
@@ -214,15 +285,58 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
+      - name: Load audited recovery tooling from enterprise main
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cat-file -e "${RELEASE_TOOLING_SHA}^{commit}"
+          git merge-base --is-ancestor "${RELEASE_TOOLING_SHA}" origin/main || {
+            echo "::error::recovery tooling commit is not on enterprise main"; exit 1;
+          }
+          git restore --source="${RELEASE_TOOLING_SHA}" -- \
+            scripts/install.ps1 \
+            scripts/release-package-smoke.mjs
+          git diff --quiet "${RELEASE_TOOLING_SHA}" -- \
+            scripts/install.ps1 \
+            scripts/release-package-smoke.mjs || {
+            echo "::error::failed to bind recovery tooling to the workflow commit"; exit 1;
+          }
+
+      - name: Download the preserved Windows candidate
+        if: github.event_name == 'workflow_dispatch' && inputs.recovery_strategy == 'preserved-artifact'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-x64-win32
+          path: dist/release
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - name: Bind the preserved Windows candidate bytes
+        if: github.event_name == 'workflow_dispatch' && inputs.recovery_strategy == 'preserved-artifact'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ needs.verify-source.outputs.version }}'
+          ASSET="dist/release/crabcode-${VERSION}-x64-win32.zip"
+          test -s "${ASSET}"
+          ACTUAL="$(sha256sum "${ASSET}" | awk '{print $1}')"
+          test "${ACTUAL}" = "${CANDIDATE_WINDOWS_SHA256}" || {
+            echo "::error::preserved candidate digest mismatch: expected ${CANDIDATE_WINDOWS_SHA256}, got ${ACTUAL}"; exit 1;
+          }
+
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        if: github.event_name != 'workflow_dispatch' || inputs.recovery_strategy != 'preserved-artifact'
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Prove deterministic Windows PE linking before native allocation
+        if: github.event_name != 'workflow_dispatch' || inputs.recovery_strategy != 'preserved-artifact'
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -249,6 +363,7 @@ jobs:
           }
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: github.event_name != 'workflow_dispatch' || inputs.recovery_strategy != 'preserved-artifact'
         with:
           workspaces: |
             crates
@@ -276,12 +391,15 @@ jobs:
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
 
       - name: Build closed TypeScript business runtime
+        if: github.event_name != 'workflow_dispatch' || inputs.recovery_strategy != 'preserved-artifact'
         run: bun run build:ts
 
       - name: Enforce complete source and executable boundary
+        if: github.event_name != 'workflow_dispatch' || inputs.recovery_strategy != 'preserved-artifact'
         run: node scripts/repository-boundary.mjs
 
       - name: Build native Rust TUI product closure
+        if: github.event_name != 'workflow_dispatch' || inputs.recovery_strategy != 'preserved-artifact'
         shell: bash
         run: |
           set -euo pipefail
@@ -295,6 +413,7 @@ jobs:
             --bin acosmi-memory-orchestrator
 
       - name: Assemble and verify one compiled product closure
+        if: github.event_name != 'workflow_dispatch' || inputs.recovery_strategy != 'preserved-artifact'
         shell: bash
         run: |
           set -euo pipefail
@@ -360,20 +479,6 @@ jobs:
             --archive "${ASSET}" \
             --installer scripts/install.ps1 \
             --iterations 100
-
-      - name: Load the audited recovery harness from the workflow commit
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git cat-file -e "${RELEASE_TOOLING_SHA}^{commit}"
-          git merge-base --is-ancestor "${RELEASE_TOOLING_SHA}" origin/main || {
-            echo "::error::recovery tooling commit is not on enterprise main"; exit 1;
-          }
-          git restore --source="${RELEASE_TOOLING_SHA}" -- scripts/release-package-smoke.mjs
-          git diff --quiet "${RELEASE_TOOLING_SHA}" -- scripts/release-package-smoke.mjs || {
-            echo "::error::failed to bind the recovery harness to the workflow commit"; exit 1;
-          }
 
       - name: Complete installer-first recovery and one direct confirmation replay
         if: github.event_name == 'workflow_dispatch'

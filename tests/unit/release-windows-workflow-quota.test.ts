@@ -5,13 +5,21 @@ import { describe, expect, test } from "bun:test";
 const root = join(import.meta.dir, "../..");
 
 describe("Windows release recovery quota controls", () => {
+  test("writes native generation markers with protocol LF on Windows", async () => {
+    const installer = await readFile(join(root, "scripts/install.ps1"), "utf8");
+
+    expect(installer).not.toContain("[Environment]::NewLine");
+    expect(installer.match(/\+ "`n"/g)).toHaveLength(2);
+    expect(installer).toContain("native generation-marker protocol");
+  });
+
   test("makes PE linking deterministic before the hosted native build", async () => {
     const workflow = await readFile(
       join(root, ".github/workflows/release.yml"),
       "utf8",
     );
     const probe = "Prove deterministic Windows PE linking before native allocation";
-    const nativeBuild = "Build native Rust TUI product closure";
+    const nativeBuild = "\n      - name: Build native Rust TUI product closure";
 
     expect(workflow).toContain(
       "RUSTFLAGS: -C link-arg=/Brepro -C link-arg=/DEBUG:NONE",
@@ -57,5 +65,33 @@ describe("Windows release recovery quota controls", () => {
     expect(repeatedSlice).toContain("--iterations 100");
     expect(recoverySlice).toContain("if: github.event_name == 'workflow_dispatch'");
     expect(recoverySlice).toContain("--iterations 1");
+  });
+
+  test("can reuse a preserved candidate without allocating a Rust build", async () => {
+    const workflow = await readFile(
+      join(root, ".github/workflows/release.yml"),
+      "utf8",
+    );
+    const preserved = "inputs.recovery_strategy == 'preserved-artifact'";
+    const noPreservedBuild =
+      "github.event_name != 'workflow_dispatch' || inputs.recovery_strategy != 'preserved-artifact'";
+
+    expect(workflow).toContain("candidate_run_id:");
+    expect(workflow).toContain("candidate_windows_sha256:");
+    expect(workflow).toContain("actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131");
+    expect(workflow).toContain("Bind the preserved Windows candidate bytes");
+    expect(workflow).toContain("Verify preserved Windows candidate provenance");
+    expect(
+      workflow.match(
+        new RegExp(
+          noPreservedBuild.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+          "g",
+        ),
+      ),
+    ).toHaveLength(7);
+    expect(workflow).toContain(preserved);
+    expect(workflow).toContain("git restore --source=\"${RELEASE_TOOLING_SHA}\" -- \\");
+    expect(workflow).toContain("scripts/install.ps1 \\");
+    expect(workflow).toContain("scripts/release-package-smoke.mjs");
   });
 });

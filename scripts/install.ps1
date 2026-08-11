@@ -168,11 +168,14 @@ try {
     Copy-Item -LiteralPath (Join-Path $destination 'crabcode.exe') -Destination $stableTemp
 
     $currentTemp = Join-Path $versions ('.current.tmp.' + [Guid]::NewGuid().ToString('N'))
-    [IO.File]::WriteAllText($currentTemp, $destination + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+    # The native generation-marker protocol is byte-stable across platforms and
+    # accepts one UTF-8 path terminated by LF. Do not use Environment.NewLine:
+    # its Windows CRLF leaves a control character in the Rust parser's value.
+    [IO.File]::WriteAllText($currentTemp, $destination + "`n", (New-Object Text.UTF8Encoding($false)))
     Move-Item -LiteralPath $currentTemp -Destination (Join-Path $versions '.current') -Force
     Move-Item -LiteralPath $stableTemp -Destination $stable -Force
     $markerTemp = Join-Path $versions ('.launcher-v1.tmp.' + [Guid]::NewGuid().ToString('N'))
-    [IO.File]::WriteAllText($markerTemp, $stable + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($markerTemp, $stable + "`n", (New-Object Text.UTF8Encoding($false)))
     Move-Item -LiteralPath $markerTemp -Destination (Join-Path $versions '.launcher-v1') -Force
 
     Write-Info "CrabCode TUI $version installed at $destination"
