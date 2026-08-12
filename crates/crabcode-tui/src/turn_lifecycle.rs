@@ -10,8 +10,11 @@ use std::time::{Duration, Instant};
 use crate::sdk_projection::{DirectStreamActivityPhase, DirectStreamActivityState};
 
 const ANIMATION_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
+#[cfg(test)]
 const SPINNER_DIVISOR: u64 = 4;
+#[cfg(test)]
 const WATCHER_PULSE_DIVISOR: u64 = SPINNER_DIVISOR * 2;
+#[cfg(test)]
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Idle-surviving work that can wake the agent after the foreground turn has
@@ -78,6 +81,8 @@ pub(crate) struct TurnStatus {
     generation: u64,
     started_at: Option<Instant>,
     activity_started_at: Option<Instant>,
+    last_outcome: Option<TurnOutcome>,
+    last_elapsed: Option<Duration>,
     animation_tick: u64,
     next_animation_at: Option<Instant>,
     watchers: Watchers,
@@ -91,6 +96,8 @@ impl Default for TurnStatus {
             generation: 0,
             started_at: None,
             activity_started_at: None,
+            last_outcome: None,
+            last_elapsed: None,
             animation_tick: 0,
             next_animation_at: None,
             watchers: Watchers::default(),
@@ -119,6 +126,14 @@ impl TurnStatus {
     pub(crate) fn elapsed(&self, now: Instant) -> Option<Duration> {
         self.started_at
             .map(|started| now.saturating_duration_since(started))
+    }
+
+    pub(crate) fn last_outcome(&self) -> Option<TurnOutcome> {
+        self.last_outcome
+    }
+
+    pub(crate) fn last_elapsed(&self) -> Option<Duration> {
+        self.last_elapsed
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -158,6 +173,8 @@ impl TurnStatus {
         self.generation = generation;
         self.started_at = Some(now);
         self.activity_started_at = None;
+        self.last_outcome = None;
+        self.last_elapsed = None;
         self.animation_tick = 0;
         self.next_animation_at = Some(now + ANIMATION_INTERVAL);
     }
@@ -213,16 +230,36 @@ impl TurnStatus {
     pub(crate) fn cancel(&mut self, now: Instant) {
         self.begin_if_idle(now);
         self.state = AgentState::Cancelling;
+        // Cancelling is its own visible phase. Do not let the header report
+        // the elapsed time of whichever activity happened to precede it.
+        self.activity_started_at = Some(now);
         self.next_animation_at
             .get_or_insert(now + ANIMATION_INTERVAL);
     }
 
-    pub(crate) fn finish(&mut self, _outcome: TurnOutcome) {
+    pub(crate) fn finish(&mut self, outcome: TurnOutcome) {
+        self.finish_at(outcome, Instant::now());
+    }
+
+    fn finish_at(&mut self, outcome: TurnOutcome, now: Instant) {
+        if self.started_at.is_none()
+            && !self.is_running()
+            && matches!(outcome, TurnOutcome::Complete | TurnOutcome::Cancelled)
+        {
+            // Initial/duplicate idle convergence is not a completed user
+            // turn. Recording it would make a fresh welcome claim that a
+            // prior turn finished when no turn clock ever opened.
+            return;
+        }
+        self.last_elapsed = self
+            .started_at
+            .map(|started| now.saturating_duration_since(started));
+        self.last_outcome = Some(outcome);
         self.state = AgentState::Idle;
         self.activity = None;
+        self.started_at = None;
         self.activity_started_at = None;
-        self.next_animation_at =
-            (self.watchers.total() > 0).then(|| Instant::now() + ANIMATION_INTERVAL);
+        self.next_animation_at = (self.watchers.total() > 0).then(|| now + ANIMATION_INTERVAL);
     }
 
     pub(crate) fn reset(&mut self) {
@@ -245,6 +282,7 @@ impl TurnStatus {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn spinner(&self) -> Option<&'static str> {
         self.is_running().then(|| {
             let frame = (self.animation_tick / SPINNER_DIVISOR) as usize % SPINNER_FRAMES.len();
@@ -252,6 +290,7 @@ impl TurnStatus {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn watcher_icon(&self) -> Option<&'static str> {
         if self.is_running() || self.watchers.total() == 0 {
             return None;
@@ -341,5 +380,45 @@ mod tests {
         status.set_watchers(Watchers::default(), start + Duration::from_secs(1));
         assert!(status.watcher_icon().is_none());
         assert_eq!(status.animation_deadline(), None);
+    }
+
+    #[test]
+    fn terminal_outcome_and_elapsed_are_frozen_until_the_next_turn() {
+        let start = Instant::now();
+        let finish = start + Duration::from_secs(48);
+        let mut status = TurnStatus::default();
+        status.begin(1, start);
+        status.set_activity(TurnActivity::Responding, start + Duration::from_secs(2));
+        status.finish_at(TurnOutcome::Failed, finish);
+
+        assert_eq!(status.last_outcome(), Some(TurnOutcome::Failed));
+        assert_eq!(status.last_elapsed(), Some(Duration::from_secs(48)));
+        assert_eq!(status.elapsed(finish + Duration::from_secs(30)), None);
+
+        status.begin(2, finish + Duration::from_secs(30));
+        assert_eq!(status.last_outcome(), None);
+        assert_eq!(status.last_elapsed(), None);
+    }
+
+    #[test]
+    fn idle_convergence_does_not_invent_a_previous_turn() {
+        let mut status = TurnStatus::default();
+        status.finish_at(TurnOutcome::Complete, Instant::now());
+        assert_eq!(status.last_outcome(), None);
+        assert_eq!(status.last_elapsed(), None);
+    }
+
+    #[test]
+    fn cancelling_starts_a_distinct_phase_clock() {
+        let start = Instant::now();
+        let cancelling = start + Duration::from_secs(9);
+        let mut status = TurnStatus::default();
+        status.begin(1, start);
+        status.set_activity(TurnActivity::Thinking, start + Duration::from_secs(1));
+        status.cancel(cancelling);
+
+        assert_eq!(status.state(), AgentState::Cancelling);
+        assert_eq!(status.activity_started_at(), Some(cancelling));
+        assert_eq!(status.elapsed(cancelling), Some(Duration::from_secs(9)));
     }
 }

@@ -2392,10 +2392,16 @@ printf 'UNEXPECTED_FILE_EDITOR_LAUNCH\n'
         Arc::clone(&captured),
         None,
     );
+    wait_until_condition(
+        Duration::from_secs(5),
+        "fail-closed keybinding SDK initialize response",
+        || {
+            std::fs::read_to_string(&fixture.setup_path)
+                .is_ok_and(|transcript| transcript.contains("\"initialize_response\""))
+        },
+    );
     wait_until(&captured, Duration::from_secs(5), |output| {
-        output.contains(ENTER_ALTERNATE_SCREEN)
-            && output.contains(ENABLE_BRACKETED_PASTE)
-            && output.contains("直连运行环境已初始化")
+        output.contains(ENTER_ALTERNATE_SCREEN) && output.contains(ENABLE_BRACKETED_PASTE)
     });
 
     {
@@ -3194,15 +3200,21 @@ fn minimal_mode_never_enters_alt_screen_and_restores_after_signal() {
         Arc::clone(&captured),
         Some(Arc::clone(&writer)),
     );
+    // Setup dialogs are intentionally paintable before StructuredIO owns
+    // stdin. Synchronize this post-handoff signal test on the authoritative
+    // SDK initialize response, not on UI copy that can change independently.
+    wait_until_condition(
+        Duration::from_secs(5),
+        "minimal-mode SDK initialize response",
+        || {
+            std::fs::read_to_string(&fixture.setup_path)
+                .is_ok_and(|transcript| transcript.contains("\"initialize_response\""))
+        },
+    );
     wait_until(&captured, Duration::from_secs(5), |output| {
         output.contains(ENABLE_BRACKETED_PASTE)
             && output.contains(ENABLE_FOCUS_CHANGE)
             && output.contains(HIDE_CURSOR)
-            // Setup dialogs are intentionally paintable before StructuredIO
-            // owns stdin. Synchronize this post-handoff signal test on the
-            // authoritative SDK initialize response, not on a generic branded
-            // setup frame that can race the setup router.
-            && output.contains("直连运行环境已初始化")
     });
     assert_ne!(
         pair.master

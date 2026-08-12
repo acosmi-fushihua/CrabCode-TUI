@@ -42,11 +42,11 @@ use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Widget as _};
+use ratatui::style::Color;
 #[cfg(test)]
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::text::Line;
+#[cfg(test)]
+use ratatui::widgets::{Paragraph, Widget as _, Wrap};
 use ratatui::{TerminalOptions, Viewport};
 use tokio::sync::Notify;
 
@@ -66,6 +66,7 @@ use crate::terminal_writer::{
 };
 use crate::tui_app::{InitialSessionRequest, TuiApp, UiLanguage};
 use crate::tui_render::{CrabCodeTheme, write_osc8_close};
+use crate::welcome_surface::{WelcomeViewModel, native_welcome_height, render_welcome_surface};
 
 const LEGACY_FULLSCREEN_ENV: &str = "CRABCODE_NO_FLICKER";
 const LEGACY_USER_TYPE_ENV: &str = "USER_TYPE";
@@ -3259,20 +3260,16 @@ pub(crate) fn active_mode_is_minimal() -> bool {
     TerminalMode::from_atomic(ACTIVE_MODE.load(Ordering::Acquire)) == TerminalMode::Minimal
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MinimalWelcomeCard {
-    language: UiLanguage,
-    preparing: bool,
+    model: WelcomeViewModel,
     height: u16,
 }
 
-fn minimal_welcome_card(language: UiLanguage, preparing: bool) -> MinimalWelcomeCard {
+fn minimal_welcome_card(app: &TuiApp, width: u16) -> MinimalWelcomeCard {
     MinimalWelcomeCard {
-        language,
-        preparing,
-        // Rounded card (2) + six compact content rows, then one native
-        // scrollback gap. This height is stable at every supported width.
-        height: 9,
+        model: WelcomeViewModel::from_app(app),
+        height: native_welcome_height(width),
     }
 }
 
@@ -3281,111 +3278,8 @@ fn render_minimal_welcome_card(
     card: MinimalWelcomeCard,
     theme: CrabCodeTheme,
 ) {
-    let card_area = Rect {
-        height: buffer.area.height.saturating_sub(1),
-        ..buffer.area
-    };
-    Block::new()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.gray_dim))
-        .render(card_area, buffer);
-
-    let x = card_area.x.saturating_add(2);
-    let width = card_area.width.saturating_sub(4);
-    let first_row = card_area.y.saturating_add(1);
-    buffer.set_line(
-        x,
-        first_row,
-        &Line::from(vec![
-            Span::styled(
-                "CrabCode",
-                Style::default()
-                    .fg(theme.accent_assistant)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                card.language.text("  原生 Rust TUI", "  native Rust TUI"),
-                Style::default().fg(theme.gray),
-            ),
-        ]),
-        width,
-    );
-    buffer.set_line(
-        x,
-        first_row.saturating_add(1),
-        &Line::from(vec![
-            Span::styled(
-                "● ",
-                Style::default().fg(if card.preparing {
-                    theme.accent_running
-                } else {
-                    theme.accent_success
-                }),
-            ),
-            Span::styled(
-                match (card.language, card.preparing) {
-                    (UiLanguage::ZhCn, true) => "正在准备会话…",
-                    (UiLanguage::ZhCn, false) => "已就绪，可以开始",
-                    (UiLanguage::EnUs, true) => "Preparing the session…",
-                    (UiLanguage::EnUs, false) => "Ready to start",
-                },
-                Style::default()
-                    .fg(theme.text_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        width,
-    );
-    buffer.set_line(
-        x,
-        first_row.saturating_add(3),
-        &Line::from(Span::styled(
-            card.language.text("快速开始", "Quick start"),
-            Style::default()
-                .fg(theme.text_primary)
-                .add_modifier(Modifier::BOLD),
-        )),
-        width,
-    );
-    let primary_action = match (card.language, width < 68) {
-        (UiLanguage::ZhCn, _) => "› 直接描述目标，或粘贴错误信息与日志",
-        (UiLanguage::EnUs, true) => "› Describe a goal or paste an error",
-        (UiLanguage::EnUs, false) => "› Describe a goal, paste an error, or inspect this workspace",
-    };
-    buffer.set_line(
-        x,
-        first_row.saturating_add(4),
-        &Line::from(Span::styled(
-            primary_action,
-            Style::default().fg(theme.text_secondary),
-        )),
-        width,
-    );
-    buffer.set_line(
-        x,
-        first_row.saturating_add(5),
-        &Line::from(vec![
-            Span::styled("Enter", Style::default().fg(theme.accent_system)),
-            Span::styled(
-                card.language.text(" 发送", " send"),
-                Style::default().fg(theme.gray),
-            ),
-            Span::styled("  ·  ", Style::default().fg(theme.gray_dim)),
-            Span::styled("/help", Style::default().fg(theme.accent_system)),
-            Span::styled(
-                card.language.text(" 操作说明", " controls"),
-                Style::default().fg(theme.gray),
-            ),
-            Span::styled("  ·  ", Style::default().fg(theme.gray_dim)),
-            Span::styled("/model", Style::default().fg(theme.accent_system)),
-            Span::styled(
-                card.language.text(" 选择模型", " choose model"),
-                Style::default().fg(theme.gray),
-            ),
-        ]),
-        width,
-    );
+    let area = buffer.area;
+    render_welcome_surface(buffer, area, &card.model, theme);
 }
 
 fn commit_minimal_welcome_with(
@@ -3399,12 +3293,7 @@ fn commit_minimal_welcome_with(
     {
         return Ok(false);
     }
-    let preparing = app.busy()
-        || matches!(
-            app.projection.session_state(),
-            Some("initializing" | "running")
-        );
-    let card = minimal_welcome_card(app.ui_language(), preparing);
+    let card = minimal_welcome_card(app, width);
     emit(card)?;
     // Clear only after the native insertion succeeds. If terminal output
     // fails, the same fresh-session card remains retryable next frame.
@@ -6204,14 +6093,32 @@ mod tests {
     }
 
     #[test]
-    fn minimal_welcome_is_compact_responsive_and_has_no_pixel_wordmark() {
-        let card = minimal_welcome_card(crate::tui_app::UiLanguage::ZhCn, false);
-        assert_eq!(card.height, 9);
+    fn minimal_welcome_consumes_the_shared_responsive_surface() {
+        let welcome_model = |preparing| WelcomeViewModel {
+            language: crate::tui_app::UiLanguage::ZhCn,
+            preparing,
+            model: Some("DeepSeek-v4-Flash".to_string()),
+            cwd: Some("/workspace/CrabCode-TUI".to_string()),
+            commands: vec![
+                crate::welcome_surface::WelcomeCommand {
+                    name: "/help".to_string(),
+                    description: "查看全部命令".to_string(),
+                },
+                crate::welcome_surface::WelcomeCommand {
+                    name: "/model".to_string(),
+                    description: "切换模型".to_string(),
+                },
+            ],
+        };
 
         for width in [120_u16, 80, 60] {
+            let card = MinimalWelcomeCard {
+                model: welcome_model(false),
+                height: native_welcome_height(width),
+            };
             let area = Rect::new(0, 0, width, card.height);
             let mut buffer = Buffer::empty(area);
-            render_minimal_welcome_card(&mut buffer, card, CrabCodeTheme::dark());
+            render_minimal_welcome_card(&mut buffer, card.clone(), CrabCodeTheme::dark());
             let rows = (0..card.height)
                 .map(|row| {
                     (0..width)
@@ -6226,21 +6133,18 @@ mod tests {
                 .join("\n");
             let diagnostic = format!("{width}x{}: {rows:#?}", card.height);
 
-            assert!(compact.contains("CrabCode原生RustTUI"), "{diagnostic}");
-            assert!(compact.contains("已就绪，可以开始"), "{diagnostic}");
-            assert!(compact.contains("快速开始"), "{diagnostic}");
-            assert!(compact.contains("Enter发送"), "{diagnostic}");
-            assert!(compact.contains("/help操作说明"), "{diagnostic}");
-            assert!(compact.contains("/model选择模型"), "{diagnostic}");
-            assert!(
-                !rows.iter().any(|row| row.contains(['▀', '▄', '█'])),
-                "minimal welcome must not paint a pixel wordmark: {diagnostic}"
+            assert!(compact.contains("DeepSeek-v4-Flash"), "{diagnostic}");
+            if width >= 72 {
+                assert!(compact.contains("CrabCode-TUI"), "{diagnostic}");
+            }
+            assert!(compact.contains("/help"), "{diagnostic}");
+            assert_eq!(
+                rows.iter().any(|row| row.contains(['▀', '▄', '█'])),
+                width >= 72,
+                "only wide/standard layouts paint the shared pixel wordmark: {diagnostic}"
             );
             assert!(rows[0].starts_with('╭'), "{diagnostic}");
-            assert!(
-                rows[card.height as usize - 2].starts_with('╰'),
-                "{diagnostic}"
-            );
+            assert!(rows.iter().any(|row| row.starts_with('╰')), "{diagnostic}");
             for row in 0..card.height {
                 for column in 0..width {
                     let symbol_width =
@@ -6253,41 +6157,51 @@ mod tests {
             }
         }
 
+        let card = MinimalWelcomeCard {
+            model: welcome_model(false),
+            height: native_welcome_height(80),
+        };
         let area = Rect::new(0, 0, 80, card.height);
         let mut dark_buffer = Buffer::empty(area);
         let mut light_buffer = Buffer::empty(area);
-        render_minimal_welcome_card(&mut dark_buffer, card, CrabCodeTheme::dark());
+        render_minimal_welcome_card(&mut dark_buffer, card.clone(), CrabCodeTheme::dark());
         render_minimal_welcome_card(&mut light_buffer, card, CrabCodeTheme::light());
-        assert_eq!(
-            dark_buffer[(2, 1)].fg,
-            CrabCodeTheme::dark().accent_assistant
-        );
-        assert_eq!(
-            light_buffer[(2, 1)].fg,
-            CrabCodeTheme::light().accent_assistant
-        );
-        assert_eq!(dark_buffer[(4, 2)].fg, CrabCodeTheme::dark().text_primary);
-        assert_eq!(light_buffer[(4, 2)].fg, CrabCodeTheme::light().text_primary);
-        assert_ne!(dark_buffer[(4, 2)].fg, light_buffer[(4, 2)].fg);
-        assert_eq!(dark_buffer[(2, 2)].fg, CrabCodeTheme::dark().accent_success);
+        assert!(dark_buffer.content().iter().any(|cell| {
+            cell.fg == CrabCodeTheme::dark().accent_assistant
+                && matches!(cell.symbol(), "▀" | "▄" | "█")
+        }));
+        assert!(light_buffer.content().iter().any(|cell| {
+            cell.fg == CrabCodeTheme::light().accent_assistant
+                && matches!(cell.symbol(), "▀" | "▄" | "█")
+        }));
 
-        let preparing = minimal_welcome_card(crate::tui_app::UiLanguage::ZhCn, true);
-        let mut preparing_buffer = Buffer::empty(area);
-        render_minimal_welcome_card(&mut preparing_buffer, preparing, CrabCodeTheme::dark());
+        let preparing = MinimalWelcomeCard {
+            model: welcome_model(true),
+            height: native_welcome_height(60),
+        };
+        let preparing_area = Rect::new(0, 0, 60, preparing.height);
+        let mut preparing_buffer = Buffer::empty(preparing_area);
+        render_minimal_welcome_card(
+            &mut preparing_buffer,
+            preparing.clone(),
+            CrabCodeTheme::dark(),
+        );
         let preparing_rows = (0..preparing.height)
             .map(|row| {
-                (0..area.width)
+                (0..preparing_area.width)
                     .map(|column| preparing_buffer[(column, row)].symbol())
                     .collect::<String>()
             })
             .collect::<String>();
         assert!(
-            preparing_rows.replace(' ', "").contains("正在准备会话…"),
+            preparing_rows.replace(' ', "").contains("正在准备会话"),
             "{preparing_rows:?}"
         );
-        assert_eq!(
-            preparing_buffer[(2, 2)].fg,
-            CrabCodeTheme::dark().accent_running
+        assert!(
+            preparing_buffer
+                .content()
+                .iter()
+                .any(|cell| cell.fg == CrabCodeTheme::dark().accent_running)
         );
     }
 

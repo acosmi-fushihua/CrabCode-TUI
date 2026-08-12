@@ -425,6 +425,17 @@ pub enum InitialSessionRequest {
     },
 }
 
+/// Renderer-owned shell state for deciding whether the welcome surface or an
+/// active conversation is shown. This state is intentionally independent of
+/// transcript occupancy and of the native-scrollback welcome commit marker:
+/// notices may occupy the transcript before a conversation starts, while a
+/// committed native welcome card must not itself start a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellPhase {
+    Welcome,
+    Conversation,
+}
+
 #[derive(Clone, PartialEq)]
 pub enum HostAction {
     SendUser {
@@ -2400,6 +2411,7 @@ pub struct TuiApp {
     runtime_stop_reason: Option<String>,
     minimal_mode: bool,
     mouse_clicks_disabled: bool,
+    shell_phase: ShellPhase,
     minimal_welcome_pending: bool,
     initial_prompt: Option<String>,
     expected_session_id: Option<String>,
@@ -2536,7 +2548,12 @@ impl TuiApp {
             Err(error) => (Vec::new(), Some(error)),
         };
         let account_summary = initialize_payload.get("account").map(bounded_pretty_json);
-        let minimal_welcome_pending = matches!(&initial_session, InitialSessionRequest::New);
+        let shell_phase = if matches!(&initial_session, InitialSessionRequest::New) {
+            ShellPhase::Welcome
+        } else {
+            ShellPhase::Conversation
+        };
+        let minimal_welcome_pending = shell_phase == ShellPhase::Welcome;
         let context_usage_is_baseline = matches!(&initial_session, InitialSessionRequest::New);
         // The app is constructed before the direct runtime's existing SDK
         // initialize response. That response is the sole readiness boundary.
@@ -2673,6 +2690,7 @@ impl TuiApp {
             oauth_browser_manual_reveal_requested: false,
             minimal_mode: false,
             mouse_clicks_disabled: false,
+            shell_phase,
             minimal_welcome_pending,
             initial_prompt: initial_prompt.filter(|prompt| !prompt.is_empty()),
             initial_dispatched: false,
@@ -2912,8 +2930,11 @@ impl TuiApp {
     }
 
     pub(crate) fn setup_ctrl_c_confirmation_active(&self) -> bool {
-        self.setup_surface_exclusive()
-            && !self.should_quit
+        self.setup_surface_exclusive() && self.ctrl_c_confirmation_active()
+    }
+
+    pub(crate) fn ctrl_c_confirmation_active(&self) -> bool {
+        !self.should_quit
             && self.last_ctrl_c.is_some_and(|armed| {
                 Instant::now().duration_since(armed) <= QUIT_CONFIRMATION_WINDOW
             })
@@ -2921,6 +2942,16 @@ impl TuiApp {
                 == self
                     .renderer_ui_language
                     .text("再次按 Ctrl-C 即可退出", "Press Ctrl-C again to exit")
+    }
+
+    pub(crate) fn quit_shortcut_confirmation_active(&self) -> bool {
+        !self.should_quit
+            && self
+                .pending_action_confirmation
+                .is_some_and(|(action, armed)| {
+                    action == TuiActionId::Quit
+                        && Instant::now().duration_since(armed) <= QUIT_CONFIRMATION_WINDOW
+                })
     }
 
     pub(crate) const fn active_goal(&self) -> Option<&ActiveGoalState> {
@@ -3210,6 +3241,22 @@ impl TuiApp {
 
     pub(crate) const fn minimal_mode(&self) -> bool {
         self.minimal_mode
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn shell_phase(&self) -> ShellPhase {
+        self.shell_phase
+    }
+
+    pub(crate) const fn welcome_visible(&self) -> bool {
+        matches!(self.shell_phase, ShellPhase::Welcome)
+    }
+
+    fn mark_conversation_started(&mut self) {
+        self.shell_phase = ShellPhase::Conversation;
+        // Once a real prompt or visible conversation record exists, a pending
+        // terminal-native card is stale even if it was never committed.
+        self.minimal_welcome_pending = false;
     }
 
     pub(crate) const fn minimal_welcome_pending(&self) -> bool {
@@ -4487,6 +4534,11 @@ impl TuiApp {
                 // normally.
                 let (effect, mut transition_actions) = self.prepare_projection_effect(effect);
                 if observes_conversation_context {
+                    // This runs after a validated session transition resets
+                    // renderer state, so the triggering visible record starts
+                    // the new conversation instead of being overwritten by
+                    // the reset.
+                    self.mark_conversation_started();
                     self.context_usage_is_baseline = false;
                     self.baseline_context_send_users_pending = 0;
                 }
@@ -5187,6 +5239,9 @@ impl TuiApp {
     /// point is fatal and never retried.
     pub(crate) fn action_admitted(&mut self, action: &HostAction) {
         if matches!(action, HostAction::SendUser { .. }) {
+            // Renderer-queue acceptance is the single admission boundary for
+            // interactive, initial, and programmatic prompts.
+            self.mark_conversation_started();
             if self.context_usage_is_baseline || self.baseline_context_send_users_pending > 0 {
                 self.context_usage_is_baseline = false;
                 self.baseline_context_send_users_pending =
@@ -5830,6 +5885,24 @@ impl TuiApp {
         }
         self.slash_commands_enabled = enabled;
         self.rebuild_completion_commands();
+    }
+
+    /// Return a discoverable command from the same renderer/runtime catalog
+    /// that drives completion and Help. Welcome surfaces use this instead of
+    /// advertising names that merely happen to exist in design copy.
+    pub(crate) fn welcome_command(&self, name: &str) -> Option<&SlashCommandChoice> {
+        self.slash_commands_enabled.then_some(())?;
+        let name = name.strip_prefix('/').unwrap_or(name);
+        self.completion_commands
+            .iter()
+            .find(|command| !command.hidden && command.name == name)
+    }
+
+    pub(crate) fn workspace_cwd(&self) -> Option<&std::path::Path> {
+        self.projection
+            .cwd()
+            .map(std::path::Path::new)
+            .or(self.setup_source_cwd.as_deref())
     }
 
     fn rebuild_completion_commands(&mut self) {
@@ -9916,6 +9989,7 @@ impl TuiApp {
         self.dialog_pointer.reset();
         self.pending_outbound.clear();
         self.dialog_response_inflight = false;
+        self.shell_phase = ShellPhase::Welcome;
         self.minimal_welcome_pending = true;
         self.synchronize_modal_tree();
         terminal_actions
@@ -17998,6 +18072,135 @@ mod tests {
         })
     }
 
+    #[test]
+    fn shell_phase_is_sticky_and_independent_from_native_welcome_commit() {
+        let mut fresh = app();
+        assert_eq!(fresh.shell_phase(), ShellPhase::Welcome);
+        assert!(fresh.welcome_visible());
+        assert!(fresh.minimal_welcome_pending());
+
+        fresh.push_startup_notice("runtime diagnostic".to_string());
+        assert_eq!(
+            fresh.shell_phase(),
+            ShellPhase::Welcome,
+            "a BootPrefix notice is not conversation content"
+        );
+
+        fresh.mark_minimal_welcome_committed();
+        assert_eq!(fresh.shell_phase(), ShellPhase::Welcome);
+        assert!(fresh.welcome_visible());
+        assert!(!fresh.minimal_welcome_pending());
+
+        let send = HostAction::SendUser {
+            content: Value::String("first task".to_string()),
+            priority: None,
+        };
+        fresh.action_admitted(&send);
+        assert_eq!(fresh.shell_phase(), ShellPhase::Conversation);
+        assert!(!fresh.welcome_visible());
+        fresh.action_failed(&send, "writer unavailable");
+        assert_eq!(
+            fresh.shell_phase(),
+            ShellPhase::Conversation,
+            "queue admission is the sticky conversation boundary even if later delivery fails"
+        );
+
+        fresh.reset_renderer_session_projection_state();
+        assert_eq!(fresh.shell_phase(), ShellPhase::Welcome);
+        assert!(fresh.minimal_welcome_pending());
+
+        let resumed = TuiApp::new(
+            &json!({}),
+            InitialSessionRequest::ResumeExact {
+                session_id: "existing-session".to_string(),
+            },
+            None,
+        );
+        assert_eq!(resumed.shell_phase(), ShellPhase::Conversation);
+        assert!(!resumed.minimal_welcome_pending());
+    }
+
+    #[test]
+    fn only_visible_non_replayed_conversation_records_exit_welcome() {
+        let mut fresh = app();
+        fresh.handle_runtime_event(raw(
+            1,
+            json!({
+                "type":"user",
+                "message":{"role":"user","content":"replayed history"},
+                "uuid":"replayed-user",
+                "timestamp":"2026-08-12T00:00:00.000Z",
+                "isReplay":true
+            }),
+            EnvelopeClass::User,
+        ));
+        assert_eq!(fresh.shell_phase(), ShellPhase::Welcome);
+
+        fresh.handle_runtime_event(raw(
+            2,
+            json!({
+                "type":"user",
+                "message":{"role":"user","content":"real task"},
+                "uuid":"visible-user",
+                "timestamp":"2026-08-12T00:00:01.000Z"
+            }),
+            EnvelopeClass::User,
+        ));
+        assert_eq!(fresh.shell_phase(), ShellPhase::Conversation);
+        assert!(!fresh.minimal_welcome_pending());
+
+        fresh.reset_renderer_session_projection_state();
+        fresh.handle_runtime_event(raw(
+            3,
+            json!({
+                "type":"assistant",
+                "uuid":"visible-assistant",
+                "session_id":"assistant-session",
+                "parent_tool_use_id":null,
+                "message":{
+                    "id":"visible-assistant-message",
+                    "content":[{"type":"text","text":"real response"}]
+                }
+            }),
+            EnvelopeClass::Assistant,
+        ));
+        assert_eq!(fresh.shell_phase(), ShellPhase::Conversation);
+        assert!(!fresh.minimal_welcome_pending());
+    }
+
+    #[test]
+    fn welcome_command_truth_uses_the_visible_completion_authority() {
+        let mut app = app();
+        assert!(app.welcome_command("help").is_some());
+        assert!(app.welcome_command("/model").is_some());
+        assert!(app.welcome_command("resume").is_none());
+        assert!(app.welcome_command("release-notes").is_none());
+
+        app.commands.push(SlashCommandChoice {
+            name: "resume".to_string(),
+            description: "Resume a session".to_string(),
+            argument_hint: String::new(),
+            hidden: true,
+            builtin: true,
+        });
+        app.rebuild_completion_commands();
+        assert!(app.welcome_command("resume").is_none());
+
+        app.commands.push(SlashCommandChoice {
+            name: "release-notes".to_string(),
+            description: "View release notes".to_string(),
+            argument_hint: String::new(),
+            hidden: false,
+            builtin: true,
+        });
+        app.rebuild_completion_commands();
+        assert!(app.welcome_command("release-notes").is_some());
+
+        app.set_slash_commands_enabled(false);
+        assert!(app.welcome_command("help").is_none());
+        assert!(app.welcome_command("model").is_none());
+    }
+
     fn question_pending(input: Value) -> PendingControl {
         PendingControl {
             request_id: "question-request-1".to_string(),
@@ -19161,7 +19364,8 @@ mod tests {
             !app.context_usage_is_baseline(),
             "the real assistant envelope that opened the new session already carries conversation context"
         );
-        assert!(app.minimal_welcome_pending());
+        assert_eq!(app.shell_phase(), ShellPhase::Conversation);
+        assert!(!app.minimal_welcome_pending());
         assert_eq!(
             app.active_tasks.get("background-task").map(String::as_str),
             Some("still running"),

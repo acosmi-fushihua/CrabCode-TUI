@@ -66,9 +66,7 @@ use ratatui::Frame;
 use ratatui::backend::Backend;
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Block, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use unicode_width::UnicodeWidthStr as _;
 
 use crate::scrollback_projection::{
@@ -82,7 +80,8 @@ use crate::text_safety::sanitize_bounded_terminal_text;
 use crate::tui_app::{TuiApp, TuiRendererNoticePlacement, UiLanguage, projected_item_is_visible};
 use crate::tui_links::{LinkTarget, MermaidAffordanceAction};
 use crate::tui_render::CrabCodeTheme;
-use crate::tui_ui::{TranscriptRenderOutcome, empty_transcript_welcome_lines};
+use crate::tui_ui::TranscriptRenderOutcome;
+use crate::welcome_surface::{WelcomeViewModel, render_welcome_surface_for_width};
 
 /// Fixed-source multi-click window for word/line selection.
 const MULTI_CLICK_TIMEOUT: Duration = Duration::from_millis(300);
@@ -766,11 +765,8 @@ impl AgentView {
             };
         }
 
-        let block = Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().fg(theme.prompt_border))
-            .style(Style::default().bg(theme.bg_base));
-        let inner = block.inner(area).inner(Margin {
+        let block = Block::default().style(Style::default().bg(theme.bg_base));
+        let inner = area.inner(Margin {
             horizontal: 1,
             vertical: 0,
         });
@@ -782,13 +778,27 @@ impl AgentView {
             0
         };
         let (mut content, panel_area) = self.side_question_layout(inner, search_reserved_rows);
-        app.transcript_content_width = content.width;
-
-        if self.scrollback.is_empty() {
+        if app.welcome_visible() {
             self.pending_pointer_selection = None;
             self.last_scrollback_selection_model = ResolvedSelectionModel::default();
             self.last_scrollback_selection_boundaries = ResolvedSelectionBoundaries::default();
-            self.render_empty(frame, content, app, theme);
+            let model = WelcomeViewModel::from_app(app);
+            let welcome_rows = render_welcome_surface_for_width(
+                frame.buffer_mut(),
+                content,
+                area.width,
+                &model,
+                theme,
+            );
+            content.y = content.y.saturating_add(welcome_rows);
+            content.height = content.height.saturating_sub(welcome_rows);
+        }
+        app.transcript_content_width = content.width;
+
+        if self.scrollback.is_empty() || content.is_empty() {
+            self.pending_pointer_selection = None;
+            self.last_scrollback_selection_model = ResolvedSelectionModel::default();
+            self.last_scrollback_selection_boundaries = ResolvedSelectionBoundaries::default();
             let panel_links = self.paint_side_question_panel(frame, panel_area, app);
             let hyperlinks = self.synchronize_links(frame, app, theme, None, &panel_links);
             self.snapshot_highlighted_link(app);
@@ -2517,17 +2527,6 @@ impl AgentView {
             .is_some_and(|entry| entry.raw);
         app.set_renderer_selection_snapshot(selected_key, selected_raw);
         app.set_renderer_text_selection_active(self.persistent_text_selection.is_some());
-    }
-
-    fn render_empty(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp, theme: CrabCodeTheme) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        frame.render_widget(
-            Paragraph::new(empty_transcript_welcome_lines(app, area.width, theme))
-                .style(Style::default().bg(theme.bg_base)),
-            area,
-        );
     }
 
     fn reclamp_active_drag(&mut self, side_question_rebuilt: bool) {

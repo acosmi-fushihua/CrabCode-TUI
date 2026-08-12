@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
 use anstyle::{Ansi256Color, AnsiColor, Color as AnstyleColor, Style as AnstyleStyle};
 use crabcode_pager_render::appearance::RendererLanguage;
@@ -58,8 +57,7 @@ use crate::text_safety::{sanitize_bounded_terminal_text, sanitize_terminal_text}
 use crate::tui_app::{
     GoalTaskState, GoalVerdict, GoalVerificationState, McpMenuAction, McpSettingsView,
     OAuthBrowserNotice, OverlayKind, QuestionDialogAction, QuestionFocus, RequestDialog, TuiApp,
-    UiLanguage, canonical_goal_phase_ordinal, localized_permission_mode_label,
-    question_dialog_actions,
+    UiLanguage, canonical_goal_phase_ordinal, question_dialog_actions,
 };
 #[cfg(test)]
 use crate::tui_app::{
@@ -73,7 +71,8 @@ use crate::tui_links::{
     local_link_to_file_target, resolve_link_target, visible_link_groups_from_soft_wrapped_lines,
 };
 use crate::tui_render::{CrabCodeTheme, fit_line_to_width, truncate_str, wrap_line};
-use crate::turn_lifecycle::{AgentState, TurnActivity, WaitingReason, Watchers};
+#[cfg(test)]
+use crate::welcome_surface::{WelcomeViewModel, render_welcome_surface_for_width};
 use crate::workspace_search::WorkspaceSearchKind;
 
 #[cfg(test)]
@@ -106,99 +105,6 @@ const fn renderer_language(language: UiLanguage) -> RendererLanguage {
         UiLanguage::ZhCn => RendererLanguage::ZhCn,
         UiLanguage::EnUs => RendererLanguage::EnUs,
     }
-}
-
-/// Build the compact empty-transcript welcome shared by both transcript
-/// owners.
-///
-/// The top ribbon already carries global session metadata, so this surface
-/// keeps only the hierarchy needed to start working: product identity,
-/// current readiness, one primary action, and two real renderer-owned
-/// commands. Keeping the model line-oriented also makes the exact same copy
-/// fit full, standard, and narrow terminals without a large ASCII banner.
-pub(crate) fn empty_transcript_welcome_lines(
-    app: &TuiApp,
-    width: u16,
-    theme: CrabCodeTheme,
-) -> Vec<Line<'static>> {
-    let language = app.ui_language();
-    let initializing = matches!(app.projection.session_state(), Some("initializing"));
-    let active = app.busy() || initializing;
-    let status = match (language, active) {
-        (UiLanguage::ZhCn, true) => "正在准备会话…",
-        (UiLanguage::ZhCn, false) => "已就绪，可以开始",
-        (UiLanguage::EnUs, true) => "Preparing the session…",
-        (UiLanguage::EnUs, false) => "Ready to start",
-    };
-    let primary_action = match (language, width < 72) {
-        (UiLanguage::ZhCn, _) => "› 直接描述目标，或粘贴错误信息与日志",
-        (UiLanguage::EnUs, true) => "› Describe a goal or paste an error",
-        (UiLanguage::EnUs, false) => "› Describe a goal, paste an error, or inspect this workspace",
-    };
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "CrabCode",
-                Style::default()
-                    .fg(theme.accent_assistant)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                language.text("  原生 Rust TUI", "  native Rust TUI"),
-                Style::default().fg(theme.gray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "● ",
-                Style::default().fg(if active {
-                    theme.accent_running
-                } else {
-                    theme.accent_success
-                }),
-            ),
-            Span::styled(
-                status,
-                Style::default()
-                    .fg(theme.text_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::default(),
-        Line::styled(
-            language.text("快速开始", "Quick start"),
-            Style::default()
-                .fg(theme.text_primary)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(primary_action, Style::default().fg(theme.text_secondary)),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled("Enter", Style::default().fg(theme.accent_system)),
-            Span::styled(
-                language.text(" 发送", " send"),
-                Style::default().fg(theme.gray),
-            ),
-            Span::styled("  ·  ", Style::default().fg(theme.gray_dim)),
-            Span::styled("/help", Style::default().fg(theme.accent_system)),
-            Span::styled(
-                language.text(" 操作说明", " controls"),
-                Style::default().fg(theme.gray),
-            ),
-            Span::styled("  ·  ", Style::default().fg(theme.gray_dim)),
-            Span::styled("/model", Style::default().fg(theme.accent_system)),
-            Span::styled(
-                language.text(" 选择模型", " choose model"),
-                Style::default().fg(theme.gray),
-            ),
-        ]),
-    ];
-    let width = usize::from(width.max(1));
-    lines
-        .into_iter()
-        .map(|line| fit_line_to_width(line, width))
-        .collect()
 }
 
 /// Closed renderer-local syntax palette denominator from fixed CrabCode.
@@ -2798,230 +2704,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut TuiApp) -> RenderOutcome {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, theme: CrabCodeTheme) {
-    if area.is_empty() {
-        return;
-    }
-    let language = app.ui_language();
-    let width = usize::from(area.width);
-    let state = header_state_label(app);
-    let permission_mode = app.projection.permission_mode().unwrap_or("default");
-    let permission = permission_mode_label(permission_mode, language, width < 72);
-    let dangerous_permission = permission_mode == "bypassPermissions";
-    let ribbon = Style::default().bg(theme.bg_dark);
-
-    frame.render_widget(Block::default().style(ribbon), area);
-
-    let mut title_spans = vec![Span::styled(
-        " CrabCode ",
-        Style::default()
-            .fg(theme.bg_base)
-            .bg(theme.accent_assistant)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if width >= 64 {
-        title_spans.push(Span::styled(
-            language.text("  原生 TUI", "  native TUI"),
-            Style::default().fg(theme.text_primary).bg(theme.bg_dark),
-        ));
-    }
-    title_spans.extend([
-        Span::styled("  ", ribbon),
-        Span::styled(
-            "● ",
-            Style::default()
-                .fg(if app.busy() {
-                    theme.accent_running
-                } else {
-                    theme.accent_success
-                })
-                .bg(theme.bg_dark),
-        ),
-        Span::styled(
-            state,
-            Style::default()
-                .fg(theme.text_primary)
-                .bg(theme.bg_dark)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
-    let permission_style = if dangerous_permission {
-        Style::default()
-            .fg(theme.bg_base)
-            .bg(theme.accent_error)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(theme.accent_system)
-            .bg(theme.bg_highlight)
-            .add_modifier(Modifier::BOLD)
-    };
-    let permission_spans = vec![
-        Span::styled(
-            format!(" {} ", language.text("审批", "approval")),
-            Style::default().fg(theme.gray).bg(theme.bg_dark),
-        ),
-        Span::styled(format!(" {permission} "), permission_style),
-        Span::styled(" ", ribbon),
-    ];
-    let title = header_row_with_priority(title_spans, permission_spans, width, 10, ribbon);
-
-    let mut rows = vec![title];
-    if area.height > 1 {
-        let session = sanitize_bounded_terminal_text(
-            app.projection
-                .session_id()
-                .map(short_id)
-                .unwrap_or(language.text("新会话", "new")),
-        );
-        let model = sanitize_bounded_terminal_text(
-            app.projection
-                .model()
-                .unwrap_or(language.text("模型待回报", "model pending")),
-        );
-        let metadata = if width >= 88 {
-            vec![
-                Span::styled(
-                    format!(" {} {}", language.text("会话", "session"), session),
-                    Style::default().fg(theme.gray).bg(theme.bg_dark),
-                ),
-                Span::styled(" │ ", Style::default().fg(theme.gray_dim).bg(theme.bg_dark)),
-                Span::styled(
-                    format!("{} {model}", language.text("模型", "model")),
-                    Style::default().fg(theme.text_secondary).bg(theme.bg_dark),
-                ),
-            ]
-        } else {
-            vec![Span::styled(
-                format!(" {} {model}", language.text("模型", "model")),
-                Style::default().fg(theme.text_secondary).bg(theme.bg_dark),
-            )]
-        };
-        let context = header_context_spans(app, theme);
-        rows.push(header_row_with_priority(
-            metadata, context, width, 0, ribbon,
-        ));
-    }
-    frame.render_widget(Paragraph::new(rows).style(ribbon), area);
-}
-
-fn header_state_label(app: &TuiApp) -> &'static str {
-    let language = app.ui_language();
-    if app.busy() {
-        return language.text("运行中", "running");
-    }
-    match app.projection.session_state() {
-        Some("initializing") => language.text("初始化中", "initializing"),
-        Some("requires_action") => language.text("等待确认", "action needed"),
-        Some("running") => language.text("运行中", "running"),
-        Some("ready" | "idle") | None => language.text("就绪", "ready"),
-        Some(_) => language.text("状态未知", "unknown state"),
-    }
-}
-
-fn permission_mode_label(mode: &str, language: UiLanguage, compact: bool) -> &'static str {
-    if !compact {
-        return localized_permission_mode_label(Some(mode), language);
-    }
-    match (language, mode, compact) {
-        (UiLanguage::ZhCn, "default", true) => "标准",
-        (UiLanguage::ZhCn, "acceptEdits", true) => "自动编辑",
-        (UiLanguage::ZhCn, "bypassPermissions", true) => "常规免审",
-        (UiLanguage::ZhCn, "plan", true) => "只规划",
-        (UiLanguage::ZhCn, "dontAsk", true) => "已批准",
-        (UiLanguage::ZhCn, "auto", true) => "自动",
-        (UiLanguage::ZhCn, _, _) => "自定义",
-        (UiLanguage::EnUs, "default", true) => "standard",
-        (UiLanguage::EnUs, "acceptEdits", true) => "auto edits",
-        (UiLanguage::EnUs, "bypassPermissions", true) => "routine auto",
-        (UiLanguage::EnUs, "plan", true) => "plan only",
-        (UiLanguage::EnUs, "dontAsk", true) => "approved",
-        (UiLanguage::EnUs, "auto", true) => "auto",
-        (UiLanguage::EnUs, _, _) => "custom",
-    }
-}
-
-fn header_context_spans(app: &TuiApp, theme: CrabCodeTheme) -> Vec<Span<'static>> {
-    let language = app.ui_language();
-    let label = if app.context_usage_is_baseline() {
-        language.text("基础上下文", "baseline context")
-    } else {
-        language.text("上下文", "context")
-    };
-    let (text, color) = if let Some(usage) = app.live_context_usage() {
-        let color = if usage.percentage >= 80 {
-            theme.accent_error
-        } else if usage.percentage >= 60 {
-            theme.warning
-        } else {
-            theme.accent_success
-        };
-        (
-            format!(
-                " {} {}/{} · {}% ",
-                label,
-                format_header_tokens(usage.total_tokens),
-                format_header_tokens(usage.max_tokens),
-                usage.percentage
-            ),
-            color,
-        )
-    } else {
-        (
-            format!(
-                " {} {} ",
-                label,
-                if app.context_usage_refresh_pending() {
-                    language.text("计算中…", "calculating…")
-                } else {
-                    language.text("待同步", "pending")
-                }
-            ),
-            theme.gray,
-        )
-    };
-    vec![
-        Span::styled(text, Style::default().fg(color).bg(theme.bg_dark)),
-        Span::styled(" ", Style::default().bg(theme.bg_dark)),
-    ]
-}
-
-fn format_header_tokens(tokens: u64) -> String {
-    let (value, suffix) = if tokens >= 1_000_000 {
-        (tokens as f64 / 1_000_000.0, "m")
-    } else if tokens >= 1_000 {
-        (tokens as f64 / 1_000.0, "k")
-    } else {
-        return tokens.to_string();
-    };
-    let mut formatted = format!("{value:.1}");
-    if formatted.ends_with(".0") {
-        formatted.truncate(formatted.len().saturating_sub(2));
-    }
-    format!("{formatted}{suffix}")
-}
-
-fn header_row_with_priority(
-    left: Vec<Span<'static>>,
-    right: Vec<Span<'static>>,
-    width: usize,
-    minimum_left_width: usize,
-    style: Style,
-) -> Line<'static> {
-    if width == 0 {
-        return Line::default();
-    }
-    let right_width = right.iter().map(|span| span.content.width()).sum::<usize>();
-    if right_width.saturating_add(minimum_left_width) > width {
-        return fit_line_to_width(Line::from(left).style(style), width);
-    }
-    if right_width >= width {
-        return fit_line_to_width(Line::from(right).style(style), width);
-    }
-    let mut line = fit_line_to_width(Line::from(left).style(style), width - right_width);
-    line.spans.extend(right);
-    line.style = style;
-    line
+    crate::session_header::render_session_header(frame, area, app, theme);
 }
 
 #[cfg(test)]
@@ -3031,11 +2714,8 @@ fn render_transcript(
     app: &mut TuiApp,
     theme: CrabCodeTheme,
 ) -> (Vec<LinkSpan>, Option<(u16, u16)>) {
-    let block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(theme.prompt_border))
-        .style(Style::default().bg(theme.bg_base));
-    let inner = block.inner(area).inner(Margin {
+    let block = Block::default().style(Style::default().bg(theme.bg_base));
+    let inner = area.inner(Margin {
         horizontal: 1,
         vertical: 0,
     });
@@ -3056,6 +2736,18 @@ fn render_transcript(
         0
     };
     content_inner.height = content_inner.height.saturating_sub(search_reserved_rows);
+    if app.welcome_visible() && (!app.minimal_mode() || app.minimal_welcome_pending()) {
+        let model = WelcomeViewModel::from_app(app);
+        let welcome_rows = render_welcome_surface_for_width(
+            frame.buffer_mut(),
+            content_inner,
+            area.width,
+            &model,
+            theme,
+        );
+        content_inner.y = content_inner.y.saturating_add(welcome_rows);
+        content_inner.height = content_inner.height.saturating_sub(welcome_rows);
+    }
     let viewport_height = usize::from(content_inner.height);
     let full_width = usize::from(content_inner.width.max(1));
     let previous_scrolling_layout = app.transcript_layout.width() == full_width.saturating_sub(1)
@@ -3155,42 +2847,6 @@ fn render_transcript(
         viewport_height,
         theme,
     );
-    if visible.lines.is_empty() && (!app.minimal_mode() || app.minimal_welcome_pending()) {
-        if app.minimal_mode() {
-            // Minimal mode's print-once card is owned by terminal.rs. Keep
-            // this pre-commit fallback byte-for-byte aligned with that
-            // native-scrollback surface; the compact full-screen welcome is
-            // deliberately scoped to the live application viewport.
-            visible.lines.extend([
-                Line::styled(
-                    app.ui_language()
-                        .text("CrabCode 已就绪。", "CrabCode is ready."),
-                    Style::default()
-                        .fg(theme.text_primary)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Line::styled(
-                    app.ui_language().text(
-                        "请在下方输入提示词。使用 /help 查看 TUI 操作说明。",
-                        "Type a prompt below. /help shows TUI controls.",
-                    ),
-                    Style::default().fg(theme.gray),
-                ),
-            ]);
-        } else {
-            visible.lines.extend(empty_transcript_welcome_lines(
-                app,
-                content_inner.width,
-                theme,
-            ));
-        }
-        visible.link_groups = visible_link_groups_from_soft_wrapped_lines(
-            &visible.lines,
-            &vec![SoftWrapJoiner::HardBreak; visible.lines.len()],
-            &[],
-            Vec::new(),
-        );
-    }
     if let Some(regex) = search_highlight.as_ref() {
         highlight_transcript_search_matches(&mut visible.lines, regex);
     }
@@ -6316,36 +5972,55 @@ fn render_composer(
         );
         return None;
     }
+    let title_style = Style::default().fg(theme.gray_bright);
+    let title = language.text(" 输入 ", " Composer ");
+    let shift_enter_unavailable =
+        crate::terminal_capabilities::terminal_context().shift_enter_unavailable();
+    let hint = if area.width >= 72 {
+        if app.busy() {
+            language.text(
+                " Enter 加入队列 · Ctrl-Enter 立即调整方向 ",
+                " Enter queue · Ctrl-Enter steer now ",
+            )
+        } else if shift_enter_unavailable {
+            language.text(
+                " Enter 发送 · Alt-Enter 换行 ",
+                " Enter send · Alt-Enter newline ",
+            )
+        } else {
+            language.text(
+                " Enter 发送 · Shift/Alt-Enter 换行 ",
+                " Enter send · Shift/Alt-Enter newline ",
+            )
+        }
+    } else if area.width >= 44 {
+        if app.busy() {
+            language.text(
+                " Enter 排队 · Ctrl-Enter 调整 ",
+                " Enter queue · Ctrl-Enter steer ",
+            )
+        } else if shift_enter_unavailable {
+            language.text(
+                " Enter 发送 · Alt-Enter 换行 ",
+                " Enter send · Alt-Enter newline ",
+            )
+        } else {
+            language.text(
+                " Enter 发送 · Shift-Enter 换行 ",
+                " Enter send · Shift-Enter newline ",
+            )
+        }
+    } else if app.busy() {
+        language.text(" Enter 排队 ", " Enter queue ")
+    } else {
+        language.text(" Enter 发送 ", " Enter send ")
+    };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(identity_border.unwrap_or(theme.prompt_border_active)))
         .style(Style::default().bg(theme.bg_dark))
-        .title(Span::styled(
-            if crate::terminal_capabilities::terminal_context().shift_enter_unavailable() {
-                if app.busy() {
-                    language.text(
-                        " 输入 · Enter 加入队列 · Alt-Enter 换行 ",
-                        " Composer · Enter queue · Alt-Enter newline ",
-                    )
-                } else {
-                    language.text(
-                        " 输入 · Enter 发送 · Alt-Enter 换行 ",
-                        " Composer · Enter send · Alt-Enter newline ",
-                    )
-                }
-            } else if app.busy() {
-                language.text(
-                    " 输入 · Enter 加入队列 · Shift/Alt-Enter 换行 ",
-                    " Composer · Enter queue · Shift/Alt-Enter newline ",
-                )
-            } else {
-                language.text(
-                    " 输入 · Enter 发送 · Shift/Alt-Enter 换行 ",
-                    " Composer · Enter send · Shift/Alt-Enter newline ",
-                )
-            },
-            Style::default().fg(theme.gray_bright),
-        ));
+        .title(Span::styled(title, title_style))
+        .title(Line::styled(hint, title_style).right_aligned());
     if let Some(name) = app.retained_commands.name() {
         let badge_color = identity_border.unwrap_or(theme.background_accent);
         let inverse =
@@ -6851,43 +6526,34 @@ fn goal_console_lines(app: &TuiApp, inner_width: u16, theme: CrabCodeTheme) -> V
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp, theme: CrabCodeTheme) {
     let language = app.ui_language();
-    let suggestion = app
+    let suggestion_visible = app
         .projection
         .prompt_suggestion()
-        .filter(|_| app.composer.is_empty())
-        .map(|suggestion| {
-            format!(
-                "{}: {}",
-                language.text("Tab 建议", "Tab"),
-                sanitize_bounded_terminal_text(suggestion)
-            )
-        });
-    let follow = if app.transcript_following {
-        language.text("跟随", "follow")
+        .is_some_and(|_| app.composer.is_empty());
+    let left = if app.ctrl_c_confirmation_active() {
+        language.text(" 再次按 Ctrl-C 即可退出 ", " Press Ctrl-C again to exit ")
+    } else if app.quit_shortcut_confirmation_active() {
+        language.text(
+            " 再次按退出快捷键即可退出 ",
+            " Press the quit shortcut again to exit ",
+        )
+    } else if !app.transcript_following {
+        language.text(" 已暂停 · G 跟随最新内容 ", " Paused · G follow latest ")
+    } else if suggestion_visible {
+        language.text(" Tab 接受建议 ", " Tab accept suggestion ")
+    } else if app.welcome_command("help").is_some() {
+        language.text(" /help 命令 ", " /help commands ")
     } else {
-        language.text("已暂停", "paused")
+        ""
     };
-    let left = format!(
-        " {} ",
-        sanitize_bounded_terminal_text(&minimal_status_line(app))
-    );
-    let mut items = vec![StatusItem {
-        id: "scroll",
+    let items = vec![StatusItem {
+        id: "quit",
         line: Line::styled(
-            format!("{} {follow}", language.text("滚动", "scroll")),
-            Style::default().fg(theme.gray_dim).bg(theme.bg_base),
+            language.text("Ctrl+Q 退出", "Ctrl+Q quit"),
+            Style::default().fg(theme.gray).bg(theme.bg_base),
         ),
     }];
-    if let Some(suggestion) = suggestion {
-        items.push(StatusItem {
-            id: "suggestion",
-            line: Line::styled(
-                suggestion,
-                Style::default().fg(theme.gray_dim).bg(theme.bg_base),
-            ),
-        });
-    }
-    app.status_hit_areas = render_status_row(frame.buffer_mut(), area, theme, &left, items);
+    app.status_hit_areas = render_status_row(frame.buffer_mut(), area, theme, left, items);
 }
 
 fn latest_unfinished_todos(app: &TuiApp) -> Vec<(&str, &str)> {
@@ -7228,130 +6894,6 @@ fn task_card_field(raw: &str, max_width: usize) -> String {
     let sanitized = sanitize_bounded_terminal_text(raw);
     let single_line = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_str(&single_line, max_width)
-}
-
-/// Resolve the one-line live status from exact renderer state. Observed task
-/// descriptions take precedence, then the validated session state; idle keeps
-/// a discoverable local help hint.
-pub(crate) fn minimal_status_line(app: &TuiApp) -> String {
-    let language = app.ui_language();
-    let turn = app.turn_status();
-    if let Some(spinner) = turn.spinner() {
-        let activity = if turn.state() == AgentState::Cancelling {
-            language.text("正在取消", "Cancelling")
-        } else {
-            match turn.activity() {
-                Some(TurnActivity::Requesting) => {
-                    language.text("正在请求响应", "Requesting response")
-                }
-                Some(TurnActivity::Thinking) => language.text("正在思考", "Thinking"),
-                Some(TurnActivity::Responding) => language.text("正在回复", "Responding"),
-                Some(TurnActivity::ToolInput) => language.text("正在准备工具", "Preparing tool"),
-                Some(TurnActivity::ToolUse) => language.text("正在运行工具", "Running tool"),
-                Some(TurnActivity::Waiting(WaitingReason::Model)) => {
-                    language.text("正在等待模型", "Waiting for model")
-                }
-                Some(TurnActivity::Waiting(WaitingReason::User)) => {
-                    language.text("等待你的输入", "Waiting for your input")
-                }
-                Some(TurnActivity::Waiting(WaitingReason::Subagent)) => {
-                    language.text("正在等待子代理", "Waiting for subagent")
-                }
-                Some(TurnActivity::Waiting(WaitingReason::Task)) => {
-                    language.text("正在等待任务", "Waiting for task")
-                }
-                Some(TurnActivity::Retrying) => language.text("正在重试", "Retrying"),
-                None => language.text("正在工作", "Working"),
-            }
-        };
-        let now = Instant::now();
-        let phase = turn
-            .activity_started_at()
-            .map(|started| compact_turn_duration(now.saturating_duration_since(started)))
-            .unwrap_or_else(|| "0s".to_string());
-        let total = turn
-            .elapsed(now)
-            .map(compact_turn_duration)
-            .unwrap_or_else(|| "0s".to_string());
-        return format!("{spinner} {activity} {phase}  ·  {total}");
-    }
-    if let Some(icon) = turn.watcher_icon() {
-        return format!("{icon} {}", still_running_label(turn.watchers(), language));
-    }
-    if let Some((task_id, summary)) = app.active_tasks.iter().min_by_key(|(task_id, _)| *task_id) {
-        return format!(
-            "{} {task_id} · {summary}",
-            language.text("活动任务", "Active")
-        );
-    }
-    if app.stream_requesting() {
-        return language
-            .text("CrabCode 正在请求响应", "CrabCode is requesting a response")
-            .to_string();
-    }
-    match app.projection.session_state() {
-        Some("running") => app
-            .projection
-            .items()
-            .iter()
-            .rev()
-            .find(|item| item.streaming && item.kind == ProjectedKind::Progress)
-            .map_or_else(
-                || {
-                    language
-                        .text("CrabCode 正在响应", "CrabCode is responding")
-                        .to_string()
-                },
-                |item| {
-                    if item.text.is_empty() {
-                        format!("{} {}", language.text("运行", "Run"), item.title)
-                    } else {
-                        format!(
-                            "{} {} · {}",
-                            language.text("运行", "Run"),
-                            item.title,
-                            item.text
-                        )
-                    }
-                },
-            ),
-        Some("requires_action") => language
-            .text("等待你的输入", "Waiting for your input")
-            .to_string(),
-        _ if app.status.contains("/help") => app.status.clone(),
-        _ => format!("{} · /help", app.status),
-    }
-}
-
-fn still_running_label(watchers: Watchers, language: UiLanguage) -> String {
-    let mut parts = Vec::new();
-    let mut push = |count: usize, zh: &str, en: &str| {
-        if count == 0 {
-            return;
-        }
-        parts.push(match language {
-            UiLanguage::ZhCn => format!("{count} 个{zh}"),
-            UiLanguage::EnUs => format!("{count} {en}{}", if count == 1 { "" } else { "s" }),
-        });
-    };
-    push(watchers.commands, "命令", "command");
-    push(watchers.monitors, "监控", "monitor");
-    push(watchers.loops, "循环", "loop");
-    push(watchers.subagents, "子代理", "subagent");
-    push(watchers.workflows, "工作流", "workflow");
-    match language {
-        UiLanguage::ZhCn => format!("{}仍在运行", parts.join("、")),
-        UiLanguage::EnUs => format!("{} still running", parts.join(", ")),
-    }
-}
-
-fn compact_turn_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else {
-        format!("{}m {:02}s", seconds / 60, seconds % 60)
-    }
 }
 
 /// Rows reserved above the composer for slash-command completion: one row per
@@ -10354,12 +9896,9 @@ fn compact_json(value: &serde_json::Value) -> String {
     sanitize_bounded_terminal_text(&value).into_owned()
 }
 
-fn short_id(value: &str) -> &str {
-    value.get(..8).unwrap_or(value)
-}
-
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -10705,7 +10244,7 @@ mod tests {
     }
 
     #[test]
-    fn live_welcome_stays_compact_without_a_pixel_wordmark() {
+    fn live_welcome_uses_the_shared_standard_pixel_surface() {
         let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
         app.release_startup_barrier_for_test();
         let buffer = render_test_buffer(&mut app, 80, 30);
@@ -10716,17 +10255,18 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            compact.contains("CrabCode原生RustTUI"),
-            "the live welcome must retain a compact product identity: {actual_rows:#?}"
-        );
-        assert!(
-            compact.contains("快速开始"),
+            compact.contains("输入任务描述，或选择命令"),
             "the live welcome must expose its primary action: {actual_rows:#?}"
         );
         assert!(
-            !actual_rows.iter().any(|row| row.contains(['▀', '▄'])),
-            "the live welcome must not paint the legacy pixel banner: {actual_rows:#?}"
+            compact.contains("/help") && compact.contains("/model"),
+            "the live welcome must expose only available commands: {actual_rows:#?}"
         );
+        assert!(
+            actual_rows.iter().any(|row| row.contains(['▀', '▄', '█'])),
+            "the standard welcome must restore the historical pixel geometry: {actual_rows:#?}"
+        );
+        assert!(!compact.contains("原生RustTUI"), "{actual_rows:#?}");
     }
 
     #[test]
@@ -11095,38 +10635,12 @@ mod tests {
     }
 
     #[test]
-    fn minimal_status_shows_rich_activity_and_idle_hint() {
-        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
-        assert!(minimal_status_line(&app).contains("/help"));
-        app.active_tasks.insert(
-            "task-1".to_string(),
-            "Running exact verification".to_string(),
-        );
-        assert_eq!(
-            minimal_status_line(&app),
-            "活动任务 task-1 · Running exact verification"
-        );
-        app.active_tasks.clear();
-        ingest_runtime_value(
-            &mut app,
-            1,
-            json!({"type":"stream_request_start","uuid":"request-1"}),
-        );
-        let status = minimal_status_line(&app);
-        assert!(status.contains("正在请求响应"), "{status}");
-        assert!(
-            status.contains("·"),
-            "turn phase and total clocks are visible: {status}"
-        );
-    }
-
-    #[test]
     fn header_distinguishes_a_missing_model_from_runtime_initialization_in_both_locales() {
         let mut chinese = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
         chinese.release_startup_barrier_for_test();
         let chinese_rendered = render_buffer(&mut chinese, 100, 20);
         let chinese_compact = chinese_rendered.replace(' ', "");
-        assert!(chinese_compact.contains("模型待回报"), "{chinese_rendered}");
+        assert!(chinese_compact.contains("模型待同步"), "{chinese_rendered}");
         assert!(
             !chinese_compact.contains("初始化中"),
             "a missing model is not evidence that the runtime is initializing: {chinese_rendered}"
@@ -11136,7 +10650,7 @@ mod tests {
         switch_to_english_and_initialize(&mut english);
         let english_rendered = render_buffer(&mut english, 100, 20);
         assert!(
-            english_rendered.contains("model pending"),
+            english_rendered.to_lowercase().contains("model pending"),
             "{english_rendered}"
         );
         assert!(
@@ -11319,14 +10833,49 @@ mod tests {
         );
 
         let rendered = render_buffer(&mut app, 72, 20);
-        assert!(rendered.replace(' ', "").contains("滚动跟随"), "{rendered}");
-        let scroll = app.status_hit_areas["scroll"];
-        assert_eq!(scroll.y, 19);
-        assert!(scroll.right() <= 72);
-        if let Some(suggestion) = app.status_hit_areas.get("suggestion") {
-            assert!(suggestion.x >= scroll.right());
-            assert!(suggestion.right() <= 72);
-        }
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("Tab接受建议"), "{rendered}");
+        assert!(compact.contains("Ctrl+Q退出"), "{rendered}");
+        assert!(!compact.contains("滚动跟随"), "{rendered}");
+        let quit = app.status_hit_areas["quit"];
+        assert_eq!(quit.y, 19);
+        assert!(quit.right() <= 72);
+
+        app.transcript_following = false;
+        let paused = render_buffer(&mut app, 72, 20).replace(' ', "");
+        assert!(paused.contains("已暂停·G跟随最新内容"), "{paused}");
+        assert!(!paused.contains("Tab接受建议"), "{paused}");
+
+        app.transcript_following = true;
+        app.composer.set_text("draft");
+        app.set_slash_commands_enabled(false);
+        let slash_disabled = render_buffer(&mut app, 72, 20).replace(' ', "");
+        assert!(!slash_disabled.contains("/help命令"), "{slash_disabled}");
+        assert!(slash_disabled.contains("Ctrl+Q退出"), "{slash_disabled}");
+
+        app.composer.set_text("");
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        let quit_confirmation = render_buffer(&mut app, 72, 20).replace(' ', "");
+        assert!(
+            quit_confirmation.contains("再次按Ctrl-C即可退出"),
+            "{quit_confirmation}"
+        );
+        assert!(!quit_confirmation.contains("Tab接受建议"));
+
+        let mut shortcut_app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        shortcut_app.release_startup_barrier_for_test();
+        shortcut_app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )));
+        let shortcut_confirmation = render_buffer(&mut shortcut_app, 72, 20).replace(' ', "");
+        assert!(
+            shortcut_confirmation.contains("再次按退出快捷键即可退出"),
+            "{shortcut_confirmation}"
+        );
     }
 
     #[test]
@@ -11558,17 +11107,18 @@ mod tests {
         app.set_minimal_mode(true);
         let pending = render_buffer(&mut app, 100, 20);
         let pending_compact = pending.replace(' ', "");
-        assert!(pending_compact.contains("CrabCode已就绪。"), "{pending}");
+        assert!(pending.contains(['▀', '▄', '█']), "{pending}");
+        assert!(pending_compact.contains("输入任务描述"), "{pending}");
 
         app.mark_minimal_welcome_committed();
         let committed = render_buffer(&mut app, 100, 20);
         let committed_compact = committed.replace(' ', "");
         assert!(
-            !committed_compact.contains("CrabCode已就绪。"),
+            !committed.contains(['▀', '▄', '█']),
             "the print-once welcome must not be duplicated in the live viewport: {committed}"
         );
         assert!(
-            !committed_compact.contains("请在下方输入提示词。使用/help查看TUI操作说明。"),
+            !committed_compact.contains("输入任务描述"),
             "the print-once hint must not be duplicated in the live viewport: {committed}"
         );
     }
@@ -11628,24 +11178,12 @@ mod tests {
         app.release_startup_barrier_for_test();
         let initialized = render_buffer(&mut app, 100, 30);
         let initialized_compact = initialized.replace(' ', "");
-        assert!(initialized_compact.contains("原生TUI"), "{initialized}");
-        assert!(
-            initialized_compact.contains("已就绪，可以开始"),
-            "{initialized}"
-        );
-        assert!(initialized_compact.contains("快速开始"), "{initialized}");
-        assert!(
-            initialized_compact.contains("输入·Enter发送"),
-            "{initialized}"
-        );
-        assert!(
-            initialized_compact.contains("审批标准审批"),
-            "{initialized}"
-        );
-        assert!(
-            initialized_compact.contains("基础上下文待同步"),
-            "{initialized}"
-        );
+        assert!(initialized.contains(['▀', '▄', '█']), "{initialized}");
+        assert!(initialized_compact.contains("已就绪"), "{initialized}");
+        assert!(initialized_compact.contains("使用帮助"), "{initialized}");
+        assert!(initialized_compact.contains("┌输入"), "{initialized}");
+        assert!(initialized_compact.contains("Enter发送"), "{initialized}");
+        assert!(!initialized_compact.contains("原生TUI"), "{initialized}");
         assert!(!initialized_compact.contains("SDK帧"), "{initialized}");
     }
 
@@ -11689,17 +11227,14 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         let compact = rendered.replace(' ', "");
-        assert!(
-            compact.contains("审批常规操作自动批准（敏感操作仍确认）"),
-            "{rendered}"
-        );
+        assert!(compact.contains("高风险免审"), "{rendered}");
         assert!(compact.contains("基础上下文12.4k/128k·10%"), "{rendered}");
-        assert!(compact.contains("模型deepseek-v4-flash"), "{rendered}");
+        assert!(compact.contains("deepseek-v4-flash"), "{rendered}");
         assert!(!rendered.contains("bypassPermissions"), "{rendered}");
         assert!(!rendered.contains("SDK"), "{rendered}");
         assert!(
             buffer.content.iter().any(|cell| {
-                cell.symbol() == "常" && cell.bg == app.renderer_theme().accent_error
+                cell.symbol() == "高" && cell.bg == app.renderer_theme().accent_error
             }),
             "dangerous approval mode must use the error-color chip"
         );
@@ -11769,12 +11304,25 @@ mod tests {
             for width in [120, 80, 60] {
                 let rendered = render_buffer(app, width, 30);
                 let compact = rendered.replace(' ', "");
-                assert!(compact.contains(expected), "width={width}: {rendered}");
-                assert_eq!(
-                    compact.contains(baseline_marker),
-                    expect_baseline,
-                    "width={width}: {rendered}"
-                );
+                match width {
+                    120 => {
+                        assert!(compact.contains(expected), "width={width}: {rendered}");
+                        assert_eq!(
+                            compact.contains(baseline_marker),
+                            expect_baseline,
+                            "width={width}: {rendered}"
+                        );
+                    }
+                    80 => assert!(
+                        compact.contains("3%"),
+                        "standard header keeps the authoritative percentage: {rendered}"
+                    ),
+                    60 => assert!(
+                        compact.contains("CrabCode"),
+                        "compact header keeps brand and state while metadata yields: {rendered}"
+                    ),
+                    _ => unreachable!(),
+                }
             }
         }
 
@@ -11847,32 +11395,6 @@ mod tests {
             "baselinecontext",
             true,
         );
-    }
-
-    #[test]
-    fn approval_labels_cover_every_direct_runtime_mode() {
-        let cases = [
-            ("default", "标准审批"),
-            ("acceptEdits", "自动接受编辑"),
-            ("bypassPermissions", "常规操作自动批准（敏感操作仍确认）"),
-            ("plan", "只规划"),
-            ("dontAsk", "仅执行已批准"),
-            ("auto", "自动模式"),
-        ];
-        for (mode, expected) in cases {
-            assert_eq!(
-                permission_mode_label(mode, UiLanguage::ZhCn, false),
-                expected
-            );
-        }
-        assert_eq!(
-            permission_mode_label("future", UiLanguage::ZhCn, false),
-            "自定义"
-        );
-        assert_eq!(format_header_tokens(999), "999");
-        assert_eq!(format_header_tokens(1_000), "1k");
-        assert_eq!(format_header_tokens(12_400), "12.4k");
-        assert_eq!(format_header_tokens(1_200_000), "1.2m");
     }
 
     #[test]
@@ -12445,6 +11967,10 @@ mod tests {
     fn task_tools_render_a_bordered_card_grid_above_the_composer() {
         let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
         app.release_startup_barrier_for_test();
+        app.action_admitted(&HostAction::SendUser {
+            content: Value::String("start task workflow".to_string()),
+            priority: None,
+        });
         let subjects = ["文件系统", "联网搜索", "记忆系统", "子代理并行", "最终验收"];
         let mut sequence = 1_u64;
         for (index, subject) in subjects.iter().enumerate() {
@@ -12506,7 +12032,7 @@ mod tests {
             .expect("task panel title");
         let composer_row = compact
             .iter()
-            .position(|row| row.contains("输入·"))
+            .position(|row| row.contains("┌输入"))
             .expect("composer title");
         assert!(panel_row < composer_row, "{rows:#?}");
         for subject in subjects {
@@ -12559,6 +12085,10 @@ mod tests {
     fn responsive_core_surfaces_fit_standard_and_narrow_terminals() {
         let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
         app.release_startup_barrier_for_test();
+        app.action_admitted(&HostAction::SendUser {
+            content: Value::String("exercise responsive transcript".to_string()),
+            priority: None,
+        });
         let initialized = app.projection.ingest(RawEnvelope {
             sequence: 0,
             encoded_len: 1,
@@ -12677,17 +12207,23 @@ mod tests {
             }
             assert_eq!(
                 buffer[(width - 1, 0)].bg,
-                app.renderer_theme().bg_dark,
-                "the header ribbon must paint through the right edge: {diagnostic}"
+                app.renderer_theme().bg_base,
+                "the base-background header must paint through the right edge: {diagnostic}"
             );
             assert_eq!(
                 buffer[(width - 1, 1)].bg,
-                app.renderer_theme().bg_dark,
-                "the metadata ribbon must paint through the right edge: {diagnostic}"
+                app.renderer_theme().bg_base,
+                "the divider row must paint through the right edge: {diagnostic}"
             );
             assert!(compact[0].contains("CrabCode"), "{diagnostic}");
-            assert!(compact[0].contains("审批"), "{diagnostic}");
-            assert!(compact[1].contains("上下文"), "{diagnostic}");
+            assert!(compact[0].contains("高风险免审"), "{diagnostic}");
+            assert!(
+                compact[1].chars().all(|character| character == '─'),
+                "{diagnostic}"
+            );
+            if width == 120 {
+                assert!(compact[0].contains("上下文"), "{diagnostic}");
+            }
             assert!(
                 !compact.join("").contains("bypassPermissions"),
                 "{diagnostic}"
@@ -12700,7 +12236,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing task card title: {diagnostic}"));
             let composer_row = compact
                 .iter()
-                .position(|row| row.contains("输入·"))
+                .position(|row| row.contains("┌输入"))
                 .unwrap_or_else(|| panic!("missing composer: {diagnostic}"));
             assert!(task_row < composer_row, "{diagnostic}");
             assert!(
@@ -12741,6 +12277,10 @@ mod tests {
         // same narrow size instead of weakening the narrow-screen acceptance criterion.
         let mut narrow_search_app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
         narrow_search_app.release_startup_barrier_for_test();
+        narrow_search_app.action_admitted(&HostAction::SendUser {
+            content: Value::String("search".to_string()),
+            priority: None,
+        });
         ingest_assistant_tool(
             &mut narrow_search_app,
             1,
@@ -14085,6 +13625,10 @@ mod tests {
     fn advisor_stream_invocation_renders_input_and_exact_error_state() {
         let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
         app.release_startup_barrier_for_test();
+        app.action_admitted(&HostAction::SendUser {
+            content: Value::String("ask advisor".to_string()),
+            priority: None,
+        });
         for (sequence, value) in [
             json!({
                 "type":"stream_event","uuid":"0","session_id":"session",
@@ -14372,7 +13916,8 @@ mod tests {
         assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
         assert!(!rendered.contains('\u{7}'), "{rendered:?}");
         assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
-        assert!(rendered.contains('␛'), "{rendered:?}");
+        // Unsafe metadata may be visibly escaped or omitted by responsive
+        // priority, but it must never recover an executable control byte.
 
         app.overlay = Some(crate::tui_app::Overlay::new(
             crate::tui_app::OverlayKind::Json,
@@ -14913,7 +14458,7 @@ mod tests {
     fn tiny_supported_viewport_keeps_one_live_transcript_row_and_composer() {
         let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
         app.release_startup_barrier_for_test();
-        app.projection.ingest(RawEnvelope {
+        app.handle_runtime_event(RuntimeEvent::Envelope(RawEnvelope {
             sequence: 0,
             encoded_len: 1,
             value: json!({
@@ -14925,12 +14470,13 @@ mod tests {
             }),
             classification: EnvelopeClass::Assistant,
             correlation: None,
-        });
+        }));
         let rendered = render_buffer(&mut app, 20, 8);
         assert!(rendered.contains("CrabCode"));
         assert!(rendered.contains("visible"), "{rendered}");
         assert!(
-            rendered.replace(' ', "").contains("输入·Enter发送"),
+            rendered.replace(' ', "").contains("┌输入")
+                && rendered.replace(' ', "").contains("Enter发送"),
             "{rendered}"
         );
     }

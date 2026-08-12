@@ -28,12 +28,14 @@ mod renderer_diagnostics;
 mod retained_command_surface;
 pub mod runtime_host;
 mod usage_plugin_management;
+mod welcome_surface;
 // CrabCode StructuredIO-to-RenderBlock product adapter consumed by AgentView.
 // It does not define or widen the backend wire protocol.
 mod scrollback_projection;
 pub mod sdk_projection;
 pub mod sdk_runtime;
 mod selection_surface;
+mod session_header;
 pub mod session_picker;
 mod status_surface;
 mod task_panel;

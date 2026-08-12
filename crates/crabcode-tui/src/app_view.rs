@@ -320,7 +320,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(painted.contains("CrabCode"), "{painted}");
-        assert!(painted.replace(' ', "").contains("快速开始"), "{painted}");
+        assert!(painted.contains(['▀', '▄', '█']), "{painted}");
+        assert!(painted.contains("/help"), "{painted}");
     }
 
     #[test]
@@ -345,28 +346,21 @@ mod tests {
                 .chunks(usize::from(width))
                 .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
                 .collect::<Vec<_>>();
-            let compact = rows
-                .iter()
-                .map(|row| row.replace(' ', ""))
-                .collect::<Vec<_>>();
             let diagnostic = format!("{width}x{height}: {rows:#?}");
 
             assert_eq!(rows.len(), usize::from(height), "{diagnostic}");
-            assert!(compact[3].contains("CrabCode原生RustTUI"), "{diagnostic}");
-            assert!(compact[4].contains("●已就绪，可以开始"), "{diagnostic}");
-            assert!(compact[6].contains("快速开始"), "{diagnostic}");
-            assert!(
-                compact[7].contains("›直接描述目标，或粘贴错误信息与日志"),
-                "{diagnostic}"
-            );
-            assert!(
-                compact[8].contains("Enter发送·/help操作说明·/model选择模型"),
-                "{diagnostic}"
-            );
-
             let joined = rows.join("\n");
-            assert!(!joined.contains(['▀', '▄']), "{diagnostic}");
-            assert!(!joined.contains("请在下方输入提示词"), "{diagnostic}");
+            let joined_compact = joined.replace(' ', "");
+            assert!(joined_compact.contains("已就绪"), "{diagnostic}");
+            assert!(joined_compact.contains("输入任务描述"), "{diagnostic}");
+            assert!(joined.contains("/help"), "{diagnostic}");
+            assert!(joined.contains("/model"), "{diagnostic}");
+            assert_eq!(
+                joined.contains(['▀', '▄', '█']),
+                width >= 72,
+                "wide/standard use the historical pixel mark; compact uses text: {diagnostic}"
+            );
+            assert!(!joined.contains("原生 Rust TUI"), "{diagnostic}");
             for row in 0..height {
                 for column in 0..width {
                     let symbol_width =
