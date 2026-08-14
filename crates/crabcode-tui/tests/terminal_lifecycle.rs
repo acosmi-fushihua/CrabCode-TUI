@@ -58,6 +58,7 @@ user_file="${CRABCODE_TUI_FIXTURE_USERS}"
 env_file="${CRABCODE_TUI_FIXTURE_ENV}"
 setup_file="${CRABCODE_TUI_FIXTURE_SETUP}"
 copy_gate="${CRABCODE_TUI_FIXTURE_COPY_GATE}"
+interactive_ready="${CRABCODE_TUI_FIXTURE_INTERACTIVE_READY}"
 notification_channel="${CRABCODE_TUI_FIXTURE_NOTIFICATION_CHANNEL-auto}"
 
 printf '%s' "$$" > "$pid_file"
@@ -265,6 +266,19 @@ fi
 
 while IFS= read -r message; do
     case "$message" in
+        *'"type":"crabcode_tui_runtime_action"'*'"kind":"health_snapshot"'*)
+            health_request_id=$(printf '%s\n' "$message" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+            if [ -z "$health_request_id" ]; then
+                printf 'fixture health_snapshot request omitted request_id\n' >&2
+                exit 34
+            fi
+            # This action is emitted only after the renderer has consumed the
+            # initialize response, released its startup barrier, and installed
+            # terminal input/signal ownership. It is the consumer-side
+            # interactive-readiness authority for PTY tests.
+            : > "$interactive_ready"
+            printf '{"type":"crabcode_tui_runtime_result","protocol_version":1,"request_id":"%s","result":{"kind":"health_snapshot","status":"ready"}}\n' "$health_request_id"
+            ;;
         *'"subtype":"end_session"'*)
             end_request_id=$(printf '%s\n' "$message" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
             if [ -z "$end_request_id" ]; then
@@ -336,6 +350,7 @@ struct MockDirectRuntime {
     env_path: PathBuf,
     setup_path: PathBuf,
     copy_gate_path: PathBuf,
+    interactive_ready_path: PathBuf,
     mode: MockMode,
 }
 
@@ -366,6 +381,7 @@ impl MockDirectRuntime {
             env_path: directory.join("runtime.env"),
             setup_path: directory.join("runtime.setup.jsonl"),
             copy_gate_path: directory.join("runtime.copy-gate"),
+            interactive_ready_path: directory.join("runtime.interactive-ready"),
             directory,
             script_path,
             mode,
@@ -383,6 +399,10 @@ impl MockDirectRuntime {
         command.env("CRABCODE_TUI_FIXTURE_ENV", &self.env_path);
         command.env("CRABCODE_TUI_FIXTURE_SETUP", &self.setup_path);
         command.env("CRABCODE_TUI_FIXTURE_COPY_GATE", &self.copy_gate_path);
+        command.env(
+            "CRABCODE_TUI_FIXTURE_INTERACTIVE_READY",
+            &self.interactive_ready_path,
+        );
         command.env("CRABCODE_TUI_FIXTURE_NOTIFICATION_CHANNEL", "auto");
     }
 
@@ -433,6 +453,14 @@ impl MockDirectRuntime {
             .expect("read direct runtime pid")
             .parse()
             .expect("parse direct runtime pid")
+    }
+
+    fn wait_until_interactive_ready(&self) {
+        wait_until_condition(
+            Duration::from_secs(5),
+            "consumer-side interactive readiness",
+            || self.interactive_ready_path.is_file(),
+        );
     }
 
     fn setup_transcript(&self) -> Vec<Value> {
@@ -2187,14 +2215,7 @@ printf 'edited-by-pty' > "$1"
             && output.contains(ENABLE_BRACKETED_PASTE)
             && output.contains("CrabCode")
     });
-    wait_until_condition(
-        Duration::from_secs(5),
-        "external-editor renderer initialize response",
-        || {
-            std::fs::read_to_string(&fixture.setup_path)
-                .is_ok_and(|transcript| transcript.contains("\"initialize_response\""))
-        },
-    );
+    fixture.wait_until_interactive_ready();
     assert_ne!(
         pair.master
             .get_termios()
@@ -2392,14 +2413,7 @@ printf 'UNEXPECTED_FILE_EDITOR_LAUNCH\n'
         Arc::clone(&captured),
         None,
     );
-    wait_until_condition(
-        Duration::from_secs(5),
-        "fail-closed keybinding SDK initialize response",
-        || {
-            std::fs::read_to_string(&fixture.setup_path)
-                .is_ok_and(|transcript| transcript.contains("\"initialize_response\""))
-        },
-    );
+    fixture.wait_until_interactive_ready();
     wait_until(&captured, Duration::from_secs(5), |output| {
         output.contains(ENTER_ALTERNATE_SCREEN) && output.contains(ENABLE_BRACKETED_PASTE)
     });
@@ -3201,16 +3215,9 @@ fn minimal_mode_never_enters_alt_screen_and_restores_after_signal() {
         Some(Arc::clone(&writer)),
     );
     // Setup dialogs are intentionally paintable before StructuredIO owns
-    // stdin. Synchronize this post-handoff signal test on the authoritative
-    // SDK initialize response, not on UI copy that can change independently.
-    wait_until_condition(
-        Duration::from_secs(5),
-        "minimal-mode SDK initialize response",
-        || {
-            std::fs::read_to_string(&fixture.setup_path)
-                .is_ok_and(|transcript| transcript.contains("\"initialize_response\""))
-        },
-    );
+    // stdin. Synchronize this post-handoff signal test on the consumer-side
+    // health action, not producer-side fixture logging or mutable UI copy.
+    fixture.wait_until_interactive_ready();
     wait_until(&captured, Duration::from_secs(5), |output| {
         output.contains(ENABLE_BRACKETED_PASTE)
             && output.contains(ENABLE_FOCUS_CHANGE)

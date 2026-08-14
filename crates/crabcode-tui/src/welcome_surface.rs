@@ -123,7 +123,8 @@ impl WelcomeViewModel {
             .collect();
         Self {
             language,
-            preparing: app.busy()
+            preparing: app.setup_surface_exclusive()
+                || app.busy()
                 || matches!(
                     app.projection.session_state(),
                     Some("initializing" | "running")
@@ -693,7 +694,10 @@ pub(crate) fn middle_ellipsis(value: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::tui_app::InitialSessionRequest;
 
     #[test]
     fn breakpoints_require_both_width_and_height_in_order() {
@@ -703,6 +707,15 @@ mod tests {
         assert_eq!(WelcomeLayout::choose(60, 20), WelcomeLayout::Compact);
         assert_eq!(WelcomeLayout::choose(59, 30), WelcomeLayout::BestEffort);
         assert_eq!(WelcomeLayout::choose(120, 9), WelcomeLayout::BestEffort);
+    }
+
+    #[test]
+    fn welcome_stays_preparing_until_runtime_handoff() {
+        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        assert!(WelcomeViewModel::from_app(&app).preparing);
+
+        app.release_startup_barrier_for_test();
+        assert!(!WelcomeViewModel::from_app(&app).preparing);
     }
 
     #[test]

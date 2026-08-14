@@ -11,6 +11,10 @@
   activity from renderer facts instead of free-form status text, so resizing,
   permissions, cancellation, retries, subagent waits, and completed turns stay
   deterministic across narrow and wide terminals.
+- Keeps the new header and welcome surface in their initializing state until
+  the renderer has actually consumed the runtime handoff. PTY lifecycle gates
+  now synchronize on the resulting private health action instead of mutable UI
+  copy or producer-side response logging.
 - Fixes the strict Linux Landlock CI path by intersecting non-directory rules
   with ABI-valid file rights while retaining hard-requirement, fail-closed
   enforcement, and avoids treating inherited standard-I/O pipe aliases as
@@ -28,6 +32,9 @@
 - 新增固定高度、类型驱动的会话标题栏，统一呈现生命周期状态、当前工具、耗时、
   模型、审批模式与上下文用量。标题栏仅依据渲染器事实判定活动状态，不再依赖自由
   文本，因此在缩放、权限确认、取消、重试、等待子代理和回合完成时都保持确定性。
+- 在渲染器真正消费运行时交接前，新的标题栏与欢迎界面会持续显示初始化中；PTY
+  生命周期门禁也改为等待交接后必发的私有健康检查，不再依赖可变界面文案或仅能
+  证明发送方已写出响应的日志。
 - 修复严格 Linux Landlock CI 路径：非目录路径规则仅保留当前 ABI 允许的文件权限，
   同时避免把继承的标准输入输出管道别名当作文件系统规则目标，并继续维持
   hard-requirement 与 fail-closed 语义。沙箱烟测也会明确拒绝初始化失败，避免把

@@ -108,6 +108,8 @@ impl SessionHeaderViewModel {
                     | RequestDialog::SetupInput(_) => None,
                 },
             }
+        } else if app.setup_surface_exclusive() {
+            HeaderActivity::Initializing
         } else if turn.state() == AgentState::Cancelling {
             HeaderActivity::Cancelling
         } else if let Some(activity) = turn.activity() {
@@ -658,8 +660,10 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use serde_json::json;
 
     use super::*;
+    use crate::tui_app::InitialSessionRequest;
 
     fn model(activity: HeaderActivity, language: UiLanguage) -> SessionHeaderViewModel {
         SessionHeaderViewModel {
@@ -720,6 +724,21 @@ mod tests {
                     .any(|cell| cell.symbol() == "●" && cell.fg == theme.accent_success)
             );
         }
+    }
+
+    #[test]
+    fn startup_barrier_is_never_presented_as_ready() {
+        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        assert_eq!(
+            SessionHeaderViewModel::from_app(&app, Instant::now()).activity,
+            HeaderActivity::Initializing
+        );
+
+        app.release_startup_barrier_for_test();
+        assert_eq!(
+            SessionHeaderViewModel::from_app(&app, Instant::now()).activity,
+            HeaderActivity::Ready
+        );
     }
 
     #[test]
