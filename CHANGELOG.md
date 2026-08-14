@@ -1,5 +1,34 @@
 # Changelog / 更新日志
 
+## v1.0.34 — 2026-08-13
+
+- Redesigns the native terminal welcome experience with a responsive surface
+  that preserves the CrabCode identity at wide widths, falls back cleanly in
+  compact terminals, and keeps the primary `/help` and `/model` entry points
+  visible without consuming transcript space.
+- Adds a typed, fixed-height session header for lifecycle state, active tool,
+  elapsed time, model, approval mode, and context usage. The header derives its
+  activity from renderer facts instead of free-form status text, so resizing,
+  permissions, cancellation, retries, subagent waits, and completed turns stay
+  deterministic across narrow and wide terminals.
+- Carries forward the audited Windows release recovery hardening: deterministic
+  native linking, preserved-candidate reuse, bounded process-inventory retries,
+  and fail-closed package replay evidence. The public release remains limited
+  to macOS arm64, macOS x64, and Windows x64; Linux is intentionally excluded.
+
+---
+
+- 重新设计原生终端欢迎界面：宽终端保留 CrabCode 像素标识，窄终端自动切换为紧凑
+  布局，并持续展示 `/help` 与 `/model` 等主要入口，同时不再占用会话正文空间。
+- 新增固定高度、类型驱动的会话标题栏，统一呈现生命周期状态、当前工具、耗时、
+  模型、审批模式与上下文用量。标题栏仅依据渲染器事实判定活动状态，不再依赖自由
+  文本，因此在缩放、权限确认、取消、重试、等待子代理和回合完成时都保持确定性。
+- 纳入已审计的 Windows 发版恢复加固：确定性原生链接、候选产物保留与复用、有界
+  进程清单重试，以及 fail-closed 成品回放证据。公开版本仍仅提供 macOS arm64、
+  macOS x64 与 Windows x64，明确不提供 Linux。
+
+---
+
 ## v1.0.33 — 2026-08-11
 
 - Forward-fixes the failed, unpublished `v1.0.32` tag without moving,

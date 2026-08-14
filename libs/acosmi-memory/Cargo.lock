@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-generation-lease"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "anyhow",
  "dirs",
