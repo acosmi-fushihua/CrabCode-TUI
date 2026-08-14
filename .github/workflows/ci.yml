@@ -87,6 +87,36 @@ jobs:
           cache-dependency-path: components/oauthapi-llm/go.sum
       - run: go test -C components/oauthapi-llm ./...
 
+  installer-transport:
+    name: Installer transport ${{ matrix.platform }}
+    if: >-
+      github.repository == 'acosmi/CrabCode-TUI' &&
+      (github.event_name != 'push' ||
+      !contains(github.event.head_commit.message, '[release-only]'))
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: arm64-darwin
+            runner: macos-15
+          - platform: x64-win32
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Exercise curl pipe install through Release transport
+        if: matrix.platform == 'arm64-darwin'
+        shell: bash
+        run: bash tests/macos/install-bootstrap-transport.sh scripts/install.sh
+      - name: Exercise irm pipe install on Windows PowerShell 5.1
+        if: matrix.platform == 'x64-win32'
+        shell: powershell
+        run: ./tests/windows/install-bootstrap-transport.ps1 -InstallerPath scripts/install.ps1
+      - name: Exercise irm pipe install on PowerShell 7
+        if: matrix.platform == 'x64-win32'
+        shell: pwsh
+        run: ./tests/windows/install-bootstrap-transport.ps1 -InstallerPath scripts/install.ps1
+
   incident-package:
     name: Incident package replay ${{ matrix.platform }}
     if: >-
@@ -126,6 +156,21 @@ jobs:
 
       - name: Install exact JavaScript dependency graph
         run: bun install --frozen-lockfile
+
+      - name: Exercise curl pipe install through Release transport
+        if: endsWith(matrix.platform, '-darwin')
+        shell: bash
+        run: bash tests/macos/install-bootstrap-transport.sh scripts/install.sh
+
+      - name: Exercise irm pipe install on Windows PowerShell 5.1
+        if: matrix.platform == 'x64-win32'
+        shell: powershell
+        run: ./tests/windows/install-bootstrap-transport.ps1 -InstallerPath scripts/install.ps1
+
+      - name: Exercise irm pipe install on PowerShell 7
+        if: matrix.platform == 'x64-win32'
+        shell: pwsh
+        run: ./tests/windows/install-bootstrap-transport.ps1 -InstallerPath scripts/install.ps1
 
       - name: Bind an unpublished CI package identity
         shell: bash

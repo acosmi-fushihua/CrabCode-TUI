@@ -1,5 +1,46 @@
 # Changelog / 更新日志
 
+## v1.0.35 — 2026-08-14
+
+- Fixes the Windows one-line bootstrap for both Windows PowerShell 5.1 and
+  PowerShell 7 by publishing `install.ps1` as printable seven-bit ASCII without
+  a byte-order mark. This prevents GitHub's `application/octet-stream` response
+  from turning the leading comment into an executable `ï»¿#` or `U+FEFF` token
+  when the script is piped through `irm | iex`.
+- Removes the installers' hard dependency on `api.github.com`. Both Windows and
+  macOS now discover the latest version from the release checksum manifest,
+  require exactly one canonical archive record for the host platform, derive a
+  versioned download URL, and verify the archive against the captured SHA-256
+  before installation.
+- Adds transport-level regression gates that execute the real bootstraps through
+  an HTTP redirect and an `application/octet-stream` response. Normal CI covers
+  Windows PowerShell 5.1, PowerShell 7, and macOS `curl | sh`; signed-tag release
+  and recovery paths carry the same checks instead of relying only on local
+  `-File` or asset-directory smoke tests.
+- Keeps the public scope limited to macOS arm64, macOS x64, and Windows x64.
+  The existing v1.0.34 archives and signed provenance were independently
+  re-downloaded and verified; this patch moves forward without replacing or
+  mutating those published assets.
+
+---
+
+- 修复 Windows 一键安装在 Windows PowerShell 5.1 与 PowerShell 7 下的传输解码
+  问题：`install.ps1` 现在是无 BOM 的可打印七位 ASCII。GitHub 以
+  `application/octet-stream` 返回脚本时，`irm | iex` 不会再把首行注释解码为
+  可执行的 `ï»¿#` 或 `U+FEFF` 标记。
+- 移除 Windows 与 macOS 安装器对 `api.github.com` 的硬依赖。两端改为从 Release
+  校验清单发现最新版本，严格要求当前平台只有一条规范归档记录，再按派生出的固定
+  版本地址下载，并在安装前使用清单中的 SHA-256 校验归档。
+- 新增传输层回归门禁，真实执行“HTTP 重定向 → `application/octet-stream` →
+  安装管道”。常规 CI 会覆盖 Windows PowerShell 5.1、PowerShell 7 与 macOS
+  `curl | sh`，签名标签发版及恢复路径也执行相同检查，不再只依赖本地 `-File` 或
+  资产目录烟测。
+- 公开范围继续仅包含 macOS arm64、macOS x64 与 Windows x64。现有 v1.0.34
+  归档及签名 provenance 已重新从公网下载并独立核验；本修复以前向版本发布，不
+  覆盖或修改既有公开资产。
+
+---
+
 ## v1.0.34 — 2026-08-13
 
 - Redesigns the native terminal welcome experience with a responsive surface

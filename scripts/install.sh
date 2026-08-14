@@ -2,9 +2,10 @@
 # SECURITY NOTICE: piping this bootstrap from a mutable URL does not authenticate its source.
 # CrabCode TUI fail-closed installer for macOS.
 set -eu
+LC_ALL=C
+export LC_ALL
 
 REPOSITORY="acosmi/CrabCode-TUI"
-API_URL="https://api.github.com/repos/${REPOSITORY}/releases/latest"
 TEMP_ROOT=""
 INCOMING=""
 
@@ -16,7 +17,10 @@ cleanup() {
     rm -rf "$INCOMING"
   fi
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 info() { printf 'info: %s\n' "$1"; }
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
@@ -42,22 +46,35 @@ case "$(uname -m)" in
   *) die "不支持的 CPU 架构: $(uname -m)" ;;
 esac
 PLATFORM="${ARCH}-${OS}"
+TEMP_ROOT="$(mktemp -d)"
+CHECKSUM_PATH="${TEMP_ROOT}/checksums-sha256.txt"
+ARCHIVE=""
 
 if [ -n "${CRABCODE_VERSION:-}" ]; then
   TAG="$CRABCODE_VERSION"
 else
-  info "查询最新 GitHub Release"
-  TAG="$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$API_URL" \
-    | sed -n -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
-    | head -n 1)"
+  info "从 latest Release 的 SHA-256 清单解析版本"
+  curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 --max-time 120 \
+    -o "$CHECKSUM_PATH" "https://github.com/${REPOSITORY}/releases/latest/download/checksums-sha256.txt" \
+    || die "无法从 github.com 下载 latest Release 的 SHA-256 清单，请检查 DNS 与代理设置"
+  LATEST_ARCHIVES="$(awk -v platform="$PLATFORM" \
+    'NF == 2 && length($1) == 64 && $1 !~ /[^a-fA-F0-9]/ && $2 ~ ("^crabcode-[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?-" platform "\\.tar\\.gz$") { print $2 }' \
+    "$CHECKSUM_PATH")"
+  [ "$(printf '%s\n' "$LATEST_ARCHIVES" | sed '/^$/d' | wc -l | tr -d ' ')" = "1" ] \
+    || die "latest SHA-256 清单必须且只能包含一个 ${PLATFORM} 归档"
+  ARCHIVE="$(printf '%s\n' "$LATEST_ARCHIVES" | sed -n '1p')"
+  VERSION="${ARCHIVE#crabcode-}"
+  VERSION="${VERSION%-"${PLATFORM}".tar.gz}"
+  TAG="v${VERSION}"
 fi
-case "$TAG" in v*) VERSION="${TAG#v}" ;; *) VERSION="$TAG"; TAG="v${TAG}" ;; esac
+if [ -z "$ARCHIVE" ]; then
+  case "$TAG" in v*) VERSION="${TAG#v}" ;; *) VERSION="$TAG"; TAG="v${TAG}" ;; esac
+  ARCHIVE="crabcode-${VERSION}-${PLATFORM}.tar.gz"
+fi
 printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$' \
   || die "发布版本不是规范 SemVer: $TAG"
 
-ARCHIVE="crabcode-${VERSION}-${PLATFORM}.tar.gz"
 BASE_URL="https://github.com/${REPOSITORY}/releases/download/${TAG}"
-TEMP_ROOT="$(mktemp -d)"
 if [ -n "${CRABCODE_ASSET_DIR:-}" ]; then
   case "$CRABCODE_ASSET_DIR" in /*) ;; *) die "CRABCODE_ASSET_DIR 必须是绝对路径" ;; esac
   [ -d "$CRABCODE_ASSET_DIR" ] || die "CRABCODE_ASSET_DIR 不是目录: $CRABCODE_ASSET_DIR"
@@ -68,17 +85,20 @@ if [ -n "${CRABCODE_ASSET_DIR:-}" ]; then
   info "使用已下载的固定版本本地资产；安装器不会访问网络"
 else
   ARCHIVE_PATH="${TEMP_ROOT}/${ARCHIVE}"
-  CHECKSUM_PATH="${TEMP_ROOT}/checksums-sha256.txt"
+  if [ -n "${CRABCODE_VERSION:-}" ]; then
+    curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 --max-time 120 \
+      -o "$CHECKSUM_PATH" "${BASE_URL}/checksums-sha256.txt" \
+      || die "无法下载同一 Release 的 SHA-256 清单，拒绝安装"
+  fi
   info "下载 ${ARCHIVE}"
   curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 --max-time 600 \
     -o "$ARCHIVE_PATH" "${BASE_URL}/${ARCHIVE}" \
     || die "未找到 ${TAG} 的 ${PLATFORM} 完整包"
-  curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 --max-time 120 \
-    -o "$CHECKSUM_PATH" "${BASE_URL}/checksums-sha256.txt" \
-    || die "无法下载同一 Release 的 SHA-256 清单，拒绝安装"
 fi
 
-EXPECTED_LINES="$(awk -v name="$ARCHIVE" '$2 == name { print $1 }' "$CHECKSUM_PATH")"
+EXPECTED_LINES="$(awk -v name="$ARCHIVE" \
+  'NF == 2 && length($1) == 64 && $1 !~ /[^a-fA-F0-9]/ && $2 == name { print $1 }' \
+  "$CHECKSUM_PATH")"
 [ "$(printf '%s\n' "$EXPECTED_LINES" | sed '/^$/d' | wc -l | tr -d ' ')" = "1" ] \
   || die "SHA-256 清单必须且只能包含一条 ${ARCHIVE} 记录"
 EXPECTED="$(printf '%s' "$EXPECTED_LINES" | tr 'A-F' 'a-f')"

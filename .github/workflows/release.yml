@@ -240,10 +240,19 @@ jobs:
           }
 
       - name: Assert installer encodings
+        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
-          test "$(head -c 3 scripts/install.ps1 | od -An -tx1 | tr -d ' \n')" = 'efbbbf'
+          # GitHub serves Release assets as application/octet-stream. Windows
+          # PowerShell 5.1 irm | iex exposes a UTF-8 BOM as the command `ï»¿#`,
+          # so this bootstrap must remain printable 7-bit ASCII without a BOM.
+          test "$(head -c 1 scripts/install.ps1 | od -An -tx1 | tr -d ' \n')" = '23'
+          test "$(head -c 3 scripts/install.ps1 | od -An -tx1 | tr -d ' \n')" != 'efbbbf'
+          if LC_ALL=C grep -n $'[^ -~\t]' scripts/install.ps1; then
+            echo '::error::install.ps1 must contain only printable 7-bit ASCII, tabs, and line feeds'
+            exit 1
+          fi
           test "$(head -c 3 scripts/install.sh | od -An -tx1 | tr -d ' \n')" != 'efbbbf'
           sh -n scripts/install.sh
 
@@ -294,13 +303,21 @@ jobs:
           git merge-base --is-ancestor "${RELEASE_TOOLING_SHA}" origin/main || {
             echo "::error::recovery tooling commit is not on enterprise main"; exit 1;
           }
-          git restore --source="${RELEASE_TOOLING_SHA}" -- \
+          git restore --source="${RELEASE_TOOLING_SHA}" --staged --worktree -- \
             scripts/install.ps1 \
-            scripts/release-package-smoke.mjs
-          git diff --quiet "${RELEASE_TOOLING_SHA}" -- \
+            scripts/release-package-smoke.mjs \
+            tests/windows/install-bootstrap-transport.ps1
+          git diff --cached --quiet "${RELEASE_TOOLING_SHA}" -- \
             scripts/install.ps1 \
-            scripts/release-package-smoke.mjs || {
-            echo "::error::failed to bind recovery tooling to the workflow commit"; exit 1;
+            scripts/release-package-smoke.mjs \
+            tests/windows/install-bootstrap-transport.ps1 || {
+            echo "::error::recovery tooling index does not match the workflow commit"; exit 1;
+          }
+          git diff --quiet -- \
+            scripts/install.ps1 \
+            scripts/release-package-smoke.mjs \
+            tests/windows/install-bootstrap-transport.ps1 || {
+            echo "::error::recovery tooling worktree does not match its staged bytes"; exit 1;
           }
 
       - name: Download the preserved Windows candidate
@@ -376,9 +393,24 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path 'scripts/install.ps1'))
+          $invalid = @($bytes | Where-Object {
+            -not ($_ -eq 0x09 -or $_ -eq 0x0A -or $_ -eq 0x0D -or ($_ -ge 0x20 -and $_ -le 0x7E))
+          })
+          if ($bytes.Count -eq 0 -or $bytes[0] -ne 0x23 -or $invalid.Count -ne 0) {
+            throw 'install.ps1 is not an irm-safe printable ASCII script beginning with #'
+          }
           [void][scriptblock]::Create(
-            [System.IO.File]::ReadAllText((Resolve-Path 'scripts/install.ps1'))
+            [System.Text.Encoding]::ASCII.GetString($bytes)
           )
+
+      - name: Exercise irm pipe install on Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/windows/install-bootstrap-transport.ps1 -InstallerPath scripts/install.ps1
+
+      - name: Exercise irm pipe install on PowerShell 7
+        shell: pwsh
+        run: ./tests/windows/install-bootstrap-transport.ps1 -InstallerPath scripts/install.ps1
 
       - name: Prove native launcher observation survives until explicit finalization
         run: bun test tests/unit/release-package-process-runner.test.ts

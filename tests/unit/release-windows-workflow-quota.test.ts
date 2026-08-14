@@ -90,8 +90,15 @@ describe("Windows release recovery quota controls", () => {
       ),
     ).toHaveLength(7);
     expect(workflow).toContain(preserved);
-    expect(workflow).toContain("git restore --source=\"${RELEASE_TOOLING_SHA}\" -- \\");
+    expect(workflow).toContain(
+      'git restore --source="${RELEASE_TOOLING_SHA}" --staged --worktree -- \\',
+    );
+    expect(workflow).toContain(
+      'git diff --cached --quiet "${RELEASE_TOOLING_SHA}" -- \\',
+    );
+    expect(workflow).toContain("git diff --quiet -- \\");
     expect(workflow).toContain("scripts/install.ps1 \\");
     expect(workflow).toContain("scripts/release-package-smoke.mjs");
+    expect(workflow).toContain("tests/windows/install-bootstrap-transport.ps1");
   });
 });

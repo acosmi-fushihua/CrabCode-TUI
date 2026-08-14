@@ -1,6 +1,7 @@
-﻿# SECURITY NOTICE: executing this bootstrap from a mutable URL does not authenticate its source.
+# SECURITY NOTICE: executing this bootstrap from a mutable URL does not authenticate its source.
 # CrabCode TUI fail-closed installer for Windows PowerShell 5.1+.
-# Encoding contract: UTF-8 with BOM, required by Windows PowerShell 5.1 over irm | iex.
+# Encoding contract: printable 7-bit ASCII so Windows PowerShell 5.1 can safely
+# decode GitHub's application/octet-stream response when using irm | iex.
 $ErrorActionPreference = 'Stop'
 
 $Repository = 'acosmi/CrabCode-TUI'
@@ -23,6 +24,35 @@ function Get-PlatformToken {
 function Assert-Version([string]$Value) {
     if ($Value -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$') {
         Fail "release version is not canonical SemVer: $Value"
+    }
+}
+
+function Get-ReleaseRecordFromChecksum([string]$Path, [string]$Platform) {
+    $pattern = '^([a-fA-F0-9]{64})[ \t]+(crabcode-([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)-' + [regex]::Escape($Platform) + '\.zip)$'
+    $records = @(
+        foreach ($line in Get-Content -LiteralPath $Path) {
+            $match = [regex]::Match($line, $pattern)
+            if ($match.Success) {
+                [PSCustomObject]@{
+                    Hash = $match.Groups[1].Value.ToLowerInvariant()
+                    Archive = $match.Groups[2].Value
+                    Version = $match.Groups[3].Value
+                }
+            }
+        }
+    )
+    if ($records.Count -ne 1) {
+        Fail "checksum manifest must contain exactly one canonical $Platform archive"
+    }
+    Assert-Version $records[0].Version
+    return $records[0]
+}
+
+function Download-ReleaseFile([string]$Uri, [string]$Destination, [string]$Label) {
+    try {
+        Invoke-WebRequest -Uri $Uri -OutFile $Destination -UseBasicParsing
+    } catch {
+        Fail "failed to download $Label; check DNS and proxy access to github.com and release-assets.githubusercontent.com"
     }
 }
 
@@ -74,23 +104,16 @@ try {
     if ($env:CRABCODE_ASSET_DIR -and -not $env:CRABCODE_VERSION) {
         Fail 'CRABCODE_ASSET_DIR local mode also requires a fixed CRABCODE_VERSION'
     }
-    if ($env:CRABCODE_VERSION) {
-        $tag = $env:CRABCODE_VERSION.Trim()
-    } else {
-        Write-Info 'security notice: this bootstrap source is not authenticated; use the README gh attestation flow for verified installs'
-        Write-Info 'querying latest GitHub Release'
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/latest" -UseBasicParsing
-        $tag = [string]$release.tag_name
-    }
-    Assert-Version $tag
-    $version = $tag -replace '^v', ''
-    $tag = "v$version"
-    $archive = "crabcode-$version-$platform.zip"
-    $baseUrl = "https://github.com/$Repository/releases/download/$tag"
-
     $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("crabcode-install-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $TempRoot | Out-Null
+    $checksumPath = Join-Path $TempRoot 'checksums-sha256.txt'
+
     if ($env:CRABCODE_ASSET_DIR) {
+        $tag = $env:CRABCODE_VERSION.Trim()
+        Assert-Version $tag
+        $version = $tag -replace '^v', ''
+        $tag = "v$version"
+        $archive = "crabcode-$version-$platform.zip"
         if (-not [IO.Path]::IsPathRooted($env:CRABCODE_ASSET_DIR)) { Fail 'CRABCODE_ASSET_DIR must be an absolute path' }
         $assetDir = [IO.Path]::GetFullPath($env:CRABCODE_ASSET_DIR)
         if (-not (Test-Path -LiteralPath $assetDir -PathType Container)) { Fail "CRABCODE_ASSET_DIR is not a directory: $assetDir" }
@@ -100,16 +123,35 @@ try {
         if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) { Fail 'local asset directory is missing checksums-sha256.txt' }
         Write-Info 'using fixed local assets; the installer will not access the network'
     } else {
+        Write-Info 'security notice: this bootstrap source is not authenticated; use the README gh attestation flow for verified installs'
+        if ($env:CRABCODE_VERSION) {
+            $tag = $env:CRABCODE_VERSION.Trim()
+            Assert-Version $tag
+            $version = $tag -replace '^v', ''
+            $tag = "v$version"
+            $archive = "crabcode-$version-$platform.zip"
+            $baseUrl = "https://github.com/$Repository/releases/download/$tag"
+            Download-ReleaseFile "$baseUrl/checksums-sha256.txt" $checksumPath 'checksums-sha256.txt'
+        } else {
+            Write-Info 'resolving the latest GitHub Release from its checksum manifest'
+            Download-ReleaseFile "https://github.com/$Repository/releases/latest/download/checksums-sha256.txt" $checksumPath 'latest checksums-sha256.txt'
+            $record = Get-ReleaseRecordFromChecksum $checksumPath $platform
+            $version = $record.Version
+            $tag = "v$version"
+            $archive = $record.Archive
+        }
+        if ($archive -ne "crabcode-$version-$platform.zip") { Fail "checksum manifest selected an unexpected archive: $archive" }
+        $baseUrl = "https://github.com/$Repository/releases/download/$tag"
         $archivePath = Join-Path $TempRoot $archive
-        $checksumPath = Join-Path $TempRoot 'checksums-sha256.txt'
         Write-Info "downloading $archive"
-        Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile $archivePath -UseBasicParsing
-        Invoke-WebRequest -Uri "$baseUrl/checksums-sha256.txt" -OutFile $checksumPath -UseBasicParsing
+        Download-ReleaseFile "$baseUrl/$archive" $archivePath $archive
     }
 
-    $matching = @(Get-Content -LiteralPath $checksumPath | Where-Object { $_ -match ('^[a-fA-F0-9]{64}\s+' + [regex]::Escape($archive) + '$') })
-    if ($matching.Count -ne 1) { Fail "checksum manifest must contain exactly one $archive record" }
-    $expected = ($matching[0] -split '\s+')[0].ToLowerInvariant()
+    $selected = Get-ReleaseRecordFromChecksum $checksumPath $platform
+    if ($selected.Archive -cne $archive -or $selected.Version -cne $version) {
+        Fail "checksum manifest does not bind the requested release archive: $archive"
+    }
+    $expected = $selected.Hash
     $actual = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actual -ne $expected) { Fail 'release archive SHA-256 mismatch' }
     Write-Info 'release-level SHA-256 verified'
