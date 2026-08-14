@@ -17,12 +17,14 @@
 //! 2. Add allow-rules for specific paths/ports
 //! 3. Call `restrict_self()` — irrevocable, inherited by exec'd processes
 
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
     Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
+use nix::sys::stat::fstat;
 use tracing::{debug, info};
 
 use crate::config::{MountMode, SandboxConfig, SecurityLevel};
@@ -79,9 +81,10 @@ const DEV_PATHS: &[&str] = &[
     "/dev/urandom",
     "/dev/random",
     "/dev/fd", // file descriptor directory
-    "/dev/stdin",
-    "/dev/stdout",
-    "/dev/stderr",
+    // Do not add direct rules for /dev/stdin, /dev/stdout, or /dev/stderr.
+    // They are dynamic aliases for inherited descriptors and commonly resolve
+    // to anonymous pipefs in CI, which is not a valid Landlock PathBeneath
+    // target. The descriptors are already open, and /dev/fd remains granted.
     "/dev/tty",
     "/dev/shm", // shared memory — needed by some runtimes
 ];
@@ -368,11 +371,42 @@ fn add_path_rule<A: Into<landlock::BitFlags<AccessFs>>>(
         operation: format!("open PathFd for {label}"),
         source: std::io::Error::other(e),
     })?;
+    let stat = fstat(fd.as_fd().as_raw_fd()).map_err(|e| SandboxError::Landlock {
+        operation: format!("fstat PathFd for {label}"),
+        source: std::io::Error::other(e),
+    })?;
+    let is_directory = mode_is_directory(stat.st_mode);
+    let access = path_kind_compatible_access(access.into(), TARGET_ABI, is_directory);
     ruleset
         .add_rule(PathBeneath::new(fd, access))
         .map_err(|e| landlock_err(&format!("add_rule for {label}"), e))?;
     debug!(path = %path_ref.display(), "landlock: added path rule");
     Ok(())
+}
+
+/// POSIX `S_IF*` values are mutually exclusive encodings under `S_IFMT`, not
+/// independent flags. A bitwise `contains(S_IFDIR)` check would, for example,
+/// misclassify some socket and block-device modes as directories.
+fn mode_is_directory(mode: libc::mode_t) -> bool {
+    (mode & libc::S_IFMT) == libc::S_IFDIR
+}
+
+/// Landlock rejects directory-only rights such as `ReadDir`, `MakeDir`, and
+/// `Refer` when a rule targets a non-directory inode. Keep directory rules
+/// unchanged, but intersect file rules with the ABI's legitimate file rights.
+///
+/// The classification comes from `fstat(2)` on the same `PathFd` that is added
+/// to the ruleset, so a path replacement cannot race a separate metadata check.
+fn path_kind_compatible_access(
+    requested: landlock::BitFlags<AccessFs>,
+    abi: ABI,
+    is_directory: bool,
+) -> landlock::BitFlags<AccessFs> {
+    if is_directory {
+        requested
+    } else {
+        requested & AccessFs::from_file(abi)
+    }
 }
 
 /// Add the single `connect(2)`-TCP allow rule to the Landlock ruleset.
@@ -407,6 +441,39 @@ fn landlock_err(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posix_file_types_are_classified_by_exact_type_mask() {
+        assert!(mode_is_directory(libc::S_IFDIR | 0o755));
+        for mode in [
+            libc::S_IFREG,
+            libc::S_IFSOCK,
+            libc::S_IFBLK,
+            libc::S_IFCHR,
+            libc::S_IFIFO,
+            libc::S_IFLNK,
+        ] {
+            assert!(!mode_is_directory(mode | 0o600), "mode {mode:#o}");
+        }
+    }
+
+    #[test]
+    fn file_rules_drop_only_directory_rights() {
+        let abi = TARGET_ABI;
+        let read = AccessFs::from_read(abi);
+        let all = AccessFs::from_all(abi);
+
+        assert_eq!(path_kind_compatible_access(read, abi, true), read);
+        assert_eq!(path_kind_compatible_access(all, abi, true), all);
+        assert_eq!(
+            path_kind_compatible_access(read, abi, false),
+            read & AccessFs::from_file(abi)
+        );
+        assert_eq!(
+            path_kind_compatible_access(all, abi, false),
+            all & AccessFs::from_file(abi)
+        );
+    }
 
     #[test]
     fn incomplete_landlock_statuses_fail_closed() {

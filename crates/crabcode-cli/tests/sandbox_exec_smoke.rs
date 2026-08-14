@@ -379,6 +379,34 @@ mod unix_execution {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standard_io_aliases_remain_reopenable() {
+        // Linux must not add /dev/std{in,out,err} themselves as PathBeneath
+        // rules: in CI they resolve to anonymous pipefs and Landlock rejects
+        // those rule targets. The granted /dev/fd directory must still let a
+        // command reopen the inherited descriptors through their usual aliases.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(out) = run_sandboxed(
+            dir.path(),
+            &[".".into()],
+            &[],
+            ": < /dev/stdin; printf 'alias-out' > /dev/stdout; \
+             printf 'alias-err' > /dev/stderr",
+        ) else {
+            skip("sandbox backend unavailable on this host");
+            return;
+        };
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "standard-I/O aliases must remain usable; stderr was: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "alias-out");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("alias-err"));
+    }
+
     #[test]
     fn tmpdir_inside_the_sandbox_is_the_one_the_config_declared() {
         // `tmpDir` 一旦写进配置就是一句承诺：提示词告诉模型 `$TMPDIR` 可写。
@@ -448,6 +476,16 @@ mod unix_execution {
             skip("sandbox backend unavailable on this host");
             return;
         };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains(INIT_FAIL_PREFIX),
+            "the sandbox must initialize before this denial proves isolation; stderr={stderr}"
+        );
+        assert_ne!(
+            out.status.code(),
+            Some(INIT_FAIL_EXIT_CODE),
+            "the sandbox initialization exit code must not prove isolation; stderr={stderr}"
+        );
         let created = target.exists();
         let _ = std::fs::remove_file(&target);
         assert!(
@@ -455,7 +493,7 @@ mod unix_execution {
             "a path outside every allowWrite entry must not be writable inside the sandbox \
              (exit={:?}, created={created}, stderr={})",
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
+            stderr
         );
     }
 

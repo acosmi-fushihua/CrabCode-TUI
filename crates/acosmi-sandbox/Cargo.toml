@@ -44,7 +44,7 @@ landlock = "0.4"
 # Seccomp-BPF — syscall filtering (requires system libseccomp-dev >= 2.5.0)
 libseccomp = "0.4"
 # POSIX API — namespaces, signals, mount, process management
-nix = { version = "0.29", features = ["sched", "signal", "mount", "user", "process"] }
+nix = { version = "0.29", features = ["sched", "signal", "mount", "user", "process", "fs"] }
 # C library bindings — constants (AF_UNIX, EPERM, etc.) for seccomp conditional rules
 libc = "0.2"
 
