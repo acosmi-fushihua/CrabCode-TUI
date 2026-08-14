@@ -56,6 +56,9 @@ function check(
 }
 
 describe('shell config-home bypass-immune safety floor', () => {
+  // The PowerShell permission path cold-starts its bounded AST-parser process.
+  // Its own retry budget can legitimately exceed Bun's 5-second test default
+  // on a loaded CI host, so the outer test must not preempt that fail-closed path.
   test('covers hidden Bash/native outputs and delegated execution without flagging safe values', async () => {
     const root = mkdtempSync(join(tmpdir(), 'crabcode-shell-floor-'))
     const workspace = join(root, 'workspace')
@@ -255,5 +258,5 @@ describe('shell config-home bypass-immune safety floor', () => {
       else process.env.CRABCODE_CONFIG_DIR = previousConfig
       rmSync(root, { recursive: true, force: true })
     }
-  })
+  }, 30_000)
 })
