@@ -358,6 +358,33 @@ if (mode === 'inventory') {
     '../../src/commands/install-slack-app/install-slack-app.js'
   )
   writeEvidence({ result: await installSlack.call(), openedUrls })
+} else if (mode === 'install-slack-count') {
+  const openedUrls: string[] = []
+  const openResult =
+    process.env.DIRECT_TUI_PRODUCTION_SMOKE_OPEN_BROWSER === '1'
+  let config = { slackAppInstallCount: 3 }
+  mock.module('../../src/utils/browser.js', () => ({
+    openBrowser: async (url: string) => {
+      openedUrls.push(url)
+      return openResult
+    },
+  }))
+  mock.module('../../src/utils/config.js', () => ({
+    saveGlobalConfig: (update: (value: typeof config) => typeof config) => {
+      config = update(config)
+    },
+  }))
+  mock.module('../../src/services/analytics/index.js', () => ({
+    logEvent: () => {},
+  }))
+  const installSlack = await import(
+    '../../src/commands/install-slack-app/install-slack-app.js'
+  )
+  writeEvidence({
+    result: await installSlack.call(),
+    openedUrls,
+    slackAppInstallCount: config.slackAppInstallCount,
+  })
 } else if (mode === 'extra-usage') {
   const openedUrls: string[] = []
   mock.module('../../src/utils/browser.js', () => ({

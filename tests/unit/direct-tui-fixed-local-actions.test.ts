@@ -22,7 +22,9 @@ import stripAnsi from 'strip-ansi'
 import * as analytics from '../../src/services/analytics/index.js'
 import { env } from '../../src/utils/env.js'
 import * as model from '../../src/utils/model/model.js'
+import * as allowlist from '../../src/utils/model/modelAllowlist.js'
 import * as settings from '../../src/utils/settings/settings.js'
+import * as sideQuery from '../../src/utils/sideQuery.js'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
 
@@ -245,22 +247,28 @@ describe('direct TUI fixed local actions', () => {
       'updateSettingsForSource',
     ).mockReturnValue({ error: null })
     const log = spyOn(analytics, 'logEvent').mockImplementation(() => {})
+    const allowed = spyOn(allowlist, 'isModelAllowed').mockImplementation(
+      candidate => candidate !== 'illegal-model',
+    )
+    const query = spyOn(sideQuery, 'sideQuery').mockResolvedValue(
+      {} as never,
+    )
     try {
       const action = await import(
         '../../src/commands/smallmodel/smallmodel.js'
       )
 
-      expect(stripAnsi(action.executeSmallModelCommand('').value)).toBe(
+      expect(stripAnsi((await action.executeSmallModelCommand('')).value)).toBe(
         'Small model: small-current',
       )
       expect(
-        stripAnsi(action.executeSmallModelCommand(' status ').value),
+        stripAnsi((await action.executeSmallModelCommand(' status ')).value),
       ).toBe('Small model: small-current')
       expect(update).not.toHaveBeenCalled()
 
       expect(
         stripAnsi(
-          action.executeSmallModelCommand(' custom-small-model ').value,
+          (await action.executeSmallModelCommand(' custom-small-model ')).value,
         ),
       ).toBe('Small model set to custom-small-model')
       expect(update).toHaveBeenLastCalledWith('userSettings', {
@@ -270,30 +278,41 @@ describe('direct TUI fixed local actions', () => {
 
       currentModel.mockReturnValue('fallback-after-reset')
       expect(
-        stripAnsi(action.executeSmallModelCommand('reset').value),
+        stripAnsi((await action.executeSmallModelCommand('reset')).value),
       ).toBe('Small model reset to SDK default (fallback-after-reset)')
       expect(update).toHaveBeenLastCalledWith('userSettings', {
         smallModel: undefined,
       })
 
+      query.mockClear()
+      await expect(
+        action.executeSmallModelCommand('illegal-model'),
+      ).rejects.toThrow("Model 'illegal-model' is not in the list of available models")
+      expect(update).toHaveBeenLastCalledWith('userSettings', {
+        smallModel: undefined,
+      })
+      expect(query).not.toHaveBeenCalled()
+
       update.mockReturnValueOnce({
         error: new Error('fixture settings write failed'),
       })
-      expect(() =>
+      await expect(
         action.executeSmallModelCommand('failed-model'),
-      ).toThrow('Failed to set small model: fixture settings write failed')
+      ).rejects.toThrow('Failed to set small model: fixture settings write failed')
       expect(log).toHaveBeenCalledTimes(1)
 
       update.mockReturnValueOnce({
         error: new Error('fixture settings reset failed'),
       })
-      expect(() => action.executeSmallModelCommand('reset')).toThrow(
+      await expect(action.executeSmallModelCommand('reset')).rejects.toThrow(
         'Failed to reset small model: fixture settings reset failed',
       )
     } finally {
       currentModel.mockRestore()
       update.mockRestore()
       log.mockRestore()
+      allowed.mockRestore()
+      query.mockRestore()
     }
 
     const actionSource = source(

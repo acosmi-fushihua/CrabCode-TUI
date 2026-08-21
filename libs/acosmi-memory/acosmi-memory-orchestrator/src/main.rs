@@ -20,6 +20,11 @@ const COORDINATOR_RESTART_WINDOW: Duration = Duration::from_secs(60);
 const COORDINATOR_RESTART_BURST: usize = 5;
 const COORDINATOR_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 const COORDINATOR_BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// CUI serving child + console-less parent: without this flag Windows allocates
+/// a new console window. Do not combine with `DETACHED_PROCESS` (MSDN: that
+/// combination ignores `CREATE_NO_WINDOW`).
+#[cfg(windows)]
+pub(crate) const SERVING_CHILD_CREATION_FLAGS: u32 = 0x0800_0000;
 
 /// Returns `true` if `pid` is still alive (or exists but we lack permission to
 /// signal it); `false` only if it is definitively gone.
@@ -160,6 +165,10 @@ async fn run_coordinator() -> Result<()> {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            command.creation_flags(SERVING_CHILD_CREATION_FLAGS);
+        }
 
         let outcome = match command.spawn() {
             Ok(mut child) => {
@@ -305,5 +314,11 @@ mod tests {
             !parent_pid_is_alive(pid),
             "reaped child pid {pid} must read as dead"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn serving_child_creation_flags_are_create_no_window_only() {
+        assert_eq!(SERVING_CHILD_CREATION_FLAGS, 0x0800_0000);
     }
 }

@@ -24,7 +24,6 @@ const overageSpy = spyOn(
 const subscriberSpy = spyOn(auth, 'isAcosmiSubscriber').mockReturnValue(true)
 const state = await import('../../src/bootstrap/state.js')
 const catalog = await import('../../src/cli/headlessCommands.js')
-const features = await import('../../src/utils/featurePolyfill.js')
 const models = await import('../../src/utils/model/model.js')
 
 const previousDisable = process.env.DISABLE_EXTRA_USAGE_COMMAND
@@ -102,7 +101,7 @@ describe('direct TUI extra-usage catalog', () => {
     ).toBe(false)
     expect(
       catalog.getDirectTuiBuiltInCommandNames().has('proactive'),
-    ).toBe(features.feature('PROACTIVE') || features.feature('KAIROS'))
+    ).toBe(false)
     expect(
       catalog.getHeadlessBuiltInCommandNames().has('proactive'),
     ).toBe(false)

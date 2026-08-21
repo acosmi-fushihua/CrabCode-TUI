@@ -153,13 +153,17 @@ function projectDirectRendererNeutralLocal(command: Command): Command {
 
 const DIRECT_TUI_INSTALL_SLACK_APP =
   projectDirectRendererNeutralLocal(installSlackApp)
-const DIRECT_TUI_PROACTIVE =
-  projectDirectRendererNeutralLocal(proactive)
 const DIRECT_TUI_CLEAR =
   projectDirectRendererNeutralLocal(clear)
 const DIRECT_TUI_SMALLMODEL =
   projectDirectRendererNeutralLocal(smallModel)
 const DIRECT_TUI_VISION = projectDirectRendererNeutralLocal(vision)
+
+/**
+ * Keep the real `/proactive` module in the TUI compile graph. The public
+ * direct catalog must not advertise this stub; Rust remains fail-closed.
+ */
+void proactive.name
 
 /**
  * The terminal setup implementation already performs only backend/local-OS
@@ -223,9 +227,6 @@ const DIRECT_TUI_BUILTINS: readonly Command[] = [
   insights,
   DIRECT_TUI_VISION,
   ...WORKFLOW_MANAGEMENT_BUILTINS,
-  ...(feature('PROACTIVE') || feature('KAIROS')
-    ? [DIRECT_TUI_PROACTIVE]
-    : []),
   ...ANT_RENDERER_NEUTRAL_BUILTINS,
 ]
 

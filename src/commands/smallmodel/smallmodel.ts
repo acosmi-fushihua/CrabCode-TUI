@@ -6,6 +6,7 @@ import type {
   LocalCommandResult,
 } from '../../types/command.js'
 import { getSmallFastModel } from '../../utils/model/model.js'
+import { validateModel } from '../../utils/model/validateModel.js'
 import { updateSettingsForSource } from '../../utils/settings/settings.js'
 
 /**
@@ -15,9 +16,9 @@ import { updateSettingsForSource } from '../../utils/settings/settings.js'
  * the same settings authority, accepted arguments, telemetry, and visible
  * result without mounting JSX or introducing a new control request.
  */
-export function executeSmallModelCommand(
+export async function executeSmallModelCommand(
   args: string,
-): Extract<LocalCommandResult, { type: 'text' }> {
+): Promise<Extract<LocalCommandResult, { type: 'text' }>> {
   const model = args?.trim() || ''
 
   if (!model || COMMON_INFO_ARGS.includes(model)) {
@@ -43,6 +44,11 @@ export function executeSmallModelCommand(
       type: 'text',
       value: `Small model reset to SDK default (${chalk.bold(getSmallFastModel() || 'auto')})`,
     }
+  }
+
+  const { valid, error: validationError } = await validateModel(model)
+  if (!valid) {
+    throw new Error(validationError)
   }
 
   const { error } = updateSettingsForSource('userSettings', {
