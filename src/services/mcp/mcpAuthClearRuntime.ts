@@ -46,13 +46,19 @@ export function __setMcpAuthClearRuntimeDepsForTest(
 export async function clearMcpAuthenticationRuntime(
   serverName: string,
   capturedConfig: OAuthScopedMcpServerConfig,
-  options: { retainUnpersistedDynamic?: boolean } = {},
+  options: {
+    retainUnpersistedDynamic?: boolean
+    /** Optional owner-scoped resolver for runtimes with multiple desired sets. */
+    resolveFreshConfig?: () => Promise<ScopedMcpServerConfig | null>
+  } = {},
 ): Promise<OAuthScopedMcpServerConfig | null> {
   const deps = depsOverride ?? defaultDeps
   await deps.revokeServerTokens(serverName, capturedConfig)
   await deps.evictExistingServerCache(serverName, capturedConfig)
 
-  const resolvedFreshConfig = await deps.getActiveMcpConfigByName(serverName)
+  const resolvedFreshConfig = options.resolveFreshConfig
+    ? await options.resolveFreshConfig()
+    : await deps.getActiveMcpConfigByName(serverName)
   const freshConfig =
     resolvedFreshConfig?.type === 'http' || resolvedFreshConfig?.type === 'sse'
       ? resolvedFreshConfig

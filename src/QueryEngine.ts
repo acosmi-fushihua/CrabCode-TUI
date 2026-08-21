@@ -223,6 +223,8 @@ export type QueryEngineConfig = {
    * string-only bash contract.
    */
   allowDirectTuiBashContentBlocks?: boolean
+  /** Private direct-TUI unknown-MCP slash handling; standard defaults false. */
+  failClosedUnknownMcp?: boolean
   /**
    * Backend semantic origin, independent from the transport used to exchange
    * events. StructuredIO-backed native TUI turns use `repl_main_thread`;
@@ -423,6 +425,7 @@ export class QueryEngine {
       automationTurnSurfaceLock,
       interactive = false,
       querySource = 'sdk',
+      failClosedUnknownMcp = false,
     } = this.config
     const isNonInteractiveSession = !interactive
 
@@ -570,6 +573,7 @@ export class QueryEngine {
       revalidateSideEffectAuthority,
       suppressUntrustedHooks: privateCommandAllowRules !== undefined,
       onSkillsDiskChanged: this.config.onSkillsDiskChanged,
+      failClosedUnknownMcp,
       discoveredSkillNames: this.discoveredSkillNames,
       setInProgressToolUseIDs: () => {},
       setResponseLength: () => {},
@@ -1624,6 +1628,7 @@ export async function* ask({
   orphanedPermission,
   interactive,
   allowDirectTuiBashContentBlocks,
+  failClosedUnknownMcp,
   querySource,
   onQueryEvent,
   sendOSNotification,
@@ -1664,6 +1669,7 @@ export async function* ask({
   orphanedPermission?: OrphanedPermission
   interactive?: boolean
   allowDirectTuiBashContentBlocks?: boolean
+  failClosedUnknownMcp?: boolean
   querySource?: QuerySource
   onQueryEvent?: (event: Message) => void
   sendOSNotification?: ToolUseContext['sendOSNotification']
@@ -1700,6 +1706,7 @@ export async function* ask({
     orphanedPermission,
     interactive,
     allowDirectTuiBashContentBlocks,
+    failClosedUnknownMcp,
     querySource,
     onQueryEvent,
     sendOSNotification,

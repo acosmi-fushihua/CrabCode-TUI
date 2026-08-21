@@ -845,7 +845,7 @@ describe('historical setup lifecycle placement', () => {
       'await rendererSession.projectRendererScrollSpeed(',
       'await rendererSession.finishSetup()',
       'getDirectTuiCommands(currentCwd)',
-      'getCrabCodeMcpConfigs(dynamicMcpConfig)',
+      'getCrabCodeMcpConfigs(dynamicMcpPolicyView.allowed)',
       "await connectMcpConfigs(store, regularMcpConfigs, 'regular')",
     ])
   })

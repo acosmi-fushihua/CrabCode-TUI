@@ -74,6 +74,7 @@ function terminalOutcomeForLocalCommand(
 export type SlashCommandRuntime = {
   isBuiltInCommandName: (name: string) => boolean
   isSubscriberGatedCommandName: (name: string) => boolean
+  failClosedUnknownMcp?: (context: ProcessUserInputContext) => boolean
   renderForkProgress?: (
     messages: ProgressMessage<AgentProgress>[],
     options: { tools: ToolUseContext['options']['tools']; verbose: boolean },
@@ -396,7 +397,11 @@ export async function processSlashCommandCore(inputString: string, precedingInpu
         resultText: gatedMessage
       };
     }
-    if (looksLikeCommand(commandName) && !isFilePath) {
+    if (
+      ((isMcp && runtime.failClosedUnknownMcp?.(context) === true) ||
+        looksLikeCommand(commandName)) &&
+      !isFilePath
+    ) {
       logEvent('tengu_input_slash_invalid', {
         input: commandName as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
       });

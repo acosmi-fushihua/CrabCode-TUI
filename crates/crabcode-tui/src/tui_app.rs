@@ -6423,14 +6423,30 @@ impl TuiApp {
         } else {
             format!(" {}", command.argument_hint)
         };
+        let runtime_owned = self.runtime_catalog_contains(&command.name)
+            && !reserved_private_local_command(&command.name);
+        let renderer_owned = fixed_local_completion_contains(&command.name) && !runtime_owned;
+        let exact_runtime_invocation =
+            runtime_owned && self.composer.text() == format!("/{}", command.name);
+        let waits_for_private_report_description =
+            reserved_private_local_command(&command.name) && !command.argument_hint.is_empty();
+        let enter_action = match (
+            self.renderer_ui_language,
+            (renderer_owned || exact_runtime_invocation) && !waits_for_private_report_description,
+        ) {
+            (UiLanguage::ZhCn, true) => "Enter 执行",
+            (UiLanguage::EnUs, true) => "Enter run",
+            (UiLanguage::ZhCn, false) => "Enter 接受",
+            (UiLanguage::EnUs, false) => "Enter accept",
+        };
         self.status = match self.renderer_ui_language {
             UiLanguage::ZhCn => format!(
-                "/{}{} — {} · Up/Down 选择 · Enter 接受 · Tab 补全",
-                command.name, hint, command.description
+                "/{}{} — {} · Up/Down 选择 · {enter_action} · Tab 补全",
+                command.name, hint, command.description,
             ),
             UiLanguage::EnUs => format!(
-                "/{}{} — {} · Up/Down choose · Enter accept · Tab complete",
-                command.name, hint, command.description
+                "/{}{} — {} · Up/Down choose · {enter_action} · Tab complete",
+                command.name, hint, command.description,
             ),
         };
     }
@@ -6459,10 +6475,11 @@ impl TuiApp {
 
     /// Accept the highlighted slash command before the ordinary chat Enter
     /// path can submit a partial token. Fixed renderer-owned commands retain
-    /// their historical one-Enter execution. Every runtime-advertised command
-    /// requires a second explicit Enter: the reduced catalog has only
-    /// name/description/argumentHint and therefore cannot prove whether the
-    /// command requires arguments, even when the typed token is exact.
+    /// their historical one-Enter execution. A runtime-advertised command also
+    /// executes on the first Enter when the composer already contains its exact
+    /// canonical token: that text is explicit user intent, while argument
+    /// validity remains owned by the existing backend command handler. Partial
+    /// tokens and Tab completion still only accept the selected name.
     fn accept_selected_command(&mut self, execute_on_enter: bool) -> Vec<HostAction> {
         let Some(index) = self
             .command_palette
@@ -6476,6 +6493,15 @@ impl TuiApp {
         let runtime_owned = self.runtime_catalog_contains(&command.name)
             && !reserved_private_local_command(&command.name);
         let renderer_owned = fixed_local_completion_contains(&command.name) && !runtime_owned;
+        let exact_runtime_invocation =
+            runtime_owned && self.composer.text() == format!("/{}", command.name);
+        if execute_on_enter && exact_runtime_invocation {
+            // Do not rewrite the explicit token or infer arguments. Reuse the
+            // ordinary transactional submission path so attachments, writer
+            // failure recovery, runtime first-wins dispatch, and backend
+            // validation retain their existing authorities.
+            return self.submit_composer_with_priority(None);
+        }
         let completed = format!("/{} ", command.name);
         self.reset_composer_history_navigation();
         self.composer.set_text(&completed);
@@ -26954,6 +26980,32 @@ mod tests {
             "the second explicit Enter sends only the canonical complete token"
         );
 
+        let mut exact_runtime_with_hint = TuiApp::new(
+            &json!({
+                "commands": [{
+                    "name": "review",
+                    "description": "Review a change",
+                    "argumentHint": "<path>"
+                }]
+            }),
+            InitialSessionRequest::New,
+            None,
+        );
+        exact_runtime_with_hint.release_startup_barrier_for_test();
+        exact_runtime_with_hint.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
+        exact_runtime_with_hint.handle_event(Event::Paste("/review".to_string()));
+        assert_eq!(
+            exact_runtime_with_hint.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            vec![HostAction::SendUser {
+                content: Value::String("/review".to_string()),
+                priority: None,
+            }],
+            "argumentHint is presentation metadata; an exact token reaches the authoritative backend validator on the first Enter"
+        );
+
         let mut exact_runtime = TuiApp::new(
             &json!({
                 "commands": [{
@@ -26968,26 +27020,41 @@ mod tests {
         exact_runtime.release_startup_barrier_for_test();
         exact_runtime.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
         exact_runtime.handle_event(Event::Paste("/compact".to_string()));
-        assert!(
-            exact_runtime
-                .handle_event(Event::Key(KeyEvent::new(
-                    KeyCode::Enter,
-                    KeyModifiers::NONE,
-                )))
-                .is_empty(),
-            "an exact runtime token still lacks enough metadata for one-Enter execution"
-        );
-        assert_eq!(exact_runtime.composer.text(), "/compact ");
         assert_eq!(
             exact_runtime.handle_event(Event::Key(KeyEvent::new(
                 KeyCode::Enter,
                 KeyModifiers::NONE,
             ))),
             vec![HostAction::SendUser {
-                content: Value::String("/compact ".to_string()),
+                content: Value::String("/compact".to_string()),
                 priority: None,
-            }]
+            }],
+            "an exact advertised runtime token is explicit user intent and executes on the first Enter"
         );
+        assert!(exact_runtime.composer.is_empty());
+
+        let mut exact_runtime_tab = TuiApp::new(
+            &json!({
+                "commands": [{
+                    "name": "compact",
+                    "description": "Compact now",
+                    "argumentHint": ""
+                }]
+            }),
+            InitialSessionRequest::New,
+            None,
+        );
+        exact_runtime_tab.release_startup_barrier_for_test();
+        exact_runtime_tab.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
+        exact_runtime_tab.handle_event(Event::Paste("/compact".to_string()));
+        assert!(
+            exact_runtime_tab
+                .handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+                .is_empty(),
+            "Tab remains completion-only even for an exact runtime token"
+        );
+        assert_eq!(exact_runtime_tab.composer.text(), "/compact ");
+        assert!(exact_runtime_tab.pending_composer_submission.is_none());
 
         let mut collision = TuiApp::new(
             &json!({
@@ -27003,27 +27070,19 @@ mod tests {
         collision.release_startup_barrier_for_test();
         collision.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
         collision.handle_event(Event::Paste("/help".to_string()));
-        assert!(
-            collision
-                .handle_event(Event::Key(KeyEvent::new(
-                    KeyCode::Enter,
-                    KeyModifiers::NONE,
-                )))
-                .is_empty(),
-            "runtime ownership must prevent the fixed local /help action"
-        );
-        assert!(collision.overlay.is_none());
-        assert_eq!(collision.composer.text(), "/help ");
         assert_eq!(
             collision.handle_event(Event::Key(KeyEvent::new(
                 KeyCode::Enter,
                 KeyModifiers::NONE,
             ))),
             vec![HostAction::SendUser {
-                content: Value::String("/help ".to_string()),
+                content: Value::String("/help".to_string()),
                 priority: None,
-            }]
+            }],
+            "an exact runtime collision executes through its first-wins backend owner on the first Enter"
         );
+        assert!(collision.overlay.is_none());
+        assert!(collision.composer.is_empty());
 
         let mut back_tab = app();
         back_tab.handle_event(Event::Paste("/m".to_string()));
@@ -27064,13 +27123,6 @@ mod tests {
         app.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
         app.attachments.push(composer_image("context.png"));
         app.handle_event(Event::Paste("/compact".to_string()));
-        assert!(
-            app.handle_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            )))
-            .is_empty()
-        );
         let actions = app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
@@ -27079,7 +27131,7 @@ mod tests {
             actions,
             vec![HostAction::SendUser {
                 content: json!([
-                    {"type":"text","text":"/compact "},
+                    {"type":"text","text":"/compact"},
                     {
                         "type":"image",
                         "source":{"type":"base64","media_type":"image/png","data":"AA=="}
@@ -27087,7 +27139,7 @@ mod tests {
                 ]),
                 priority: None,
             }],
-            "the Rust renderer emits its fixed text-first content; the direct adapter restores the historical text-last parser order"
+            "an exact runtime token and its attachment submit transactionally on the first Enter; the direct adapter restores the historical text-last parser order"
         );
         assert!(app.attachments.is_empty());
     }
@@ -31290,18 +31342,6 @@ mod tests {
             "the first physical input after closing the panel must reach the prompt"
         );
 
-        assert!(
-            app.handle_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE
-            )))
-            .is_empty(),
-            "the runtime-catalog command first accepts its canonical token"
-        );
-        assert_eq!(app.composer.text(), "/local-models ");
-        assert!(app.status.contains("again") || app.status.contains("再次"));
-        assert!(app.model_management.is_none());
-
         let new_actions = app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
@@ -31313,7 +31353,9 @@ mod tests {
             },
         ] = new_actions.as_slice()
         else {
-            panic!("the second explicit Enter must open native local-model management");
+            panic!(
+                "the exact runtime token must open native local-model management on its first Enter"
+            );
         };
         let new_request_id = admit_private_action(&mut app, new_action);
         app.action_succeeded(new_action);
@@ -31843,9 +31885,12 @@ mod tests {
         local_completion_registry_is_separate_from_runtime_dispatch_ownership();
         initialize_commands_preserve_metadata_and_leave_execution_to_the_backend_slash_resolver();
         runtime_first_wins_for_non_reserved_local_collisions();
+        command_palette_enter_accepts_before_chat_submit_without_inventing_aliases();
+        runtime_slash_command_with_attachment_uses_user_path_without_losing_command_or_image();
         catalog_metadata_hides_discovery_without_revoking_typed_dispatch_and_partitions_help();
         help_lists_retained_local_command_surfaces();
         unavailable_local_tokens_fail_closed_without_changing_the_viewport();
+        disabled_slash_commands_hide_every_catalog_and_submit_literal_text();
 
         typed_quit_aliases_exit_immediately_without_keybinding_confirmation();
         find_is_renderer_local_and_minimal_mode_fails_without_dispatch();

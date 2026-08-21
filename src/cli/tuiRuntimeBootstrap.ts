@@ -95,6 +95,7 @@ import {
   filterMcpServersByPolicy,
   doesEnterpriseMcpConfigExist,
   areMcpConfigsAllowedWithEnterpriseMcpConfig,
+  isMcpServerDisabled,
   isMcpServerRuntimeActive,
   dedupAcosmiMcpServers,
   getMcpServerSignature,
@@ -104,6 +105,7 @@ import type {
   McpServerConfig,
   ScopedMcpServerConfig,
 } from '../services/mcp/types.js'
+import type { McpServerConfigForProcessTransport } from '../entrypoints/agentSdkTypes.js'
 import {
   clearServerCache,
   getMcpToolsCommandsAndResources,
@@ -113,6 +115,12 @@ import {
   excludeResourcesByServer,
 } from '../services/mcp/utils.js'
 import { fetchAcosmiMcpConfigsIfEligible } from '../services/mcp/acosmi.js'
+import {
+  admitStartupMcpNamespaceReservations,
+  filterDirectTuiProcessMcpServers,
+  filterMcpServersForOwner,
+  orderMcpServersByPrecedence,
+} from './print/mcpServerOwnership.js'
 import {
   processSessionStartHooks,
   processSetupHooks,
@@ -454,19 +462,12 @@ function parseDynamicMcpConfigs(
     fail(`Invalid MCP configuration:\n${errors.join('\n')}`)
   }
 
-  const scoped = Object.fromEntries(
+  return Object.fromEntries(
     Object.entries(merged).map(([name, config]) => [
       name,
       { ...config, scope: 'dynamic' as const },
     ]),
   ) as Record<string, ScopedMcpServerConfig>
-  const { allowed, blocked } = filterMcpServersByPolicy(scoped)
-  if (blocked.length > 0) {
-    process.stderr.write(
-      `Warning: MCP servers blocked by enterprise policy: ${blocked.join(', ')}\n`,
-    )
-  }
-  return allowed
 }
 
 function resolveThinkingConfig(options: TuiRuntimeOptions): ThinkingConfig {
@@ -693,13 +694,39 @@ export async function runTuiRuntime(
   }
 
   const dynamicMcpConfig = parseDynamicMcpConfigs(options.mcpConfig ?? [])
+  const rawDynamicProcessTransport = filterDirectTuiProcessMcpServers(
+    dynamicMcpConfig,
+  )
+  for (const [name, reason] of Object.entries(
+    rawDynamicProcessTransport.errors,
+  )) {
+    process.stderr.write(`Warning: Ignoring MCP server "${name}": ${reason}\n`)
+  }
+  const rawDynamicProcessMcpConfigs = rawDynamicProcessTransport.accepted
+  const dynamicMcpPolicyView = filterMcpServersByPolicy(dynamicMcpConfig)
+  const dynamicProcessPolicyView = filterMcpServersByPolicy(
+    rawDynamicProcessMcpConfigs,
+  )
+  // This mutable record is the direct session's fixed-owner desired source.
+  // IDE discovery may append after the query loop starts; the consumer reads
+  // the same record at each settings reconciliation rather than a stale copy.
+  const fixedSessionMcpConfigs: Record<string, ScopedMcpServerConfig> = {
+    ...rawDynamicProcessMcpConfigs,
+  }
+  const initiallyInactiveFixedMcpNames = new Set(
+    Object.keys(rawDynamicProcessMcpConfigs).filter(isMcpServerDisabled),
+  )
   if (doesEnterpriseMcpConfigExist()) {
     if (options.strictMcpConfig) {
       fail(
         '--strict-mcp-config cannot be used when enterprise MCP configuration is present',
       )
     }
-    if (!areMcpConfigsAllowedWithEnterpriseMcpConfig(dynamicMcpConfig)) {
+    if (
+      !areMcpConfigsAllowedWithEnterpriseMcpConfig(
+        dynamicMcpPolicyView.allowed,
+      )
+    ) {
       fail(
         'dynamic MCP servers are not allowed with enterprise MCP configuration',
       )
@@ -864,17 +891,74 @@ export async function runTuiRuntime(
   const existing =
     options.strictMcpConfig || isBareMode()
       ? {}
-      : (await getCrabCodeMcpConfigs(dynamicMcpConfig)).servers
-  const allMcpConfigs = Object.fromEntries(
-    Object.entries({ ...existing, ...dynamicMcpConfig }).filter(
+      : (await getCrabCodeMcpConfigs(dynamicMcpPolicyView.allowed)).servers
+  const runtimeActiveMcpConfigs = Object.fromEntries(
+    [
+      ...Object.entries(dynamicMcpPolicyView.allowed),
+      ...Object.entries(orderMcpServersByPrecedence(existing)).filter(
+        ([name]) => !(name in rawDynamicProcessMcpConfigs),
+      ),
+    ].filter(
       ([name, config]) => isMcpServerRuntimeActive(name, config),
     ),
   )
+  // Native direct TUI has no SDK MCP control host. Reject SDK transports before
+  // assigning namespaces so an unsupported config cannot shadow a healthy
+  // process server that normalizes to the same wire namespace.
+  const processTransportConfigs = filterDirectTuiProcessMcpServers(
+    runtimeActiveMcpConfigs,
+  )
+  for (const [name, reason] of Object.entries(processTransportConfigs.errors)) {
+    if (name in rawDynamicProcessTransport.errors) continue
+    process.stderr.write(`Warning: Ignoring MCP server "${name}": ${reason}\n`)
+  }
+  // --mcp-config is not part of getCrabCodeMcpConfigs()' returned server map,
+  // so the direct bootstrap must apply the same managed policy itself before
+  // a blocked name can claim a namespace or create a transport.
+  const startupPolicy = filterMcpServersByPolicy(
+    processTransportConfigs.accepted,
+  )
+  const startupBlockedNames = new Set([
+    ...startupPolicy.blocked,
+    ...dynamicProcessPolicyView.blocked,
+  ])
+  for (const name of startupBlockedNames) {
+    process.stderr.write(
+      `Warning: Ignoring MCP server "${name}": Blocked by enterprise policy (allowedMcpServers/deniedMcpServers)\n`,
+    )
+    if (dynamicProcessPolicyView.blocked.includes(name)) {
+      initiallyInactiveFixedMcpNames.add(name)
+    }
+  }
+  // Raw names share one MCP wire namespace across tools and prompts. Reject
+  // later collisions before any process transport connects so one server can
+  // never erase another server's projected capabilities.
+  const startupNamespaceOwnership = admitStartupMcpNamespaceReservations(
+    rawDynamicProcessMcpConfigs,
+    startupPolicy.allowed,
+  )
+  for (const [name, reason] of Object.entries(
+    startupNamespaceOwnership.errors,
+  )) {
+    process.stderr.write(`Warning: Ignoring MCP server "${name}": ${reason}\n`)
+  }
+  const allMcpConfigs = startupNamespaceOwnership.acceptedActive
+  for (const name of Object.keys(rawDynamicProcessMcpConfigs)) {
+    if (
+      !startupNamespaceOwnership.acceptedReservationNames.has(name)
+    ) {
+      // A namespace-rejected CLI row never owned this session and must not
+      // become a ghost protected owner during later reconciliation.
+      delete fixedSessionMcpConfigs[name]
+      initiallyInactiveFixedMcpNames.delete(name)
+    }
+  }
+  // Kept for the shared standard-query signature. Direct startup rejects every
+  // SDK transport above, so this record is intentionally always empty.
   const sdkMcpConfigs: Record<string, McpSdkServerConfig> = {}
   const regularMcpConfigs: Record<string, ScopedMcpServerConfig> = {}
   for (const [name, config] of Object.entries(allMcpConfigs)) {
-    if (config.type === 'sdk') sdkMcpConfigs[name] = config
-    else regularMcpConfigs[name] = config
+    if (config.type !== 'sdk') regularMcpConfigs[name] = config
   }
 
   const defaultState = getDefaultAppState()
@@ -914,22 +998,6 @@ export async function runTuiRuntime(
     })
   }
   await connectMcpConfigs(store, regularMcpConfigs, 'regular')
-  void ideMcpConfigPromise
-    .then(async config => {
-      if (
-        !config ||
-        store.getState().mcp.clients.some(client => client.name === 'ide')
-      ) {
-        return
-      }
-      await connectMcpConfigs(store, { ide: config }, 'IDE')
-    })
-    .catch(error => {
-      logForDebugging(
-        `[MCP] IDE auto-connect discovery error: ${errorMessage(error)}`,
-        { level: 'warn' },
-      )
-    })
 
   if (
     !options.strictMcpConfig &&
@@ -940,20 +1008,71 @@ export async function runTuiRuntime(
       string,
       ScopedMcpServerConfig
     >
-    const { allowed, blocked } = filterMcpServersByPolicy(fetched)
-    if (blocked.length > 0) {
-      process.stderr.write(
-        `Warning: Acosmi MCP servers blocked by enterprise policy: ${blocked.join(', ')}\n`,
-      )
-    }
-    suppressDuplicatePluginServers(store, regularMcpConfigs, allowed)
     const nonPlugin = Object.fromEntries(
       Object.entries(regularMcpConfigs).filter(
         ([name]) => !name.startsWith('plugin:'),
       ),
     )
-    const { servers: deduped } = dedupAcosmiMcpServers(allowed, nonPlugin)
-    await connectMcpConfigs(store, deduped, 'acosmi')
+    const { servers: dedupedFetched } = dedupAcosmiMcpServers(
+      fetched,
+      nonPlugin,
+    )
+    const { allowed, blocked } = filterMcpServersByPolicy(dedupedFetched)
+    if (blocked.length > 0) {
+      process.stderr.write(
+        `Warning: Acosmi MCP servers blocked by enterprise policy: ${blocked.join(', ')}\n`,
+      )
+    }
+    const inactive = Object.fromEntries(
+      blocked.flatMap(name => {
+        const config = dedupedFetched[name]
+        return config ? [[name, config] as const] : []
+      }),
+    )
+    const runtimeAllowed = Object.fromEntries(
+      Object.entries(allowed).filter(([name, config]) => {
+        if (isMcpServerRuntimeActive(name, config)) return true
+        inactive[name] = config
+        return false
+      }),
+    )
+    const fixedOwnerNames = new Set([
+      ...Object.keys(fixedSessionMcpConfigs),
+      ...Object.keys(allMcpConfigs),
+      ...store.getState().mcp.clients.map(client => client.name),
+    ])
+    const activeOwnership = filterMcpServersForOwner(
+      'plugin',
+      runtimeAllowed,
+      fixedOwnerNames,
+    )
+    const inactiveOwnership = filterMcpServersForOwner(
+      'plugin',
+      inactive,
+      new Set([
+        ...fixedOwnerNames,
+        ...Object.keys(activeOwnership.accepted),
+      ]),
+    )
+    for (const [name, reason] of Object.entries({
+      ...activeOwnership.errors,
+      ...inactiveOwnership.errors,
+    })) {
+      process.stderr.write(
+        `Warning: Ignoring Acosmi MCP server "${name}": ${reason}\n`,
+      )
+    }
+    Object.assign(fixedSessionMcpConfigs, inactiveOwnership.accepted)
+    for (const name of Object.keys(inactiveOwnership.accepted)) {
+      initiallyInactiveFixedMcpNames.add(name)
+    }
+    suppressDuplicatePluginServers(
+      store,
+      regularMcpConfigs,
+      activeOwnership.accepted,
+    )
+    Object.assign(fixedSessionMcpConfigs, activeOwnership.accepted)
+    await connectMcpConfigs(store, activeOwnership.accepted, 'acosmi')
   }
 
   if (!isBareMode()) {
@@ -1032,6 +1151,14 @@ export async function runTuiRuntime(
       enableAuthStatus: options.enableAuthStatus,
       agent: options.agent,
       workload: options.workload,
+      disableSlashCommands: options.disableSlashCommands,
+      subscribeAppState: store.subscribe,
+      startupSessionMcpServerNames: Object.keys(fixedSessionMcpConfigs),
+      startupSessionMcpServers: fixedSessionMcpConfigs,
+      startupPolicyBlockedMcpServerNames: initiallyInactiveFixedMcpNames,
+      lateFixedMcpConfig: ideMcpConfigPromise.then(config =>
+        config ? { name: 'ide', config } : null,
+      ),
       taskListId,
       setupTrigger,
       sessionStartHooksPromise,

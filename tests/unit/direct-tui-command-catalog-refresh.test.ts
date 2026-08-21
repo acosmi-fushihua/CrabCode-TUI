@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  DIRECT_TUI_COMMAND_CATALOG_ARGUMENT_HINT_MAX_UTF16_UNITS,
+  DIRECT_TUI_COMMAND_CATALOG_DESCRIPTION_MAX_UTF16_UNITS,
+  DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES,
+  DIRECT_TUI_COMMAND_CATALOG_NAME_MAX_UTF16_UNITS,
+  projectDirectTuiCommandCatalogEntries as projectCommandCatalogEntries,
+} from '../../src/cli/commandCatalogProjection.js'
+import {
   buildDirectTuiCommandCatalogChangedRequest,
   DirectTuiCommandCatalogLifecycle,
   DirectTuiCommandCatalogPublisher,
@@ -8,8 +15,94 @@ import {
   DirectTuiCommandCatalogChangedResponseSchema,
 } from '../../src/cli/directTuiCommandCatalogRefresh.js'
 import { StructuredIO } from '../../src/cli/structuredIO.js'
+import { commandInventoryForRoute } from '../../src/cli/print/slashCommandRoutePolicy.js'
+import { createStore } from '../../src/state/store.js'
+import type { Command } from '../../src/types/command.js'
 
 describe('direct TUI command catalog refresh private contract', () => {
+  test('keeps published and executable MCP inventory aligned across every producer', async () => {
+    const sent: string[][] = []
+    const publisher = new DirectTuiCommandCatalogPublisher(
+      async commands => {
+        sent.push(commands.map(command => command.name))
+      },
+      error => {
+        throw error
+      },
+    )
+    const command = (name: string) => ({ name }) as Command
+    const entry = (name: string) => ({
+      name,
+      description: name,
+      argumentHint: '',
+    })
+    let runtimeCommands = [command('runtime-initial')]
+    const store = createStore({
+      mcpCommands: [command('mcp__server__initial')],
+    })
+    const currentInventory = () =>
+      commandInventoryForRoute(
+        true,
+        runtimeCommands,
+        store.getState().mcpCommands,
+      )
+    const publish = () =>
+      publisher.update(currentInventory().map(item => entry(item.name)))
+    const lifecycle = new DirectTuiCommandCatalogLifecycle<Command>(
+      runtimeCommands,
+      commands => {
+        runtimeCommands = [...commands]
+        publish()
+      },
+    )
+    let observedMcpCommands = store.getState().mcpCommands
+    const unsubscribe = store.subscribe(() => {
+      const nextMcpCommands = store.getState().mcpCommands
+      if (Object.is(nextMcpCommands, observedMcpCommands)) return
+      observedMcpCommands = nextMcpCommands
+      publish()
+    })
+
+    publisher.markInitialized()
+    publish()
+    await publisher.whenIdle()
+
+    store.setState(() => ({
+      mcpCommands: [
+        command('mcp__server__initial'),
+        command('mcp__server__late'),
+      ],
+    }))
+    await publisher.whenIdle()
+
+    store.setState(() => ({
+      mcpCommands: [command('mcp__server__late')],
+    }))
+    await publisher.whenIdle()
+
+    await lifecycle.refresh(async () => [command('runtime-refreshed')])
+    await publisher.whenIdle()
+
+    store.setState(() => ({ mcpCommands: [] }))
+    await publisher.whenIdle()
+    unsubscribe()
+
+    expect(sent).toEqual([
+      ['runtime-initial', 'mcp__server__initial'],
+      [
+        'runtime-initial',
+        'mcp__server__initial',
+        'mcp__server__late',
+      ],
+      ['runtime-initial', 'mcp__server__late'],
+      ['runtime-refreshed', 'mcp__server__late'],
+      ['runtime-refreshed'],
+    ])
+    expect(currentInventory().map(item => item.name)).toEqual(
+      sent.at(-1),
+    )
+  })
+
   test('uses the existing correlated StructuredIO FIFO and validates the ACK', async () => {
     let deliverLine: ((line: string) => void) | undefined
     const line = new Promise<string>(resolve => {
@@ -175,6 +268,103 @@ describe('direct TUI command catalog refresh private contract', () => {
     ).toBe(false)
   })
 
+  test('shares exact UTF-16 and entry bounds with the catalog projector', () => {
+    const exactBoundaryCommand = {
+      name: 'n'.repeat(
+        DIRECT_TUI_COMMAND_CATALOG_NAME_MAX_UTF16_UNITS,
+      ),
+      type: 'prompt',
+      description: 'd'.repeat(
+        DIRECT_TUI_COMMAND_CATALOG_DESCRIPTION_MAX_UTF16_UNITS,
+      ),
+      argumentHint: 'h'.repeat(
+        DIRECT_TUI_COMMAND_CATALOG_ARGUMENT_HINT_MAX_UTF16_UNITS,
+      ),
+      progressMessage: 'running',
+      getPromptForCommand: () => [],
+    } satisfies Command
+    const projected = projectCommandCatalogEntries(
+      [exactBoundaryCommand],
+      command => command.description,
+    )
+    expect(projected).toHaveLength(1)
+    expect(
+      DirectTuiCommandCatalogChangedRequestSchema.safeParse(
+        buildDirectTuiCommandCatalogChangedRequest(projected),
+      ).success,
+    ).toBe(true)
+
+    const boundaryEntry = projected[0]!
+    for (const invalidEntry of [
+      {
+        ...boundaryEntry,
+        name: boundaryEntry.name + 'n',
+      },
+      {
+        ...boundaryEntry,
+        description: boundaryEntry.description + 'd',
+      },
+      {
+        ...boundaryEntry,
+        argumentHint: boundaryEntry.argumentHint + 'h',
+      },
+    ]) {
+      expect(
+        DirectTuiCommandCatalogChangedRequestSchema.safeParse(
+          {
+            subtype: 'crabcode_tui_command_catalog_changed',
+            protocol_version: 1,
+            commands: [invalidEntry],
+          },
+        ).success,
+      ).toBe(false)
+    }
+
+    for (const invalidEntry of [
+      { ...boundaryEntry, name: `bad-\ud800` },
+      { ...boundaryEntry, description: `bad-\udc00` },
+      { ...boundaryEntry, argumentHint: `bad-\ud800` },
+    ]) {
+      expect(
+        DirectTuiCommandCatalogChangedRequestSchema.safeParse({
+          subtype: 'crabcode_tui_command_catalog_changed',
+          protocol_version: 1,
+          commands: [invalidEntry],
+        }).success,
+      ).toBe(false)
+    }
+
+    const maximumEntries = Array.from(
+      { length: DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES },
+      (_, index) => ({
+        name: `command-${index}`,
+        description: '',
+        argumentHint: '',
+      }),
+    )
+    expect(
+      DirectTuiCommandCatalogChangedRequestSchema.safeParse(
+        buildDirectTuiCommandCatalogChangedRequest(maximumEntries),
+      ).success,
+    ).toBe(true)
+    expect(
+      DirectTuiCommandCatalogChangedRequestSchema.safeParse(
+        {
+          subtype: 'crabcode_tui_command_catalog_changed',
+          protocol_version: 1,
+          commands: [
+            ...maximumEntries,
+            {
+              name: 'one-command-too-many',
+              description: '',
+              argumentHint: '',
+            },
+          ],
+        },
+      ).success,
+    ).toBe(false)
+  })
+
   test('holds pre-initialize changes and coalesces in-flight updates latest-wins', async () => {
     const sends: string[][] = []
     const releases: Array<() => void> = []
@@ -236,6 +426,54 @@ describe('direct TUI command catalog refresh private contract', () => {
     await publisher.whenIdle()
 
     expect(order).toEqual(['auth-control-response', 'catalog-refresh'])
+  })
+
+  test('holds an async owning refresh until its correlated response is queued', async () => {
+    const order: string[] = []
+    const publisher = new DirectTuiCommandCatalogPublisher(
+      async () => {
+        order.push('catalog-refresh')
+      },
+      error => {
+        throw error
+      },
+    )
+    publisher.markInitialized()
+    const release = publisher.hold()
+
+    await Promise.resolve()
+    publisher.update([
+      { name: 'async-command', description: '', argumentHint: '' },
+    ])
+    await Promise.resolve()
+    expect(order).toEqual([])
+
+    order.push('correlated-response')
+    release()
+    release()
+    await publisher.whenIdle()
+    expect(order).toEqual(['correlated-response', 'catalog-refresh'])
+  })
+
+  test('keeps nested holds independent and releases after an owner failure', async () => {
+    const sends: string[] = []
+    const publisher = new DirectTuiCommandCatalogPublisher(
+      async commands => {
+        sends.push(commands[0]?.name ?? '')
+      },
+      () => {},
+    )
+    publisher.markInitialized()
+    const releaseOuter = publisher.hold()
+    const releaseInner = publisher.hold()
+    publisher.update([{ name: 'held', description: '', argumentHint: '' }])
+
+    releaseInner()
+    await Promise.resolve()
+    expect(sends).toEqual([])
+    releaseOuter()
+    await publisher.whenIdle()
+    expect(sends).toEqual(['held'])
   })
 
   test('does not retry a failed snapshot until a newer change arrives', async () => {
@@ -349,6 +587,55 @@ describe('direct TUI command catalog refresh private contract', () => {
 
     expect(commits).toEqual([['older-valid']])
     expect(lifecycle.snapshot()).toEqual([{ name: 'older-valid' }])
+  })
+
+  test('bounds the idle barrier to refreshes registered at its call boundary', async () => {
+    type Entry = { name: string }
+    let releaseFirst!: (commands: Entry[]) => void
+    let releaseSecond!: (commands: Entry[]) => void
+    const firstLoad = new Promise<Entry[]>(resolve => {
+      releaseFirst = resolve
+    })
+    const secondLoad = new Promise<Entry[]>(resolve => {
+      releaseSecond = resolve
+    })
+    const lifecycle = new DirectTuiCommandCatalogLifecycle<Entry>(
+      [{ name: 'initial' }],
+      () => {},
+    )
+
+    const firstRefresh = lifecycle.refresh(() => firstLoad)
+    let barrierResolved = false
+    const barrier = lifecycle.whenIdle().then(snapshot => {
+      barrierResolved = true
+      return snapshot
+    })
+    await Promise.resolve()
+
+    const secondRefresh = lifecycle.refresh(() => secondLoad)
+    releaseFirst([{ name: 'first' }])
+    await firstRefresh
+    expect(await barrier).toEqual([{ name: 'first' }])
+    expect(barrierResolved).toBe(true)
+
+    releaseSecond([{ name: 'second' }])
+    await secondRefresh
+    expect(lifecycle.snapshot()).toEqual([{ name: 'second' }])
+  })
+
+  test('idle barrier observes failed refresh settlement without stealing its rejection', async () => {
+    const lifecycle = new DirectTuiCommandCatalogLifecycle(
+      [{ name: 'last-success' }],
+      () => {},
+    )
+    const failedRefresh = lifecycle.refresh(async () => {
+      throw new Error('catalog load failed')
+    })
+    const observedFailure = failedRefresh.catch(error => String(error))
+
+    expect(await lifecycle.whenIdle()).toEqual([{ name: 'last-success' }])
+    expect(await observedFailure).toBe('Error: catalog load failed')
+    expect(lifecycle.snapshot()).toEqual([{ name: 'last-success' }])
   })
 
   test('contains diagnostic callback failures and sends nothing after pre-init close', async () => {

@@ -16,6 +16,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
 import stripAnsi from 'strip-ansi'
 
 import * as analytics from '../../src/services/analytics/index.js'
@@ -56,6 +57,8 @@ async function runClearQueryFixture(
   const auditRoot = mkdtempSync(join(tmpdir(), 'crabcode-clear-query-engine-'))
   const configDir = join(auditRoot, 'config')
   const homeDir = join(auditRoot, 'home')
+  const outputPath = join(auditRoot, 'evidence.json')
+  const errorPath = join(auditRoot, 'fixture.stderr')
   mkdirSync(configDir, { recursive: true })
   mkdirSync(homeDir, { recursive: true })
   writeFileSync(
@@ -87,18 +90,13 @@ async function runClearQueryFixture(
         DISABLE_BACKGROUND_TASKS: '1',
         ...overrides,
       },
-      stdout: 'pipe',
-      stderr: 'pipe',
+      stdout: Bun.file(outputPath),
+      stderr: Bun.file(errorPath),
     })
-    const [exitCode, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ])
+    const exitCode = await child.exited
+    const stderr = readFileSync(errorPath, 'utf8')
     expect(exitCode, stderr).toBe(0)
-    return JSON.parse(
-      stdout.trim().split('\n').at(-1) ?? '',
-    ) as ClearFixtureEvidence
+    return await readLastJsonEvidence<ClearFixtureEvidence>(outputPath)
   } finally {
     rmSync(auditRoot, { recursive: true, force: true })
   }
@@ -277,6 +275,21 @@ describe('direct TUI fixed local actions', () => {
       expect(update).toHaveBeenLastCalledWith('userSettings', {
         smallModel: undefined,
       })
+
+      update.mockReturnValueOnce({
+        error: new Error('fixture settings write failed'),
+      })
+      expect(() =>
+        action.executeSmallModelCommand('failed-model'),
+      ).toThrow('Failed to set small model: fixture settings write failed')
+      expect(log).toHaveBeenCalledTimes(1)
+
+      update.mockReturnValueOnce({
+        error: new Error('fixture settings reset failed'),
+      })
+      expect(() => action.executeSmallModelCommand('reset')).toThrow(
+        'Failed to reset small model: fixture settings reset failed',
+      )
     } finally {
       currentModel.mockRestore()
       update.mockRestore()

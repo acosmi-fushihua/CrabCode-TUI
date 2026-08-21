@@ -61,7 +61,11 @@ import {
 import { queryCheckpoint } from '../queryProfiler.js'
 import { parseSlashCommand } from '../slashCommandParsing.js'
 import { processTextPrompt } from './processTextPrompt.js'
-export type ProcessUserInputContext = ToolUseContext & LocalJSXCommandContext
+export type ProcessUserInputContext = ToolUseContext &
+  LocalJSXCommandContext & {
+    /** Private direct-TUI slash boundary; omitted by standard/headless routes. */
+    failClosedUnknownMcp?: boolean
+  }
 
 export type LocalCommandTerminalOutcome = {
   /**

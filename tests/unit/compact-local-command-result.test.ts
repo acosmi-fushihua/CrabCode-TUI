@@ -1,9 +1,16 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import compactCommand from '../../src/commands/compact/index.js'
 import { matchesCommandInvocation } from '../../src/types/command.js'
+import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
 
@@ -68,6 +75,8 @@ describe('compact local-command terminal result contract', () => {
     )
 
     try {
+      const evidencePath = join(auditRoot, 'evidence.json')
+      const errorPath = join(auditRoot, 'fixture.stderr')
       const child = Bun.spawn({
         cmd: [
           process.execPath,
@@ -86,25 +95,22 @@ describe('compact local-command terminal result contract', () => {
           CRABCODE_FEATURE_COORDINATOR_MODE: '0',
           DISABLE_BACKGROUND_TASKS: '1',
         },
-        stdout: 'pipe',
-        stderr: 'pipe',
+        stdout: Bun.file(evidencePath),
+        stderr: Bun.file(errorPath),
       })
-      const [exitCode, stdout, stderr] = await Promise.all([
-        child.exited,
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-      ])
+      const exitCode = await child.exited
+      const stderr = readFileSync(errorPath, 'utf8')
       expect(exitCode, stderr).toBe(0)
-      const evidence = JSON.parse(
-        stdout.trim().split('\n').at(-1) ?? '',
-      ) as Record<
+      const evidence = await readLastJsonEvidence<
+        Record<
         | 'success'
         | 'alias-success'
         | 'empty-history'
         | 'api-error'
         | 'cancelled',
-        ScenarioEvidence
-      >
+          ScenarioEvidence
+        >
+      >(evidencePath)
 
       const success = terminalResult(evidence.success)
       expect(success).toMatchObject({

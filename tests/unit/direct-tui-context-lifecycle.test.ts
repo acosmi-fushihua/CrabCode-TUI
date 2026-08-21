@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
 
 import {
   collectContextData,
@@ -321,38 +325,51 @@ describe('/context collection lifecycle', () => {
       'fixtures',
       'context-microcompact-analysis-only.ts',
     )
+    const evidenceRoot = mkdtempSync(
+      join(tmpdir(), 'crabcode-context-analysis-'),
+    )
+    const outputPath = join(evidenceRoot, 'evidence.json')
+    const errorPath = join(evidenceRoot, 'fixture.stderr')
     const child = Bun.spawn([process.execPath, fixture], {
       cwd: join(import.meta.dir, '..', '..'),
-      env: { ...process.env, NODE_ENV: 'test' },
-      stdout: 'pipe',
-      stderr: 'pipe',
+      env: {
+        ...process.env,
+        NODE_ENV: 'test',
+      },
+      stdout: Bun.file(outputPath),
+      stderr: Bun.file(errorPath),
     })
-    const [exitCode, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ])
-    expect(exitCode, stderr).toBe(0)
-
-    const result = JSON.parse(stdout) as {
-      pendingBefore: unknown
-      pinnedBefore: unknown[]
-      analysisStateCreations: number
-      analysisCacheEditPlans: number
-      analysisCacheDeletionNotifications: number
-      warningAfterAnalysis: boolean
-      pendingAfterAnalysis: unknown
-      pinnedAfterAnalysis: unknown[]
-      transcriptUnchanged: boolean
-      analysisRegisteredToolCounts: number[]
-      stateCreationsAfterProductionControl: number
-      productionPendingEdits: {
-        type: string
-        edits: Array<{ cache_reference: string }>
-      } | null
-      productionCacheDeletionNotifications: number
-      analyzedModel: string
+    const exitCode = await child.exited
+    let stderr = ''
+    let result:
+      | {
+          pendingBefore: unknown
+          pinnedBefore: unknown[]
+          analysisStateCreations: number
+          analysisCacheEditPlans: number
+          analysisCacheDeletionNotifications: number
+          warningAfterAnalysis: boolean
+          pendingAfterAnalysis: unknown
+          pinnedAfterAnalysis: unknown[]
+          transcriptUnchanged: boolean
+          analysisRegisteredToolCounts: number[]
+          stateCreationsAfterProductionControl: number
+          productionPendingEdits: {
+            type: string
+            edits: Array<{ cache_reference: string }>
+          } | null
+          productionCacheDeletionNotifications: number
+          analyzedModel: string
+        }
+      | undefined
+    try {
+      stderr = readFileSync(errorPath, 'utf8')
+      if (exitCode === 0) result = await readLastJsonEvidence(outputPath)
+    } finally {
+      rmSync(evidenceRoot, { recursive: true, force: true })
     }
+    expect(exitCode, stderr).toBe(0)
+    if (!result) throw new Error('missing context lifecycle evidence')
 
     expect(result).toMatchObject({
       pendingBefore: null,

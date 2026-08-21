@@ -25,6 +25,7 @@ import {
   clearSessionMessagesCache,
   resetProjectForTesting,
 } from '../../src/utils/sessionStorage.js'
+import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
 const WRITER_FIXTURE = join(
@@ -112,6 +113,8 @@ describe('compact transcript persistence and cross-process resume', () => {
     const projectDir = join(root, 'project')
     const sessionId = randomUUID()
     const transcriptPath = join(projectDir, `${sessionId}.jsonl`)
+    const evidencePath = join(root, 'writer-evidence.json')
+    const errorPath = join(root, 'writer.stderr')
     await Promise.all([
       mkdir(configDir, { recursive: true }),
       mkdir(homeDir, { recursive: true }),
@@ -143,18 +146,13 @@ describe('compact transcript persistence and cross-process resume', () => {
           CRABCODE_FEATURE_COORDINATOR_MODE: '0',
           DISABLE_BACKGROUND_TASKS: '1',
         },
-        stdout: 'pipe',
-        stderr: 'pipe',
+        stdout: Bun.file(evidencePath),
+        stderr: Bun.file(errorPath),
       })
-      const [exitCode, stdout, stderr] = await Promise.all([
-        writer.exited,
-        new Response(writer.stdout).text(),
-        new Response(writer.stderr).text(),
-      ])
+      const exitCode = await writer.exited
+      const stderr = await readFile(errorPath, 'utf8')
       expect(exitCode, stderr).toBe(0)
-      const evidence = JSON.parse(
-        stdout.trim().split('\n').at(-1) ?? '',
-      ) as WriterEvidence
+      const evidence = await readLastJsonEvidence<WriterEvidence>(evidencePath)
       expect(evidence.terminalResult).toMatchObject({
         type: 'result',
         subtype: 'success',

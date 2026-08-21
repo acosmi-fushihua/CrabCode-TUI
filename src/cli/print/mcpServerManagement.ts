@@ -1,5 +1,6 @@
 // ANT-ONLY import markers must not be reordered
 import type { Tools } from 'src/Tool.js'
+import type { Command } from 'src/commands.js'
 import type {
   MCPServerConnection,
   ScopedMcpServerConfig,
@@ -14,11 +15,14 @@ import type {
 import type { AppState } from 'src/state/AppStateStore.js'
 import {
   connectToServer,
-  clearServerCache,
+  evictExistingServerCache,
   fetchToolsForClient,
+  fetchCommandsForClient,
   areMcpConfigsEqual,
 } from 'src/services/mcp/client.js'
 import { filterMcpServersByPolicy } from 'src/services/mcp/config.js'
+import { commandBelongsToServer } from 'src/services/mcp/utils.js'
+import { getMcpPrefix } from 'src/services/mcp/mcpStringUtils.js'
 import { logError } from 'src/utils/log.js'
 import { toError } from 'src/utils/errors.js'
 
@@ -26,6 +30,125 @@ export type DynamicMcpState = {
   clients: MCPServerConnection[]
   tools: Tools
   configs: Record<string, ScopedMcpServerConfig>
+}
+
+export type StartupProcessMcpPartition = {
+  dynamicState: DynamicMcpState
+  remainingClients: MCPServerConnection[]
+  remainingTools: Tools
+}
+
+export type McpServerManagementDependencies = {
+  connectToServer: (
+    name: string,
+    config: ScopedMcpServerConfig,
+  ) => Promise<MCPServerConnection>
+  evictExistingServerCache: (
+    name: string,
+    config: ScopedMcpServerConfig,
+  ) => Promise<void>
+  fetchToolsForClient: (client: MCPServerConnection) => Promise<Tools>
+  fetchCommandsForClient: (client: MCPServerConnection) => Promise<Command[]>
+}
+
+export type ReconcileMcpServersOptions = {
+  /**
+   * Direct-TUI-only opt-in for keeping live MCP prompt commands in AppState.
+   * The public SDK/headless route intentionally retains its established behavior
+   * when this is omitted or false.
+   */
+  syncPromptCommands?: boolean
+  /** Direct-route opt-in for removing stale resource snapshots on reconcile. */
+  syncResourceCleanup?: boolean
+  /** Direct route has globally admitted normalized wire namespaces. */
+  strictWireNamespaceCleanup?: boolean
+  /** Preserve trusted internal config scope/provenance for direct plugin state. */
+  preserveDesiredScopes?: boolean
+  /** Narrow test seam; production callers use the module defaults. */
+  dependencies?: Partial<McpServerManagementDependencies>
+}
+
+const defaultDependencies: McpServerManagementDependencies = {
+  connectToServer,
+  evictExistingServerCache,
+  fetchToolsForClient,
+  fetchCommandsForClient,
+}
+
+/** Small FIFO lane for stateful MCP mutations; a rejected task never poisons it. */
+export function createMcpMutationLane(): <T>(
+  work: () => Promise<T>,
+) => Promise<T> {
+  let tail: Promise<void> = Promise.resolve()
+  return <T>(work: () => Promise<T>): Promise<T> => {
+    const result = tail.then(work, work)
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }
+}
+
+function isProcessTransportConnection(
+  connection: MCPServerConnection,
+): boolean {
+  const type = connection.config.type
+  return (
+    type === undefined || type === 'stdio' || type === 'sse' || type === 'http'
+  )
+}
+
+/**
+ * Moves startup process-transport MCP ownership into DynamicMcpState.
+ *
+ * Direct TUI connects configured servers before the headless query loop starts.
+ * Seeding reconciliation from that live snapshot lets the very first plugin diff
+ * observe removals instead of treating every surviving server as a fresh add.
+ * The returned remainder keeps non-process transports and non-MCP tools with
+ * their existing owner.
+ */
+export function partitionStartupProcessMcpState(
+  clients: MCPServerConnection[],
+  tools: Tools,
+  retainedProcessOwnerNames: ReadonlySet<string> = new Set(),
+): StartupProcessMcpPartition {
+  const processClients: MCPServerConnection[] = []
+  const remainingClients: MCPServerConnection[] = []
+  const configs: Record<string, ScopedMcpServerConfig> = {}
+
+  for (const client of clients) {
+    if (
+      isProcessTransportConnection(client) &&
+      !retainedProcessOwnerNames.has(client.name)
+    ) {
+      processClients.push(client)
+      configs[client.name] = client.config
+    } else {
+      remainingClients.push(client)
+    }
+  }
+
+  const processPrefixes = processClients.map(client => getMcpPrefix(client.name))
+  const processTools: Tools[number][] = []
+  const remainingTools: Tools[number][] = []
+  for (const tool of tools) {
+    if (processPrefixes.some(prefix => tool.name?.startsWith(prefix))) {
+      processTools.push(tool)
+    } else {
+      remainingTools.push(tool)
+    }
+  }
+
+  return {
+    dynamicState: {
+      clients: processClients,
+      tools: processTools,
+      configs,
+    },
+    remainingClients,
+    remainingTools,
+  }
 }
 
 /**
@@ -53,11 +176,18 @@ export type McpSetServersResult = {
  */
 export function toScopedConfig(
   config: McpServerConfigForProcessTransport,
+  preserveDesiredScope = false,
 ): ScopedMcpServerConfig {
   // McpServerConfigForProcessTransport is a subset of McpServerConfig
   // (it excludes IDE-specific types like sse-ide and ws-ide)
   // Adding scope makes it a valid ScopedMcpServerConfig
-  return { ...config, scope: 'dynamic' } as ScopedMcpServerConfig
+  const suppliedScope = preserveDesiredScope
+    ? (config as { scope?: ScopedMcpServerConfig['scope'] }).scope
+    : undefined
+  return {
+    ...config,
+    scope: suppliedScope ?? 'dynamic',
+  } as ScopedMcpServerConfig
 }
 
 /**
@@ -74,6 +204,7 @@ export async function handleMcpSetServers(
   sdkState: SdkMcpState,
   dynamicState: DynamicMcpState,
   setAppState: (f: (prev: AppState) => AppState) => void,
+  options: ReconcileMcpServersOptions = {},
 ): Promise<McpSetServersResult> {
   // Enforce enterprise MCP policy on process-based servers (stdio/http/sse).
   // Mirrors the --mcp-config filter in main.tsx — both user-controlled injection
@@ -144,6 +275,7 @@ export async function handleMcpSetServers(
     processServers,
     dynamicState,
     setAppState,
+    options,
   )
 
   return {
@@ -170,6 +302,7 @@ export async function reconcileMcpServers(
   desiredConfigs: Record<string, McpServerConfigForProcessTransport>,
   currentState: DynamicMcpState,
   setAppState: (f: (prev: AppState) => AppState) => void,
+  options: ReconcileMcpServersOptions = {},
 ): Promise<{
   response: SDKControlMcpSetServersResponse
   newState: DynamicMcpState
@@ -186,35 +319,43 @@ export async function reconcileMcpServers(
     const currentConfig = currentState.configs[name]
     const desiredConfigRaw = desiredConfigs[name]
     if (!currentConfig || !desiredConfigRaw) return true
-    const desiredConfig = toScopedConfig(desiredConfigRaw)
-    return !areMcpConfigsEqual(currentConfig, desiredConfig)
+    const desiredConfig = toScopedConfig(
+      desiredConfigRaw,
+      options.preserveDesiredScopes,
+    )
+    return (
+      !areMcpConfigsEqual(currentConfig, desiredConfig) ||
+      (options.preserveDesiredScopes === true &&
+        currentConfig.scope !== desiredConfig.scope)
+    )
   })
 
   const removed: string[] = []
   const added: string[] = []
   const errors: Record<string, string> = {}
+  const dependencies = {
+    ...defaultDependencies,
+    ...options.dependencies,
+  }
 
   let newClients = [...currentState.clients]
   let newTools = [...currentState.tools]
+  const refreshedPromptCommands: Command[] = []
 
   // Remove old servers (including ones being replaced)
   for (const name of [...toRemove, ...toReplace]) {
-    const client = newClients.find(c => c.name === name)
     const config = currentState.configs[name]
-    if (client && config) {
-      if (client.type === 'connected') {
-        try {
-          await client.cleanup()
-        } catch (e) {
-          logError(e)
-        }
-      }
-      // Clear the memoization cache
-      await clearServerCache(name, config)
+    if (config) {
+      // This is the sole teardown owner. Unlike clearServerCache, eviction
+      // never creates a connection on a cache miss, and it cleans an existing
+      // cached client at most once before invalidating all derived caches.
+      await dependencies.evictExistingServerCache(name, config)
     }
 
     // Remove tools from this server
-    const prefix = `mcp__${name}__`
+    const prefix = options.strictWireNamespaceCleanup
+      ? getMcpPrefix(name)
+      : `mcp__${name}__`
     newTools = newTools.filter(t => !t.name.startsWith(prefix))
 
     // Remove from clients list
@@ -230,7 +371,7 @@ export async function reconcileMcpServers(
   for (const name of [...toAdd, ...toReplace]) {
     const config = desiredConfigs[name]
     if (!config) continue
-    const scopedConfig = toScopedConfig(config)
+    const scopedConfig = toScopedConfig(config, options.preserveDesiredScopes)
 
     // SDK servers are managed by the SDK process, not the CLI.
     // Just track them without trying to connect.
@@ -240,12 +381,18 @@ export async function reconcileMcpServers(
     }
 
     try {
-      const client = await connectToServer(name, scopedConfig)
+      const client = await dependencies.connectToServer(name, scopedConfig)
       newClients.push(client)
 
       if (client.type === 'connected') {
-        const serverTools = await fetchToolsForClient(client)
+        const [serverTools, serverCommands] = await Promise.all([
+          dependencies.fetchToolsForClient(client),
+          options.syncPromptCommands
+            ? dependencies.fetchCommandsForClient(client)
+            : Promise.resolve([]),
+        ])
         newTools.push(...serverTools)
+        refreshedPromptCommands.push(...serverCommands)
       } else if (client.type === 'failed') {
         errors[name] = client.error || 'Connection failed'
       }
@@ -263,7 +410,11 @@ export async function reconcileMcpServers(
   for (const name of desiredNames) {
     const config = desiredConfigs[name]
     if (config) {
-      newConfigs[name] = toScopedConfig(config)
+      const currentConfig = currentState.configs[name]
+      newConfigs[name] =
+        currentConfig && !toReplace.includes(name)
+          ? currentConfig
+          : toScopedConfig(config, options.preserveDesiredScopes)
     }
   }
 
@@ -273,7 +424,8 @@ export async function reconcileMcpServers(
     configs: newConfigs,
   }
 
-  // Update AppState with the new tools
+  // Update AppState once so clients, tools, and (for the opted-in direct route)
+  // prompt commands describe the same completed reconciliation.
   setAppState(prev => {
     // Get all dynamic server names (current + new)
     const allDynamicServerNames = new Set([
@@ -284,7 +436,10 @@ export async function reconcileMcpServers(
     // Remove old dynamic tools
     const nonDynamicTools = prev.mcp.tools.filter(t => {
       for (const serverName of allDynamicServerNames) {
-        if (t.name.startsWith(`mcp__${serverName}__`)) {
+        const prefix = options.strictWireNamespaceCleanup
+          ? getMcpPrefix(serverName)
+          : `mcp__${serverName}__`
+        if (t.name.startsWith(prefix)) {
           return false
         }
       }
@@ -296,12 +451,48 @@ export async function reconcileMcpServers(
       return !allDynamicServerNames.has(c.name)
     })
 
+    const affectedPromptServerNames = new Set([
+      ...toRemove,
+      ...toAdd,
+      ...toReplace,
+    ])
+    let resources = prev.mcp.resources
+    if (options.syncResourceCleanup && affectedPromptServerNames.size > 0) {
+      resources = { ...prev.mcp.resources }
+      // Reconciliation does not fetch resources. Remove only the affected
+      // owner's stale snapshots; unrelated/fixed owners retain their entries.
+      for (const serverName of affectedPromptServerNames) {
+        delete resources[serverName]
+      }
+    }
+    const commands =
+      options.syncPromptCommands && affectedPromptServerNames.size > 0
+        ? [
+            ...prev.mcp.commands.filter(command => {
+              for (const serverName of affectedPromptServerNames) {
+                if (
+                  (command.isMcp === true ||
+                    (command.type === 'prompt' &&
+                      command.loadedFrom === 'mcp')) &&
+                  commandBelongsToServer(command, serverName)
+                ) {
+                  return false
+                }
+              }
+              return true
+            }),
+            ...refreshedPromptCommands,
+          ]
+        : prev.mcp.commands
+
     return {
       ...prev,
       mcp: {
         ...prev.mcp,
         tools: [...nonDynamicTools, ...newTools],
         clients: [...nonDynamicClients, ...newClients],
+        commands,
+        resources,
       },
     }
   })

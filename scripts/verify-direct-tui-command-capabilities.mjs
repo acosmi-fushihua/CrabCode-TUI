@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { isAbsolute, relative, resolve, sep } from 'node:path'
 
 const root = resolve(import.meta.dir, '..')
 const contractPath = resolve(
@@ -201,13 +201,53 @@ if (
 }
 
 function verifyAvailableReferenceRepository() {
-  const referenceRepository = resolve(root, contract.reference.repository)
+  const requireLiveReference =
+    process.env.CRABCODE_COMMAND_REFERENCE_REQUIRED === '1'
+  const testReferenceRepository =
+    process.env.NODE_ENV === 'test'
+      ? process.env.CRABCODE_COMMAND_REFERENCE_TEST_REPOSITORY
+      : undefined
+  // Production callers cannot redirect trust to an arbitrary repository;
+  // the override only lets hermetic tests exercise optional/required modes.
+  const referenceRepository = testReferenceRepository
+    ? resolve(testReferenceRepository)
+    : resolve(root, contract.reference.repository)
   if (!existsSync(referenceRepository)) {
-    if (process.env.CRABCODE_COMMAND_REFERENCE_REQUIRED === '1') {
+    if (requireLiveReference) {
       fail(`required reference repository is absent: ${referenceRepository}`)
     }
     return 'snapshot_only'
   }
+
+  const [sourcePath, exportName] = contract.reference.source.split('::')
+  if (!sourcePath || !exportName) {
+    fail('reference.source must use path::exportName syntax')
+  }
+
+  // The reference repository is optional for ordinary local/package checks.
+  // When it happens to contain the pinned object, validate the immutable Git
+  // blob instead of coupling this repository to the neighbour's current HEAD
+  // or dirty worktree. Dynamic execution remains an explicit live-audit mode.
+  const pinnedSource = spawnSync(
+    'git',
+    ['show', `${contract.reference.revision}:${sourcePath}`],
+    {
+      cwd: referenceRepository,
+      encoding: 'utf8',
+    },
+  )
+  if (pinnedSource.status !== 0) {
+    if (requireLiveReference) {
+      fail(
+        `required pinned reference source is unavailable: ${pinnedSource.stderr.trim()}`,
+      )
+    }
+    return 'snapshot_only'
+  }
+  if (sha256(pinnedSource.stdout) !== contract.reference.sourceSha256) {
+    fail('reference command source hash drifted at the pinned revision')
+  }
+  if (!requireLiveReference) return 'snapshot_only'
 
   const revision = spawnSync('git', ['rev-parse', 'HEAD'], {
     cwd: referenceRepository,
@@ -222,10 +262,17 @@ function verifyAvailableReferenceRepository() {
     )
   }
 
-  const [sourcePath, exportName] = contract.reference.source.split('::')
-  if (!sourcePath || !exportName) {
-    fail('reference.source must use path::exportName syntax')
+  const worktreeStatus = spawnSync('git', ['status', '--porcelain'], {
+    cwd: referenceRepository,
+    encoding: 'utf8',
+  })
+  if (worktreeStatus.status !== 0) {
+    fail(`could not inspect reference worktree: ${worktreeStatus.stderr.trim()}`)
   }
+  if (worktreeStatus.stdout.trim() !== '') {
+    fail('required reference repository has worktree changes')
+  }
+
   const absoluteSourcePath = resolve(referenceRepository, sourcePath)
   if (!existsSync(absoluteSourcePath)) {
     fail(`reference source is absent: ${absoluteSourcePath}`)
@@ -319,7 +366,7 @@ const expectedLifecycleScope = {
   externalAuthorityBoundary:
     'Network services, operating-system integrations, and command-specific business mutations behind an admitted handler are separate authorities; this audit neither invokes them nor labels their internal effects as renderer success.',
   hermeticRuntimeSeam:
-    'The runtime-general matrix binds every real production command object and execution kind to the production slash dispatcher, then injects success, failure, and cancellation at the admitted handler boundary and reloads the resulting physical transcript.',
+    'Production smoke loads every real command and executes each actual handler with mocks only at external authority seams. The separate runtime matrix verifies the shared slash-dispatch, terminal projection, renderer-input, and physical transcript machinery without pretending its injected handler is command-specific business evidence.',
 }
 assertExactKeys(
   'lifecycleAudit.scope',
@@ -335,23 +382,29 @@ if (evidence === null || typeof evidence !== 'object' || Array.isArray(evidence)
   fail('lifecycleAudit.evidence must be an object')
 }
 for (const [id, item] of Object.entries(evidence)) {
-  assertExactKeys(`lifecycle evidence ${id}`, item, [
-    'kind',
-    'path',
-    'markers',
-  ])
+  assertExactKeys(
+    `lifecycle evidence ${id}`,
+    item,
+    item.kind === 'bun_test'
+      ? ['kind', 'path', 'markers', 'testNames']
+      : ['kind', 'path', 'markers'],
+  )
   if (!['rust_test', 'bun_test'].includes(item.kind)) {
     fail(`lifecycle evidence ${id} has unsupported kind`)
   }
-  if (
-    typeof item.path !== 'string' ||
-    item.path.length === 0 ||
-    resolve(root, item.path) === root ||
-    !resolve(root, item.path).startsWith(`${root}/`)
-  ) {
+  if (typeof item.path !== 'string' || item.path.length === 0) {
     fail(`lifecycle evidence ${id} has an unsafe path`)
   }
   const evidencePath = resolve(root, item.path)
+  const relativeEvidencePath = relative(root, evidencePath)
+  if (
+    relativeEvidencePath === '' ||
+    relativeEvidencePath === '..' ||
+    relativeEvidencePath.startsWith(`..${sep}`) ||
+    isAbsolute(relativeEvidencePath)
+  ) {
+    fail(`lifecycle evidence ${id} has an unsafe path`)
+  }
   if (!existsSync(evidencePath)) {
     fail(`lifecycle evidence ${id} is absent: ${item.path}`)
   }
@@ -366,6 +419,20 @@ for (const [id, item] of Object.entries(evidence)) {
   for (const marker of item.markers) {
     if (!body.includes(marker)) {
       fail(`lifecycle evidence ${id} lost marker ${JSON.stringify(marker)}`)
+    }
+  }
+  if (item.kind === 'bun_test') {
+    if (
+      !Array.isArray(item.testNames) ||
+      item.testNames.length === 0 ||
+      item.testNames.some(
+        testName => typeof testName !== 'string' || testName.length < 8,
+      ) ||
+      new Set(item.testNames).size !== item.testNames.length
+    ) {
+      fail(
+        `lifecycle evidence ${id} must declare unique executable Bun testNames`,
+      )
     }
   }
 }
@@ -497,6 +564,15 @@ for (const [profileIndex, profile] of audit.profiles.entries()) {
   }
 }
 
+const unusedEvidenceIds = Object.keys(evidence)
+  .filter(id => !requiredEvidenceIds.has(id))
+  .sort()
+if (unusedEvidenceIds.length > 0) {
+  fail(
+    `lifecycle evidence is not referenced by verified coverage: ${unusedEvidenceIds.join(', ')}`,
+  )
+}
+
 assertSameSet('lifecycle known-token partition', [...tokenProfiles.keys()], allKnown)
 assertSameSet('lifecycle renderer owner partition', ownerTokens.rendererLocal, rendererKnown)
 assertSameSet('lifecycle runtime owner partition', ownerTokens.runtimeCatalog, runtimeKnown)
@@ -591,13 +667,14 @@ function executeLifecycleEvidence() {
     .sort()
     .map(id => ({ id, ...evidence[id] }))
   const rustItems = requiredItems.filter(item => item.kind === 'rust_test')
-  const bunPaths = [
-    ...new Set(
-      requiredItems
-        .filter(item => item.kind === 'bun_test')
-        .map(item => item.path),
-    ),
-  ].sort()
+  const bunItems = requiredItems.filter(item => item.kind === 'bun_test')
+  const bunTestsByPath = new Map()
+  for (const item of bunItems) {
+    const names = bunTestsByPath.get(item.path) ?? new Set()
+    for (const testName of item.testNames) names.add(testName)
+    bunTestsByPath.set(item.path, names)
+  }
+  const bunPaths = [...bunTestsByPath.keys()].sort()
   const evidenceEnvironment = {
     ...process.env,
     NODE_ENV: 'test',
@@ -607,11 +684,15 @@ function executeLifecycleEvidence() {
   }
 
   if (rustItems.length > 0) {
+    const tuiAppRustPath = 'crates/crabcode-tui/src/tui_app.rs'
+    const terminalRustPath = 'crates/crabcode-tui/src/terminal.rs'
     const unsupportedRustPaths = [
       ...new Set(
         rustItems
           .map(item => item.path)
-          .filter(path => path !== 'crates/crabcode-tui/src/tui_app.rs'),
+          .filter(
+            path => path !== tuiAppRustPath && path !== terminalRustPath,
+          ),
       ),
     ]
     if (unsupportedRustPaths.length > 0) {
@@ -621,7 +702,7 @@ function executeLifecycleEvidence() {
     }
     const aggregateName =
       'direct_tui_command_lifecycle_executable_evidence_suite'
-    const aggregatePath = resolve(root, rustItems[0].path)
+    const aggregatePath = resolve(root, tuiAppRustPath)
     const aggregateSource = readFileSync(aggregatePath, 'utf8')
     const aggregateDeclaration = `fn ${aggregateName}() {`
     const aggregateOffset = aggregateSource.indexOf(aggregateDeclaration)
@@ -632,12 +713,14 @@ function executeLifecycleEvidence() {
       aggregateOffset + aggregateDeclaration.length,
     )
     const referencedRustFunctions = new Set(
-      rustItems.flatMap(item =>
-        item.markers.flatMap(marker => {
-          const match = /^fn ([a-zA-Z_][a-zA-Z0-9_]*)\(\)$/.exec(marker)
-          return match && match[1] !== aggregateName ? [match[1]] : []
-        }),
-      ),
+      rustItems
+        .filter(item => item.path === tuiAppRustPath)
+        .flatMap(item =>
+          item.markers.flatMap(marker => {
+            const match = /^fn ([a-zA-Z_][a-zA-Z0-9_]*)\(\)$/.exec(marker)
+            return match && match[1] !== aggregateName ? [match[1]] : []
+          }),
+        ),
     )
     if (process.argv.includes('--test-inject-missing-rust-member')) {
       const injected = [...referencedRustFunctions].sort()[0]
@@ -656,6 +739,11 @@ function executeLifecycleEvidence() {
         )
       }
     }
+    const exactAggregateTestName = process.argv.includes(
+      '--test-inject-missing-rust-aggregate-test',
+    )
+      ? `tui_app::tests::${aggregateName}_missing`
+      : `tui_app::tests::${aggregateName}`
     const rustResult = spawnSync(
       'cargo',
       [
@@ -663,8 +751,10 @@ function executeLifecycleEvidence() {
         '--locked',
         '-p',
         'crabcode-tui',
-        'direct_tui_command_lifecycle_executable_evidence_suite',
+        exactAggregateTestName,
         '--lib',
+        '--',
+        '--exact',
       ],
       {
         cwd: resolve(root, 'crates'),
@@ -677,12 +767,73 @@ function executeLifecycleEvidence() {
         `Rust lifecycle evidence failed:\n${rustResult.stdout}${rustResult.stderr}`,
       )
     }
+    if (
+      !rustResult.stdout.includes(`test ${exactAggregateTestName} ... ok`) ||
+      !/test result: ok\. 1 passed; 0 failed; 0 ignored;/.test(
+        rustResult.stdout,
+      )
+    ) {
+      fail(
+        `Rust lifecycle aggregate ${aggregateName} did not execute exactly once:\n${rustResult.stdout}${rustResult.stderr}`,
+      )
+    }
+
+    const terminalRustFunctions = new Set(
+      rustItems
+        .filter(item => item.path === terminalRustPath)
+        .flatMap(item =>
+          item.markers.flatMap(marker => {
+            const match = /^fn ([a-zA-Z_][a-zA-Z0-9_]*)\(\)$/.exec(marker)
+            return match ? [match[1]] : []
+          }),
+        ),
+    )
+    for (const functionName of [...terminalRustFunctions].sort()) {
+      const exactTestName = process.argv.includes(
+        '--test-inject-missing-terminal-test',
+      )
+        ? `terminal::tests::${functionName}_missing`
+        : `terminal::tests::${functionName}`
+      const terminalResult = spawnSync(
+        'cargo',
+        [
+          'test',
+          '--locked',
+          '-p',
+          'crabcode-tui',
+          exactTestName,
+          '--lib',
+          '--',
+          '--exact',
+        ],
+        {
+          cwd: resolve(root, 'crates'),
+          encoding: 'utf8',
+          env: evidenceEnvironment,
+        },
+      )
+      if (terminalResult.status !== 0) {
+        fail(
+          `Rust terminal lifecycle evidence ${functionName} failed:\n${terminalResult.stdout}${terminalResult.stderr}`,
+        )
+      }
+      if (
+        !terminalResult.stdout.includes(`test ${exactTestName} ... ok`) ||
+        !/test result: ok\. 1 passed; 0 failed; 0 ignored;/.test(
+          terminalResult.stdout,
+        )
+      ) {
+        fail(
+          `Rust terminal lifecycle evidence ${functionName} did not execute exactly once:\n${terminalResult.stdout}${terminalResult.stderr}`,
+        )
+      }
+    }
   }
 
   // Run files serially. Several fixtures launch a real QueryEngine or Rust
   // linker; serial evidence keeps their command deadlines meaningful instead
   // of turning host CPU contention into a false lifecycle failure.
-  for (const path of bunPaths) {
+  for (const [pathIndex, path] of bunPaths.entries()) {
     const bunResult = spawnSync(process.execPath, ['test', path], {
       cwd: root,
       encoding: 'utf8',
@@ -692,6 +843,42 @@ function executeLifecycleEvidence() {
       fail(
         `Bun lifecycle evidence failed for ${path}:\n${bunResult.stdout}${bunResult.stderr}`,
       )
+    }
+    const expectedTests = new Set(bunTestsByPath.get(path))
+    if (
+      pathIndex === 0 &&
+      process.argv.includes('--test-inject-missing-bun-test')
+    ) {
+      expectedTests.add('__missing_bun_lifecycle_evidence_test__')
+    }
+    const passedTests = new Map()
+    const skippedTests = new Set()
+    for (const line of `${bunResult.stdout}\n${bunResult.stderr}`.split(/\r?\n/u)) {
+      const passed = /^\(pass\) (.*?)(?: \[[^\]]+\])?$/.exec(line)
+      if (passed) {
+        passedTests.set(passed[1], (passedTests.get(passed[1]) ?? 0) + 1)
+        continue
+      }
+      const skipped = /^\((?:skip|todo)\) (.*)$/.exec(line)
+      if (skipped) skippedTests.add(skipped[1])
+    }
+    if (
+      pathIndex === 0 &&
+      process.argv.includes('--test-inject-skipped-bun-result')
+    ) {
+      const injected = [...expectedTests][0]
+      if (injected) {
+        passedTests.delete(injected)
+        skippedTests.add(injected)
+      }
+    }
+    for (const testName of [...expectedTests].sort()) {
+      const passCount = passedTests.get(testName) ?? 0
+      if (passCount !== 1 || skippedTests.has(testName)) {
+        fail(
+          `Bun lifecycle evidence ${JSON.stringify(testName)} in ${path} did not execute exactly once as a passing test; passes=${passCount} skipped=${skippedTests.has(testName)}`,
+        )
+      }
     }
   }
 }

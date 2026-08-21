@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
 const FIXTURE = join(
@@ -22,6 +23,8 @@ async function runScenario(
   scenario: Evidence['outcome'],
 ): Promise<Evidence> {
   const configDir = join(root, scenario)
+  const outputPath = join(configDir, 'evidence.json')
+  const errorPath = join(configDir, 'fixture.stderr')
   await mkdir(configDir, { recursive: true })
   await Promise.all([
     writeFile(
@@ -45,16 +48,13 @@ async function runScenario(
       CRABCODE_FEATURE_COORDINATOR_MODE: '0',
       DISABLE_BACKGROUND_TASKS: '1',
     },
-    stdout: 'pipe',
-    stderr: 'pipe',
+    stdout: Bun.file(outputPath),
+    stderr: Bun.file(errorPath),
   })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
+  const exitCode = await child.exited
+  const stderr = await Bun.file(errorPath).text()
   expect(exitCode, stderr).toBe(0)
-  return JSON.parse(stdout.trim().split('\n').at(-1) ?? '') as Evidence
+  return readLastJsonEvidence<Evidence>(outputPath)
 }
 
 describe('/compact session-memory progress', () => {

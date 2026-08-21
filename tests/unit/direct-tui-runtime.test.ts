@@ -26,6 +26,75 @@ afterEach(() => {
 })
 
 describe('dedicated native TUI runtime boundary', () => {
+  test('--disable-slash-commands reaches the persistent direct-route policy', () => {
+    expect(
+      parseTuiRuntimeOptions([
+        'bun',
+        '/release/dist/tui-runtime/index.js',
+        '--disable-slash-commands',
+      ]).disableSlashCommands,
+    ).toBe(true)
+
+    const bootstrap = source('src/cli/tuiRuntimeBootstrap.ts')
+    const core = source('src/cli/print/queryExecutionCore.ts')
+    expect(bootstrap).toContain(
+      'disableSlashCommands: options.disableSlashCommands,',
+    )
+    expect(bootstrap).toContain('subscribeAppState: store.subscribe,')
+    expect(core).toContain(
+      'const slashCommandsEnabled = options.disableSlashCommands !== true',
+    )
+    expect(core).toContain(
+      'commandLoader: commandLoaderForRoute(\n      slashCommandsEnabled,\n      getDirectTuiCommands,',
+    )
+    expect(core).toContain('slashCommandsEnabled: true')
+    expect(core).toContain('options.subscribeAppState?.(() => {')
+  })
+
+  test('separates direct MCP desired-set owners without changing standard routing', () => {
+    const core = source('src/cli/print/queryExecutionCore.ts')
+
+    expect(core).toContain(
+      'const separateProcessMcpOwners = routePolicy.directQueryEventDelivery',
+    )
+    expect(core).toContain(
+      'const startupProcessMcp = routePolicy.directQueryEventDelivery',
+    )
+    expect(core).toContain(
+      "await applyMcpServerChanges(\n          'plugin',\n          supportedConfigs,",
+    )
+    expect(core).toContain(
+      "await applyMcpServerChanges(\n              'public',\n              message.request.servers,",
+    )
+    expect(core).toContain(
+      "const effectiveOwner = separateProcessMcpOwners ? owner : 'public'",
+    )
+    expect(core).toContain('const serializeMcpMutation = createMcpMutationLane()')
+    expect(core).toContain(
+      'preservePublicProcessDesiredAcrossSdkRejections(',
+    )
+    expect(core).toContain('if (commitPublicDesired) {')
+    expect(core).toContain('publicProcessMcpDesired = structuredClone(')
+  })
+
+  test('rejects management-only SDK inventory before direct toggle persistence', () => {
+    const core = source('src/cli/print/queryExecutionCore.ts')
+    const toggle = core.slice(
+      core.indexOf('async function toggleDirectMcpServer('),
+      core.indexOf('// Build McpServerStatus[]'),
+    )
+    const inventory = toggle.indexOf('const inventoryRecord =')
+    const sdkGuard = toggle.indexOf(
+      'if (isDirectTuiSdkMcpInventoryRecord(inventoryRecord))',
+      inventory,
+    )
+    const persistence = toggle.indexOf('await setMcpServerEnabled(', sdkGuard)
+
+    expect(inventory).toBeGreaterThanOrEqual(0)
+    expect(sdkGuard).toBeGreaterThan(inventory)
+    expect(persistence).toBeGreaterThan(sdkGuard)
+  })
+
   test('the entry is the capability and contains no mode marker or foreign-surface vocabulary', () => {
     const entry = source('src/entrypoints/tuiRuntime.ts')
 
@@ -386,8 +455,12 @@ describe('dedicated native TUI runtime boundary', () => {
     expect(bootstrap).toContain("mode: 'plan' as const")
     expect(bootstrap).toContain('resolveIdeAutoConnectMcpConfig(options.ide)')
     expect(bootstrap).toContain(
+      'lateFixedMcpConfig: ideMcpConfigPromise.then',
+    )
+    expect(bootstrap).not.toContain(
       "connectMcpConfigs(store, { ide: config }, 'IDE')",
     )
+    expect(core).toContain('admitLateFixedMcpConfig(candidate)')
     expect(core).toContain('processOwnedAccountBridge: true')
     expect(core).toContain('withDirectTuiPermissionBridge(args[7])')
     expect(core).not.toContain('sessionControl')

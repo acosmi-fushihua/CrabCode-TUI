@@ -17,6 +17,7 @@ const headlessRuntime: SlashCommandRuntime = {
   isBuiltInCommandName: isHeadlessBuiltInCommandName,
   isSubscriberGatedCommandName:
     isHeadlessSubscriberGatedCommandName,
+  failClosedUnknownMcp: context => context.failClosedUnknownMcp === true,
 }
 
 export async function processSlashCommand(
