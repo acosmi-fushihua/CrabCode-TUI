@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, setDefaultTimeout, test } from 'bun:test'
 import {
   mkdirSync,
   mkdtempSync,
@@ -12,6 +12,10 @@ import { join } from 'node:path'
 import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
+// Capability verify and CI run this file as one lifecycle evidence suite.
+// Insights alone serializes four fixture subprocesses; Bun's 5s default
+// is enough locally but not under a contended runner.
+setDefaultTimeout(20_000)
 const FIXTURE = join(
   REPO_ROOT,
   'tests/fixtures/direct-tui-runtime-command-production-smoke.ts',
