@@ -194,43 +194,32 @@ fn count_sdk_watcher(watchers: &mut Watchers, task_type: Option<&str>) {
 /// Known product commands whose interaction lifecycle is intentionally absent
 /// from the public pure-TUI runtime. Keeping this closed token set prevents an
 /// unsupported local command from being forwarded to the model or backend.
+/// Runtime-catalog tokens that are merely gated (not unported) live in
+/// `GATED_RUNTIME_COMMAND_TOKENS` instead.
 const UNAVAILABLE_LOCAL_COMMAND_TOKENS: &[&str] = &[
     "add-dir",
-    "advisor",
     "agents",
     "branch",
     "fork",
     "chrome",
-    "clear",
-    "reset",
-    "new",
-    "compact",
-    "com",
     "config",
     "settings",
     "copy",
     "desktop",
     "app",
-    "cost",
     "diff",
     "doctor",
     "effort",
     "fast",
-    "files",
-    "heapdump",
     "ide",
     "keybindings",
     "install-github-app",
-    "install-slack-app",
     "update",
     "memory",
     "mobile",
     "ios",
     "android",
-    "smallmodel",
-    "output-style",
     "remote-env",
-    "release-notes",
     "resume",
     "continue",
     "session",
@@ -243,9 +232,7 @@ const UNAVAILABLE_LOCAL_COMMAND_TOKENS: &[&str] = &[
     "ultrareview",
     "rewind",
     "checkpoint",
-    "terminal-setup",
     "upgrade",
-    "extra-usage",
     "rate-limit-options",
     "vim",
     "proactive",
@@ -264,27 +251,95 @@ const UNAVAILABLE_LOCAL_COMMAND_TOKENS: &[&str] = &[
     "tasks",
     "bashes",
     "bridge-kick",
-    "version",
     "ultraplan",
     "office",
     "rc",
     "remote-control",
     "remote-status",
-    // These built-ins are healthy only when the authoritative runtime
-    // advertises them. Keep the renderer's known-command guard closed when a
-    // feature/auth/build gate removes them from the current catalog; normal
-    // runtime first-wins dispatch remains unchanged when they are present.
-    "compact-history",
-    "init",
-    "insights",
-    "local-models",
-    "pr-comments",
-    "proxy",
-    "review",
-    "security-review",
-    "statusline",
-    "vision",
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RuntimeGateReason {
+    Build,
+    Account,
+    Environment,
+    Session,
+}
+
+/// Strictly equal to the contract runtime catalog (including aliases) ∪ {version}.
+/// Copy is shown only when the token is absent from the advertised catalog.
+const GATED_RUNTIME_COMMAND_TOKENS: &[(&str, RuntimeGateReason)] = &[
+    ("advisor", RuntimeGateReason::Account),
+    ("extra-usage", RuntimeGateReason::Account),
+    ("install-slack-app", RuntimeGateReason::Account),
+    ("files", RuntimeGateReason::Build),
+    ("version", RuntimeGateReason::Build),
+    ("terminal-setup", RuntimeGateReason::Environment),
+    ("clear", RuntimeGateReason::Session),
+    ("reset", RuntimeGateReason::Session),
+    ("new", RuntimeGateReason::Session),
+    ("compact", RuntimeGateReason::Session),
+    ("com", RuntimeGateReason::Session),
+    ("compact-history", RuntimeGateReason::Session),
+    ("cost", RuntimeGateReason::Session),
+    ("heapdump", RuntimeGateReason::Session),
+    ("init", RuntimeGateReason::Session),
+    ("insights", RuntimeGateReason::Session),
+    ("local-models", RuntimeGateReason::Session),
+    ("output-style", RuntimeGateReason::Session),
+    ("pr-comments", RuntimeGateReason::Session),
+    ("proxy", RuntimeGateReason::Session),
+    ("release-notes", RuntimeGateReason::Session),
+    ("review", RuntimeGateReason::Session),
+    ("security-review", RuntimeGateReason::Session),
+    ("smallmodel", RuntimeGateReason::Session),
+    ("statusline", RuntimeGateReason::Session),
+    ("vision", RuntimeGateReason::Session),
+];
+
+fn gated_runtime_command_reason(token: &str) -> Option<RuntimeGateReason> {
+    GATED_RUNTIME_COMMAND_TOKENS
+        .iter()
+        .find(|(name, _)| *name == token)
+        .map(|(_, reason)| *reason)
+}
+
+fn gated_runtime_fail_closed_status(
+    slash_name: &str,
+    reason: RuntimeGateReason,
+    language: UiLanguage,
+) -> String {
+    match (reason, language) {
+        (RuntimeGateReason::Build, UiLanguage::ZhCn) => {
+            format!("{slash_name} 仅特定构建提供，当前构建未启用；命令未发送")
+        }
+        (RuntimeGateReason::Build, UiLanguage::EnUs) => {
+            format!("{slash_name} is only available in specific builds; command was not sent")
+        }
+        (RuntimeGateReason::Account, UiLanguage::ZhCn) => {
+            format!("{slash_name} 未对当前账户、订阅或实验放行；命令未发送")
+        }
+        (RuntimeGateReason::Account, UiLanguage::EnUs) => {
+            format!(
+                "{slash_name} is not enabled for this account, subscription, or experiment; command was not sent"
+            )
+        }
+        (RuntimeGateReason::Environment, UiLanguage::ZhCn) => {
+            format!("{slash_name} 在当前终端环境不适用；命令未发送")
+        }
+        (RuntimeGateReason::Environment, UiLanguage::EnUs) => {
+            format!(
+                "{slash_name} does not apply to this terminal environment; command was not sent"
+            )
+        }
+        (RuntimeGateReason::Session, UiLanguage::ZhCn) => {
+            format!("{slash_name} 在当前会话未启用；命令未发送")
+        }
+        (RuntimeGateReason::Session, UiLanguage::EnUs) => {
+            format!("{slash_name} is not enabled in this session; command was not sent")
+        }
+    }
+}
 
 struct KnownUnavailableLocalCommands;
 
@@ -9093,14 +9148,25 @@ impl TuiApp {
                     purpose: OutboundPurpose::SideQuestion { question },
                 }])
             }
-            _ if KNOWN_UNAVAILABLE_LOCAL_COMMANDS.contains(&name)
-                && !self.runtime_catalog_contains(name) =>
-            {
-                self.status = KNOWN_UNAVAILABLE_LOCAL_COMMANDS
-                    .fail_closed_status(name, self.renderer_ui_language);
-                Some(Vec::new())
+            _ => {
+                let token = name.strip_prefix('/').unwrap_or(name);
+                if !self.runtime_catalog_contains(name) {
+                    if let Some(reason) = gated_runtime_command_reason(token) {
+                        self.status = gated_runtime_fail_closed_status(
+                            name,
+                            reason,
+                            self.renderer_ui_language,
+                        );
+                        return Some(Vec::new());
+                    }
+                    if KNOWN_UNAVAILABLE_LOCAL_COMMANDS.contains(&name) {
+                        self.status = KNOWN_UNAVAILABLE_LOCAL_COMMANDS
+                            .fail_closed_status(name, self.renderer_ui_language);
+                        return Some(Vec::new());
+                    }
+                }
+                None
             }
-            _ => None,
         }
     }
 
@@ -27456,6 +27522,74 @@ mod tests {
     }
 
     #[test]
+    fn gated_runtime_tokens_fail_closed_with_reason_specific_copy() {
+        let cases = [
+            (
+                "/files",
+                "/files 仅特定构建提供，当前构建未启用；命令未发送",
+                "/files is only available in specific builds; command was not sent",
+            ),
+            (
+                "/advisor",
+                "/advisor 未对当前账户、订阅或实验放行；命令未发送",
+                "/advisor is not enabled for this account, subscription, or experiment; command was not sent",
+            ),
+            (
+                "/terminal-setup",
+                "/terminal-setup 在当前终端环境不适用；命令未发送",
+                "/terminal-setup does not apply to this terminal environment; command was not sent",
+            ),
+            (
+                "/compact",
+                "/compact 在当前会话未启用；命令未发送",
+                "/compact is not enabled in this session; command was not sent",
+            ),
+            (
+                "/voice",
+                "/voice 在纯 TUI 中不可用；命令未发送",
+                "/voice is unavailable in the pure TUI; command was not sent",
+            ),
+        ];
+        for (command, chinese, english) in cases {
+            let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+            let actions = app
+                .handle_local_command(command)
+                .unwrap_or_else(|| panic!("{command} must be stopped by the renderer"));
+            assert!(
+                actions.is_empty(),
+                "{command} must not acquire backend authority"
+            );
+            assert_eq!(app.status, chinese);
+            app.renderer_ui_language = UiLanguage::EnUs;
+            let actions = app
+                .handle_local_command(command)
+                .unwrap_or_else(|| panic!("{command} must be stopped by the renderer"));
+            assert!(
+                actions.is_empty(),
+                "{command} must not acquire backend authority"
+            );
+            assert_eq!(app.status, english);
+        }
+
+        let mut app = TuiApp::new(&json!({}), InitialSessionRequest::New, None);
+        for (token, _) in GATED_RUNTIME_COMMAND_TOKENS {
+            let command = format!("/{token}");
+            let actions = app
+                .handle_local_command(&command)
+                .unwrap_or_else(|| panic!("{command} must be stopped by the renderer"));
+            assert!(
+                actions.is_empty(),
+                "{command} must not acquire backend authority"
+            );
+            assert!(
+                app.status.contains("命令未发送"),
+                "{command}: {}",
+                app.status
+            );
+        }
+    }
+
+    #[test]
     fn localized_link_failure_chrome_preserves_target_and_reason() {
         let target = LinkTarget::File(Arc::from(Path::new("/tmp/证据/evidence.txt")));
         let reason = "OS-DYNAMIC-拒绝 / errno=13";
@@ -27543,30 +27677,54 @@ mod tests {
                 .all(|token| !UNAVAILABLE_LOCAL_COMMAND_TOKENS.contains(token)),
             "implemented and unavailable local command sets must be disjoint"
         );
+        assert!(
+            GATED_RUNTIME_COMMAND_TOKENS
+                .iter()
+                .all(|(token, _)| !UNAVAILABLE_LOCAL_COMMAND_TOKENS.contains(token)),
+            "gated runtime tokens must be disjoint from the unported set"
+        );
+        assert!(
+            completed_local
+                .iter()
+                .all(|token| { gated_runtime_command_reason(token).is_none() }),
+            "implemented local commands must not collide with gated runtime tokens"
+        );
         for boundary_token in [
             "chrome",
-            "compact-history",
             "desktop",
-            "init",
-            "insights",
-            "local-models",
             "mobile",
-            "pr-comments",
-            "proxy",
             "remote",
             "bridge-kick",
             "office",
             "rc",
             "remote-control",
             "remote-status",
-            "review",
-            "security-review",
-            "statusline",
-            "vision",
         ] {
             assert!(
                 UNAVAILABLE_LOCAL_COMMAND_TOKENS.contains(&boundary_token),
                 "non-TUI boundary token {boundary_token} must fail closed"
+            );
+        }
+        for gated_token in [
+            "compact-history",
+            "init",
+            "insights",
+            "local-models",
+            "pr-comments",
+            "proxy",
+            "review",
+            "security-review",
+            "statusline",
+            "vision",
+            "version",
+        ] {
+            assert!(
+                gated_runtime_command_reason(gated_token).is_some(),
+                "runtime-catalog boundary token {gated_token} must remain gated"
+            );
+            assert!(
+                !UNAVAILABLE_LOCAL_COMMAND_TOKENS.contains(&gated_token),
+                "gated runtime token {gated_token} must not remain in the unported set"
             );
         }
     }
@@ -31890,6 +32048,7 @@ mod tests {
         catalog_metadata_hides_discovery_without_revoking_typed_dispatch_and_partitions_help();
         help_lists_retained_local_command_surfaces();
         unavailable_local_tokens_fail_closed_without_changing_the_viewport();
+        gated_runtime_tokens_fail_closed_with_reason_specific_copy();
         disabled_slash_commands_hide_every_catalog_and_submit_literal_text();
 
         typed_quit_aliases_exit_immediately_without_keybinding_confirmation();

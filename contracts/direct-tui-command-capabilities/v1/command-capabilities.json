@@ -264,6 +264,16 @@
       "voice"
     ]
   },
+  "buildAnnex": {
+    "description": "默认公开构建之外可能额外广告的 token 及条件；不参与 104 分母",
+    "entries": [
+      { "token": "version", "condition": "USER_TYPE=ant && !IS_DEMO" },
+      { "token": "commit", "condition": "USER_TYPE=ant && !IS_DEMO" },
+      { "token": "commit-push-pr", "condition": "USER_TYPE=ant && !IS_DEMO" },
+      { "token": "init-verifiers", "condition": "USER_TYPE=ant && !IS_DEMO" },
+      { "token": "workflows", "condition": "feature(WORKFLOW_SCRIPTS)" }
+    ]
+  },
   "lifecycleAudit": {
     "schemaVersion": 1,
     "dimensions": [
@@ -409,8 +419,14 @@
         "path": "crates/crabcode-tui/src/tui_app.rs",
         "markers": [
           "fn unavailable_local_tokens_fail_closed_without_changing_the_viewport()",
+          "fn gated_runtime_tokens_fail_closed_with_reason_specific_copy()",
           "fn disabled_slash_commands_hide_every_catalog_and_submit_literal_text()",
-          "command was not sent"
+          "command was not sent",
+          "is only available in specific builds",
+          "is not enabled for this account, subscription, or experiment",
+          "does not apply to this terminal environment",
+          "is not enabled in this session",
+          "在纯 TUI 中不可用；命令未发送"
         ]
       },
       "rust.disable_slash_cli": {
@@ -569,7 +585,8 @@
           "executes real side-effect handlers with only external authorities mocked",
           "executes the real security-review builder across the shell authority seam",
           "keeps advisor AppState behind successful persistence and projects write failure as terminal error",
-          "executes insights production phases and honors pre-phase and inter-phase cancellation"
+          "executes insights production phases and honors pre-phase and inter-phase cancellation",
+          "counts slack app installs only after a successful browser open"
         ],
         "testNames": [
           "direct TUI runtime production command smoke > loads every audited production definition and its real lazy handler",
@@ -578,7 +595,8 @@
           "direct TUI runtime production command smoke > executes real side-effect handlers with only external authorities mocked",
           "direct TUI runtime production command smoke > executes the real security-review builder across the shell authority seam",
           "direct TUI runtime production command smoke > keeps advisor AppState behind successful persistence and projects write failure as terminal error",
-          "direct TUI runtime production command smoke > executes insights production phases and honors pre-phase and inter-phase cancellation"
+          "direct TUI runtime production command smoke > executes insights production phases and honors pre-phase and inter-phase cancellation",
+          "direct TUI runtime production command smoke > counts slack app installs only after a successful browser open"
         ]
       },
       "ts.command_terminal_gaps": {
@@ -607,6 +625,18 @@
         "testNames": [
           "slash-command control catalog projection > preserves hidden dispatch and builtin help metadata per invocation token",
           "slash-command control catalog projection > projects canonical names and aliases in backend first-wins order"
+        ]
+      },
+      "ts.catalog_build_annex": {
+        "kind": "bun_test",
+        "path": "tests/unit/direct-tui-command-catalog.test.ts",
+        "markers": [
+          "keeps feature and ant-build annex tokens out of the default denominator",
+          "DIRECT_TUI_PROACTIVE"
+        ],
+        "testNames": [
+          "direct TUI command catalog denominator > adds only reviewed direct-TUI renderer-neutral adapters",
+          "direct TUI command catalog denominator > keeps feature and ant-build annex tokens out of the default denominator"
         ]
       },
       "ts.catalog_refresh": {
@@ -1020,7 +1050,7 @@
           "discovery": { "status": "verified", "evidence": ["ts.catalog_projection", "ts.catalog_refresh", "rust.hidden_and_help"] },
           "parsingDispatch": { "status": "verified", "evidence": ["rust.catalog_dispatch", "rust.disable_slash_cli", "ts.slash_parser", "ts.runtime_general_lifecycle"] },
           "success": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.clear_terminal"], "note": "Every actual command handler is loaded and invoked; external network, OS, and storage authorities are replaced only at their boundary." },
-          "failure": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.clear_terminal"], "note": "Actual handler fallback or thrown persistence/authority failure is exercised, including advisor no-split-brain, init onboarding-config rejection, and smallmodel write rejection." },
+          "failure": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.clear_terminal"], "note": "Actual handler fallback or thrown persistence/authority failure is exercised, including advisor no-split-brain, init onboarding-config rejection, smallmodel write rejection, smallmodel validateModel rejection, and install-slack-app counting only after a successful browser open." },
           "cancellation": { "status": "not_applicable", "evidence": [], "note": "Each admitted operation is atomic at this command boundary and its underlying authority exposes no renderer-owned cancellation phase." },
           "terminalState": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle", "ts.clear_terminal"], "note": "Actual success and failure truth is combined with the shared production terminal projection, not inferred from a fake business handler." },
           "rendering": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle"], "note": "Actual bounded result text and the shared renderer-input mapping are both executable evidence." },
@@ -1129,8 +1159,8 @@
           "voice"
         ],
         "coverage": {
-          "ownership": { "status": "verified", "evidence": ["rust.command_inventory"] },
-          "discovery": { "status": "verified", "evidence": ["rust.fail_closed"] },
+          "ownership": { "status": "verified", "evidence": ["rust.command_inventory", "ts.catalog_build_annex"] },
+          "discovery": { "status": "verified", "evidence": ["rust.fail_closed", "ts.catalog_build_annex"] },
           "parsingDispatch": { "status": "verified", "evidence": ["rust.fail_closed", "ts.slash_parser"] },
           "success": { "status": "not_applicable", "evidence": [], "note": "Without an authoritative catalog entry this profile has no executable success path." },
           "failure": { "status": "verified", "evidence": ["rust.fail_closed"] },

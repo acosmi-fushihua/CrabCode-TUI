@@ -89,6 +89,47 @@ function rustFixedCompletionNames() {
 
 if (contract.schemaVersion !== 1) fail('unsupported schemaVersion')
 
+const buildAnnex = contract.buildAnnex
+if (
+  buildAnnex === null ||
+  typeof buildAnnex !== 'object' ||
+  Array.isArray(buildAnnex)
+) {
+  fail('buildAnnex must be an object')
+}
+assertExactKeys('buildAnnex', buildAnnex, ['description', 'entries'])
+if (
+  buildAnnex.description !==
+  '默认公开构建之外可能额外广告的 token 及条件；不参与 104 分母'
+) {
+  fail('buildAnnex.description drifted')
+}
+if (!Array.isArray(buildAnnex.entries) || buildAnnex.entries.length === 0) {
+  fail('buildAnnex.entries must be a non-empty array')
+}
+const buildAnnexTokens = []
+for (const [index, entry] of buildAnnex.entries.entries()) {
+  assertExactKeys(`buildAnnex.entries[${index}]`, entry, [
+    'token',
+    'condition',
+  ])
+  if (
+    typeof entry.token !== 'string' ||
+    entry.token.length === 0 ||
+    entry.token.startsWith('/') ||
+    /\s/u.test(entry.token)
+  ) {
+    fail(`buildAnnex.entries[${index}] has an invalid token`)
+  }
+  if (typeof entry.condition !== 'string' || entry.condition.length === 0) {
+    fail(`buildAnnex.entries[${index}] has an invalid condition`)
+  }
+  if (buildAnnexTokens.includes(entry.token)) {
+    fail(`buildAnnex.entries contains duplicate token ${entry.token}`)
+  }
+  buildAnnexTokens.push(entry.token)
+}
+
 const reference = sortedUnique(
   'reference.invocationTokens',
   contract.reference?.invocationTokens,
@@ -182,16 +223,55 @@ assertSameSet(
 // Every reference token not owned locally must be rejected locally whenever
 // the runtime does not advertise it. This prevents feature/auth/catalog drift
 // from degrading into a backend "unknown skill" send.
+const gatedRuntimeTokens = rustStringArray('GATED_RUNTIME_COMMAND_TOKENS')
+assertSameSet(
+  'Rust gated runtime command registry',
+  gatedRuntimeTokens,
+  [...runtimeCatalog, ...runtimeExtensions, 'version'],
+)
 assertSameSet(
   'Rust known-unavailable fallback registry',
   rustStringArray('UNAVAILABLE_LOCAL_COMMAND_TOKENS'),
+  [...failClosedOnly, ...failClosedExtensions].filter(
+    token => token !== 'version',
+  ),
+)
+
+assertSameSet(
+  'buildAnnex tokens',
+  buildAnnexTokens,
   [
-    ...runtimeCatalog,
-    ...runtimeExtensions,
-    ...failClosedOnly,
-    ...failClosedExtensions,
+    'version',
+    'commit',
+    'commit-push-pr',
+    'init-verifiers',
+    'workflows',
   ],
 )
+for (const token of buildAnnexTokens) {
+  if (rendererLocal.includes(token) || rendererExtensions.includes(token)) {
+    fail(`buildAnnex token ${token} collides with rendererLocal`)
+  }
+  if (runtimeCatalog.includes(token) || runtimeExtensions.includes(token)) {
+    fail(`buildAnnex token ${token} collides with runtimeCatalog`)
+  }
+}
+if (!failClosedExtensions.includes('version')) {
+  fail('version must remain fail-closed in the default public denominator')
+}
+for (const token of buildAnnexTokens) {
+  if (token === 'version') continue
+  if (
+    reference.includes(token) ||
+    rendererExtensions.includes(token) ||
+    runtimeExtensions.includes(token) ||
+    failClosedExtensions.includes(token)
+  ) {
+    fail(
+      `buildAnnex token ${token} must stay outside the 104-token denominator`,
+    )
+  }
+}
 
 if (
   sha256(JSON.stringify(reference)) !==

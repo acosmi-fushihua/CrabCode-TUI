@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, setDefaultTimeout, test } from 'bun:test'
 import {
   mkdirSync,
   mkdtempSync,
@@ -12,6 +12,10 @@ import { join } from 'node:path'
 import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
+// Capability verify and CI run this file as one lifecycle evidence suite.
+// Insights alone serializes four fixture subprocesses; Bun's 5s default
+// is enough locally but not under a contended runner.
+setDefaultTimeout(20_000)
 const FIXTURE = join(
   REPO_ROOT,
   'tests/fixtures/direct-tui-runtime-command-production-smoke.ts',
@@ -19,7 +23,7 @@ const FIXTURE = join(
 
 async function runFixture<T>(
   mode: string,
-  options: { initializedProject?: boolean } = {},
+  options: { initializedProject?: boolean; env?: Record<string, string> } = {},
 ): Promise<T> {
   const root = mkdtempSync(join(tmpdir(), 'direct-tui-production-smoke-'))
   const config = join(root, 'config')
@@ -46,6 +50,7 @@ async function runFixture<T>(
         NODE_ENV: 'test',
         TERM_PROGRAM: 'crabcode-production-smoke-unsupported',
         USER_TYPE: 'external',
+        ...options.env,
       },
       stdout: Bun.file(output),
       stderr: Bun.file(error),
@@ -297,5 +302,35 @@ describe('direct TUI runtime production command smoke', () => {
       generationCalls: 1,
     })
     expect(failure.message).toContain('fixture insights generation failed')
+  })
+
+  test('counts slack app installs only after a successful browser open', async () => {
+    const failed = await runFixture<{
+      result: { value: string }
+      openedUrls: string[]
+      slackAppInstallCount: number
+    }>('install-slack-count', {
+      env: { DIRECT_TUI_PRODUCTION_SMOKE_OPEN_BROWSER: '0' },
+    })
+    expect(failed.result.value).toContain("Couldn't open browser")
+    expect(failed.openedUrls).toEqual([
+      'https://slack.com/marketplace/A08SF47R6P4-crabcode',
+    ])
+    expect(failed.slackAppInstallCount).toBe(3)
+
+    const succeeded = await runFixture<{
+      result: { value: string }
+      openedUrls: string[]
+      slackAppInstallCount: number
+    }>('install-slack-count', {
+      env: { DIRECT_TUI_PRODUCTION_SMOKE_OPEN_BROWSER: '1' },
+    })
+    expect(succeeded.result.value).toContain(
+      'Opening Slack app installation page in browser',
+    )
+    expect(succeeded.openedUrls).toEqual([
+      'https://slack.com/marketplace/A08SF47R6P4-crabcode',
+    ])
+    expect(succeeded.slackAppInstallCount).toBe(4)
   })
 })

@@ -1,8 +1,13 @@
-import { describe, expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { describe, expect, setDefaultTimeout, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
+
 const REPO_ROOT = join(import.meta.dir, '..', '..')
+
+setDefaultTimeout(120_000)
 
 function source(path: string): string {
   return readFileSync(join(REPO_ROOT, path), 'utf8')
@@ -88,8 +93,6 @@ const DIRECT_TUI_BUILTINS = [
   'insights',
   'DIRECT_TUI_VISION',
   '...WORKFLOW_MANAGEMENT_BUILTINS',
-  "...(feature('PROACTIVE') || feature('KAIROS')",
-  '? [DIRECT_TUI_PROACTIVE]',
   '...ANT_RENDERER_NEUTRAL_BUILTINS',
 ] as const
 
@@ -120,7 +123,7 @@ describe('direct TUI command catalog denominator', () => {
     expect(directTui).not.toContain('login')
     expect(directTui.match(/directTuiStatusline/g)).toHaveLength(1)
     expect(directTui.match(/DIRECT_TUI_INSTALL_SLACK_APP/g)).toHaveLength(1)
-    expect(directTui.match(/DIRECT_TUI_PROACTIVE/g)).toHaveLength(1)
+    expect(directTui).not.toContain('DIRECT_TUI_PROACTIVE')
     expect(directTui).not.toContain('DIRECT_TUI_RELOAD_PLUGINS')
     expect(directTui.match(/DIRECT_TUI_CLEAR/g)).toHaveLength(1)
     expect(directTui.match(/DIRECT_TUI_SMALLMODEL/g)).toHaveLength(1)
@@ -287,6 +290,103 @@ describe('direct TUI command catalog denominator', () => {
       ),
     ).toHaveLength(2)
     expect(skillTool).not.toContain("command.source === 'builtin'")
+  })
+
+  test('keeps feature and ant-build annex tokens out of the default denominator', async () => {
+    const contract = JSON.parse(
+      source('contracts/direct-tui-command-capabilities/v1/command-capabilities.json'),
+    ) as {
+      owners: { runtimeCatalog: { invocationTokens: string[] } }
+      nonReferenceKnownTokens: {
+        runtimeCatalog: string[]
+        failClosed: string[]
+      }
+      failClosedGroups: Array<{ invocationTokens: string[] }>
+      buildAnnex: { entries: Array<{ token: string }> }
+    }
+    const runtimeCatalog = new Set([
+      ...contract.owners.runtimeCatalog.invocationTokens,
+      ...contract.nonReferenceKnownTokens.runtimeCatalog,
+    ])
+    const buildAnnex = new Set(
+      contract.buildAnnex.entries.map(entry => entry.token),
+    )
+    const failClosed = new Set([
+      ...contract.failClosedGroups.flatMap(group => group.invocationTokens),
+      ...contract.nonReferenceKnownTokens.failClosed,
+    ])
+    const failClosedMinusAnnex = new Set(
+      [...failClosed].filter(token => !buildAnnex.has(token)),
+    )
+    const allowed = new Set([...runtimeCatalog, ...buildAnnex])
+    const probe = join(
+      REPO_ROOT,
+      'tests/fixtures/direct-tui-builtin-invocation-probe.ts',
+    )
+    const flags = ['0', '1'] as const
+    const userTypes = [undefined, 'ant'] as const
+
+    for (const proactive of flags) {
+      for (const kairos of flags) {
+        for (const workflows of flags) {
+          for (const userType of userTypes) {
+            const env: NodeJS.ProcessEnv = {
+              ...process.env,
+              CRABCODE_FEATURE_PROACTIVE: proactive,
+              CRABCODE_FEATURE_KAIROS: kairos,
+              CRABCODE_FEATURE_WORKFLOW_SCRIPTS: workflows,
+            }
+            if (userType === undefined) {
+              delete env.USER_TYPE
+            } else {
+              env.USER_TYPE = userType
+            }
+            const outputRoot = mkdtempSync(
+              join(tmpdir(), 'direct-tui-catalog-annex-'),
+            )
+            const output = join(outputRoot, 'evidence.json')
+            const error = join(outputRoot, 'fixture.stderr')
+            try {
+              const child = Bun.spawn({
+                cmd: [process.execPath, probe],
+                cwd: REPO_ROOT,
+                env: {
+                  ...env,
+                  ACOSMI_API_KEY: env.ACOSMI_API_KEY ?? 'catalog-annex-fixture',
+                  CRABCODE_DISABLE_TELEMETRY: '1',
+                  DISABLE_BACKGROUND_TASKS: '1',
+                  NODE_ENV: 'test',
+                },
+                stdout: Bun.file(output),
+                stderr: Bun.file(error),
+              })
+              const exitCode = await child.exited
+              const stderr = readFileSync(error, 'utf8')
+              expect(exitCode, stderr).toBe(0)
+              const invocations =
+                await readLastJsonEvidence<string[]>(output)
+              const unexpected = invocations.filter(
+                token => !allowed.has(token),
+              )
+              expect(
+                unexpected,
+                `PROACTIVE=${proactive} KAIROS=${kairos} WORKFLOW_SCRIPTS=${workflows} USER_TYPE=${userType ?? '<unset>'}`,
+              ).toEqual([])
+              const leakedFailClosed = invocations.filter(token =>
+                failClosedMinusAnnex.has(token),
+              )
+              expect(
+                leakedFailClosed,
+                `fail-closed leak PROACTIVE=${proactive} KAIROS=${kairos} WORKFLOW_SCRIPTS=${workflows} USER_TYPE=${userType ?? '<unset>'}`,
+              ).toEqual([])
+              expect(invocations).not.toContain('proactive')
+            } finally {
+              rmSync(outputRoot, { recursive: true, force: true })
+            }
+          }
+        }
+      }
+    }
   })
 
 })

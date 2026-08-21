@@ -8,15 +8,13 @@ const SLACK_APP_URL = 'https://slack.com/marketplace/A08SF47R6P4-crabcode'
 export async function call(): Promise<LocalCommandResult> {
   logEvent('tengu_install_slack_app_clicked', {})
 
-  // Track that user has clicked to install
-  saveGlobalConfig(current => ({
-    ...current,
-    slackAppInstallCount: (current.slackAppInstallCount ?? 0) + 1,
-  }))
-
   const success = await openBrowser(SLACK_APP_URL)
 
   if (success) {
+    saveGlobalConfig(current => ({
+      ...current,
+      slackAppInstallCount: (current.slackAppInstallCount ?? 0) + 1,
+    }))
     return {
       type: 'text',
       value: 'Opening Slack app installation page in browser…',
