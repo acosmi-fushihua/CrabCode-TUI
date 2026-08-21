@@ -193,7 +193,7 @@ if (previousNodeEnv === undefined) delete process.env.NODE_ENV
 else process.env.NODE_ENV = previousNodeEnv
 
 process.stdout.write(
-  JSON.stringify({
+  `${JSON.stringify({
     pendingBefore,
     pinnedBefore,
     analysisStateCreations,
@@ -208,5 +208,5 @@ process.stdout.write(
     productionPendingEdits,
     productionCacheDeletionNotifications,
     analyzedModel: data.model,
-  }),
+  })}\n`,
 )

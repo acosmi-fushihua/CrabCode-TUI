@@ -128,8 +128,16 @@ describe('direct TUI command catalog denominator', () => {
     expect(directTui.match(/DIRECT_TUI_VISION/g)).toHaveLength(1)
     expect(directTui.match(/outputStyle/g)).toHaveLength(1)
     expect(directTui).not.toContain('[logout]')
-    expect(catalog).toContain("'logout',\n  'reload-plugins'")
+    expect(catalog).toContain(
+      "'bug',\n  'feedback',\n  'logout',\n  'reload-plugins'",
+    )
     expect(catalog).toContain('claimsDirectTuiRendererOwnedInvocation')
+    expect(catalog).toContain(
+      'for (const name of getRoutableCommandInvocationNames(command))',
+    )
+    expect(catalog).toContain(
+      '// one command fail-closed instead of losing the entire direct registry.',
+    )
     expect(catalog).toContain(
       'DIRECT_TUI_RENDERER_NEUTRAL_LOCAL_JSX.has(command)',
     )
@@ -182,17 +190,37 @@ describe('direct TUI command catalog denominator', () => {
     const core = source('src/cli/print/queryExecutionCore.ts')
     expect(core).toContain('installDirectTuiCommandSurface()')
     expect(core).toContain('installHeadlessCommandSurface()')
-    expect(core).toContain('commandLoader: getDirectTuiCommands')
+    expect(core).toContain(
+      'commandLoader: commandLoaderForRoute(\n      slashCommandsEnabled,\n      getDirectTuiCommands,',
+    )
     expect(core).toContain('commandLoader: getHeadlessCommands')
+    expect(core).toContain(
+      '? commandInventoryForRoute(routePolicy.slashCommandsEnabled, commands)',
+    )
+    expect(core).toContain(
+      'routePolicy.slashCommandsEnabled,\n        commands,\n        appState.mcp.commands,',
+    )
+    expect(core).toContain(
+      'return executableCommandInventoryForRoute(\n      routePolicy.slashCommandsEnabled,\n      routePolicy.directQueryEventDelivery,\n      currentCommands,\n      mcpCommands,',
+    )
+    expect(core).toContain('options.subscribeAppState?.(() => {')
     expect(core).toContain(
       'commandCatalogLifecycle.refresh(() =>\n      routePolicy.commandLoader(cwd()),',
     )
-    expect(core.match(/routePolicy\.commandLoader\(cwd\(\)\)/g)).toHaveLength(
-      3,
+    expect(core).toContain(
+      'clearHeadlessCommandMemoizationCaches()\n    return commandCatalogLifecycle.refresh(() =>\n      routePolicy.commandLoader(cwd()),',
     )
     expect(core).toContain(
-      'refreshControlAuthCatalog(\n                  routePolicy.commandLoader,\n                  cwd(),',
+      'settingsChangeDetector.subscribe(queueSettingsCommandCatalogRefresh)',
     )
+    expect(core).toContain(
+      'refreshControlAuthCatalog(\n                    routePolicy.commandLoader,\n                    cwd(),\n                    undefined,\n                    routePolicy.directQueryEventDelivery,',
+    )
+    expect(core).toContain(
+      'withCurrentControlAuthCommandCatalog(\n                      refreshed.response,\n                      currentCatalogCommands(),\n                      routePolicy.directQueryEventDelivery,',
+    )
+    expect(core).toContain('await handleDirectTuiLogoutRequest(')
+    expect(core).toContain('currentCatalogCommands,')
   })
 
   test('uses the direct catalog for initial and normal TUI setup', () => {
@@ -202,38 +230,50 @@ describe('direct TUI command catalog denominator', () => {
     expect(bootstrap).not.toContain('getHeadlessCommands(')
   })
 
-  test('uses one canonical-plus-alias projector for every catalog producer', () => {
+  test('uses one backend-routable projector for every catalog producer', () => {
     const handlers = source('src/cli/print/sdkControlHandlers.ts')
+    expect(handlers).toContain('strictDirectTuiCatalog = false')
+    expect(handlers).toContain('? projectDirectTuiCommandCatalogEntries(')
+    expect(handlers).toContain(': projectCommandCatalogEntries(')
     expectOrdered(handlers, [
       'export async function refreshControlAuthCatalog(',
-      'commands: projectCommandCatalogEntries(',
-      'async function refreshSignedOutControlAuthCatalog(',
-      'commands: projectCommandCatalogEntries(',
+      'strictDirectTuiCatalog = false',
+      '? projectDirectTuiCommandCatalogEntries(',
+      ': projectCommandCatalogEntries(',
       'export async function handleInitializeRequest(',
-      'commands: projectCommandCatalogEntries(',
+      'strictDirectTuiCatalog = false',
+      '? projectDirectTuiCommandCatalogEntries(',
+      ': projectCommandCatalogEntries(',
     ])
     expect(handlers).not.toContain('commands: commands.map(')
 
     const query = source('src/cli/print/queryExecutionCore.ts')
     expectOrdered(query, [
+      'const projectCurrentCommandCatalog = (',
+      '? projectDirectTuiCommandCatalogEntries(',
+      ': projectCommandCatalogEntries(',
+      'const publishCurrentCommandCatalog = (): void => {',
+      'projectCurrentCommandCatalog(currentCatalogCommands())',
       'const commandCatalogLifecycle = new DirectTuiCommandCatalogLifecycle(',
-      'projectCommandCatalogEntries(',
       "message.request.subtype === 'reload_plugins'",
-      'commands: projectCommandCatalogEntries(',
+      'commands: projectCurrentCommandCatalog(currentCatalogCommands())',
     ])
     expect(query).not.toContain('commands: currentCommands.map(')
 
     const projection = source('src/cli/commandCatalogProjection.ts')
     expectOrdered(projection, [
-      'if (command.userInvocable === false) continue',
-      'for (const name of [command.name, ...(command.aliases ?? [])])',
+      'const invocationNames = getRoutableCommandInvocationNames(command)',
+      'nextName = invocationNames.next()',
       'if (claimedInvocationNames.has(name)) continue',
       'claimedInvocationNames.add(name)',
+      'if (command.userInvocable === false) continue',
       'entries.push({',
       '...(command.isHidden === true',
       '...(builtInNames.has(name)',
     ])
-    expect(projection).not.toContain('.userFacingName')
+    expect(projection).toContain(
+      'DIRECT_TUI_COMMAND_CATALOG_NAME_MAX_UTF16_UNITS',
+    )
   })
 
   test('preserves name-based built-in skill telemetry after command shadowing', () => {

@@ -8,6 +8,8 @@ import {
 } from 'bun:test'
 import type { Command } from '../../src/types/command.js'
 import type { StdoutMessage } from '../../src/entrypoints/sdk/controlTypes.js'
+import type { StructuredIO } from '../../src/cli/structuredIO.js'
+import { getDefaultAppState } from '../../src/state/AppStateStore.js'
 
 const auth = await import('../../src/utils/auth.js')
 const catalog = await import('../../src/cli/headlessCommands.js')
@@ -47,6 +49,106 @@ afterAll(() => {
 })
 
 describe('direct TUI authentication control lifecycle', () => {
+  test('initialize resolves a lazy command catalog immediately before enqueueing its response', async () => {
+    const messages: StdoutMessage[] = []
+    let releaseCatalog!: (commands: readonly Command[]) => void
+    let markResolverEntered!: () => void
+    const resolverEntered = new Promise<void>(resolve => {
+      markResolverEntered = resolve
+    })
+    const catalogReady = new Promise<readonly Command[]>(resolve => {
+      releaseCatalog = resolve
+    })
+
+    const initialization = handlers.handleInitializeRequest(
+      { subtype: 'initialize' },
+      'initialize-lazy-catalog',
+      false,
+      { enqueue: message => messages.push(message) },
+      async () => {
+        markResolverEntered()
+        return catalogReady
+      },
+      [],
+      {} as StructuredIO,
+      false,
+      {
+        systemPrompt: undefined,
+        appendSystemPrompt: undefined,
+        agent: undefined,
+        userSpecifiedModel: undefined,
+      },
+      [],
+      getDefaultAppState,
+    )
+
+    await resolverEntered
+    expect(messages).toEqual([])
+    releaseCatalog([command('late-initialize-command')])
+    await initialization
+
+    const response = messages[0] as Extract<
+      StdoutMessage,
+      { type: 'control_response' }
+    >
+    expect(response.response.response?.commands).toMatchObject([
+      { name: 'late-initialize-command' },
+    ])
+  })
+
+  test('correlated auth catalogs use the committed route inventory on their first response', async () => {
+    const base = command('public-after-auth-transition')
+    const liveMcp = command('mcp__live__prompt')
+
+    expect(
+      handlers.withCurrentControlAuthCommandCatalog(
+        { account: { email: 'signed-in@example.invalid' }, commands: [] },
+        [base, liveMcp],
+      ),
+    ).toMatchObject({
+      account: { email: 'signed-in@example.invalid' },
+      commands: [
+        { name: 'public-after-auth-transition' },
+        { name: 'mcp__live__prompt' },
+      ],
+    })
+
+    for (const slashCommandsEnabled of [true, false]) {
+      const messages: StdoutMessage[] = []
+      let committed: readonly Command[] = []
+      await handlers.handleDirectTuiLogoutRequest(
+        `logout-route-${slashCommandsEnabled}`,
+        { enqueue: message => messages.push(message) },
+        async () => (slashCommandsEnabled ? [base] : []),
+        '/workspace',
+        true,
+        {
+          logout: async () => {},
+          clearCommandCaches: () => {},
+          getAccount: () => undefined,
+          getProvider: () => 'firstParty',
+        },
+        nextCommands => {
+          committed = nextCommands
+        },
+        () =>
+          slashCommandsEnabled ? [...committed, liveMcp] : [],
+      )
+
+      const response = messages[0] as Extract<
+        StdoutMessage,
+        { type: 'control_response' }
+      >
+      expect(
+        response.response.response?.commands.map(item => item.name),
+      ).toEqual(
+        slashCommandsEnabled
+          ? ['public-after-auth-transition', 'mcp__live__prompt']
+          : [],
+      )
+    }
+  })
+
   test('logout performs backend cleanup, refreshes auth/catalog, and preserves request correlation', async () => {
     const messages: StdoutMessage[] = []
     const events: string[] = []

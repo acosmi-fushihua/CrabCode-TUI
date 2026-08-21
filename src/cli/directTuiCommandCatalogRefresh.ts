@@ -1,6 +1,13 @@
 import { z } from 'zod/v4'
 
-import type { CommandCatalogEntry } from './commandCatalogProjection.js'
+import {
+  DIRECT_TUI_COMMAND_CATALOG_ARGUMENT_HINT_MAX_UTF16_UNITS,
+  DIRECT_TUI_COMMAND_CATALOG_DESCRIPTION_MAX_UTF16_UNITS,
+  DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES,
+  DIRECT_TUI_COMMAND_CATALOG_NAME_MAX_UTF16_UNITS,
+  isWellFormedUtf16,
+  type CommandCatalogEntry,
+} from './commandCatalogProjection.js'
 import { parseSlashCommand } from '../utils/slashCommandParsing.js'
 
 /**
@@ -19,7 +26,10 @@ const CommandCatalogEntrySchema = z
     name: z
       .string()
       .min(1)
-      .max(512)
+      .max(DIRECT_TUI_COMMAND_CATALOG_NAME_MAX_UTF16_UNITS)
+      .refine(isWellFormedUtf16, {
+        message: 'command name must contain well-formed UTF-16',
+      })
       .refine(name => {
         const parsed = parseSlashCommand('/' + name)
         return (
@@ -30,8 +40,18 @@ const CommandCatalogEntrySchema = z
       }, {
         message: 'command name must roundtrip as one argument-free slash token',
       }),
-    description: z.string().max(16_384),
-    argumentHint: z.string().max(4_096),
+    description: z
+      .string()
+      .max(DIRECT_TUI_COMMAND_CATALOG_DESCRIPTION_MAX_UTF16_UNITS)
+      .refine(isWellFormedUtf16, {
+        message: 'command description must contain well-formed UTF-16',
+      }),
+    argumentHint: z
+      .string()
+      .max(DIRECT_TUI_COMMAND_CATALOG_ARGUMENT_HINT_MAX_UTF16_UNITS)
+      .refine(isWellFormedUtf16, {
+        message: 'command argument hint must contain well-formed UTF-16',
+      }),
     hidden: z.literal(true).optional(),
     builtin: z.literal(true).optional(),
   })
@@ -41,7 +61,9 @@ export const DirectTuiCommandCatalogChangedRequestSchema = z
   .object({
     subtype: z.literal(DIRECT_TUI_COMMAND_CATALOG_CHANGED_SUBTYPE),
     protocol_version: z.literal(DIRECT_TUI_COMMAND_CATALOG_PROTOCOL_VERSION),
-    commands: z.array(CommandCatalogEntrySchema).max(4_096),
+    commands: z
+      .array(CommandCatalogEntrySchema)
+      .max(DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES),
   })
   .strict()
   .superRefine((request, context) => {
@@ -111,6 +133,9 @@ export class DirectTuiCommandCatalogLifecycle<TCommand> {
   private committedRevision = 0
   private closed = false
   private commands: readonly TCommand[]
+  private readonly pendingRefreshes = new Set<
+    Promise<readonly TCommand[]>
+  >()
 
   constructor(
     initialCommands: readonly TCommand[],
@@ -144,9 +169,31 @@ export class DirectTuiCommandCatalogLifecycle<TCommand> {
   async refresh(
     load: () => Promise<readonly TCommand[]>,
   ): Promise<readonly TCommand[]> {
-    const ticket = this.beginRefresh()
-    const commands = await load()
-    ticket.commit(commands)
+    const refreshPromise = (async () => {
+      const ticket = this.beginRefresh()
+      const commands = await load()
+      ticket.commit(commands)
+      return this.snapshot()
+    })()
+    this.pendingRefreshes.add(refreshPromise)
+    const forget = () => {
+      this.pendingRefreshes.delete(refreshPromise)
+    }
+    // Handle both outcomes explicitly. A bare finally() would create a second
+    // rejected promise when the loader fails, even when the refresh owner
+    // correctly handles the original rejection.
+    void refreshPromise.then(forget, forget)
+    return refreshPromise
+  }
+
+  /**
+   * Wait for the refreshes registered at this call boundary. Later discovery
+   * remains owned by the reverse publisher; bounding this barrier prevents
+   * continuous settings/skill churn from starving initialize.
+   */
+  async whenIdle(): Promise<readonly TCommand[]> {
+    if (this.closed) return this.snapshot()
+    await Promise.allSettled([...this.pendingRefreshes])
     return this.snapshot()
   }
 
@@ -170,6 +217,7 @@ export class DirectTuiCommandCatalogLifecycle<TCommand> {
 export class DirectTuiCommandCatalogPublisher {
   private ready = false
   private closed = false
+  private holdCount = 0
   private dirty = false
   private latest: readonly CommandCatalogEntry[] = []
   private drainPromise: Promise<void> | undefined
@@ -192,6 +240,23 @@ export class DirectTuiCommandCatalogPublisher {
     this.startDrain()
   }
 
+  /**
+   * Hold reverse publication while an owning correlated control response is
+   * being assembled. The release closure is idempotent and nested holds are
+   * counted so one failing producer cannot prematurely flush another.
+   */
+  hold(): () => void {
+    if (this.closed) return () => {}
+    this.holdCount += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.holdCount = Math.max(0, this.holdCount - 1)
+      this.startDrain()
+    }
+  }
+
   close(): void {
     this.closed = true
     this.dirty = false
@@ -209,6 +274,7 @@ export class DirectTuiCommandCatalogPublisher {
     if (
       !this.ready ||
       this.closed ||
+      this.holdCount > 0 ||
       !this.dirty ||
       this.drainPromise
     ) {

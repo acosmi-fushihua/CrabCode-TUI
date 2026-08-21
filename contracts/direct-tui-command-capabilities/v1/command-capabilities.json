@@ -286,7 +286,7 @@
     "scope": {
       "ownerBoundary": "Lifecycle statuses cover the direct TUI owner boundary: token discovery, exact dispatch, correlated completion truth, renderer input, and TUI transcript recovery.",
       "externalAuthorityBoundary": "Network services, operating-system integrations, and command-specific business mutations behind an admitted handler are separate authorities; this audit neither invokes them nor labels their internal effects as renderer success.",
-      "hermeticRuntimeSeam": "The runtime-general matrix binds every real production command object and execution kind to the production slash dispatcher, then injects success, failure, and cancellation at the admitted handler boundary and reloads the resulting physical transcript."
+      "hermeticRuntimeSeam": "Production smoke loads every real command and executes each actual handler with mocks only at external authority seams. The separate runtime matrix verifies the shared slash-dispatch, terminal projection, renderer-input, and physical transcript machinery without pretending its injected handler is command-specific business evidence."
     },
     "ownershipPrecedence": {
       "rules": [
@@ -391,7 +391,9 @@
         "markers": [
           "fn local_completion_registry_is_separate_from_runtime_dispatch_ownership()",
           "fn initialize_commands_preserve_metadata_and_leave_execution_to_the_backend_slash_resolver()",
-          "fn runtime_first_wins_for_non_reserved_local_collisions()"
+          "fn runtime_first_wins_for_non_reserved_local_collisions()",
+          "fn command_palette_enter_accepts_before_chat_submit_without_inventing_aliases()",
+          "fn runtime_slash_command_with_attachment_uses_user_path_without_losing_command_or_image()"
         ]
       },
       "rust.hidden_and_help": {
@@ -407,7 +409,15 @@
         "path": "crates/crabcode-tui/src/tui_app.rs",
         "markers": [
           "fn unavailable_local_tokens_fail_closed_without_changing_the_viewport()",
+          "fn disabled_slash_commands_hide_every_catalog_and_submit_literal_text()",
           "command was not sent"
+        ]
+      },
+      "rust.disable_slash_cli": {
+        "kind": "rust_test",
+        "path": "crates/crabcode-tui/src/terminal.rs",
+        "markers": [
+          "fn disable_slash_commands_is_both_a_native_fact_and_an_unchanged_child_flag()"
         ]
       },
       "rust.exit_terminal": {
@@ -449,8 +459,8 @@
         "path": "crates/crabcode-tui/src/tui_app.rs",
         "markers": [
           "fn direct_tui_command_lifecycle_executable_evidence_suite()",
-          "plugin_command_aliases_settle_fail_and_cancel_on_their_correlated_panel",
-          "context_usage_error_is_visible_without_replacing_the_last_good_terminal_state"
+          "fn plugin_command_aliases_settle_fail_and_cancel_on_their_correlated_panel()",
+          "fn context_usage_error_is_visible_without_replacing_the_last_good_terminal_state()"
         ]
       },
       "ts.auth_control_lifecycle": {
@@ -460,6 +470,11 @@
           "logout performs backend cleanup, refreshes auth/catalog, and preserves request correlation",
           "logout failure is request-local and does not refresh or terminate the runtime",
           "auth refresh invalidates the memoized direct catalog after login state changes"
+        ],
+        "testNames": [
+          "direct TUI authentication control lifecycle > logout performs backend cleanup, refreshes auth/catalog, and preserves request correlation",
+          "direct TUI authentication control lifecycle > logout failure is request-local and does not refresh or terminate the runtime",
+          "direct TUI authentication control lifecycle > auth refresh invalidates the memoized direct catalog after login state changes"
         ]
       },
       "ts.context_control_lifecycle": {
@@ -468,6 +483,10 @@
         "markers": [
           "takes a fresh atomic tool/agent/app-state snapshot for every correlated request",
           "correlates collection and schema failures without mutating established state"
+        ],
+        "testNames": [
+          "/context collection lifecycle > takes a fresh atomic tool/agent/app-state snapshot for every correlated request",
+          "/context collection lifecycle > correlates collection and schema failures without mutating established state"
         ]
       },
       "ts.bug_action_lifecycle": {
@@ -476,6 +495,10 @@
         "markers": [
           "the closed action returns a correlated feedback id",
           "malformed descriptions and invalid response ids fail closed"
+        ],
+        "testNames": [
+          "direct native TUI bug reporting > the closed action returns a correlated feedback id",
+          "direct native TUI bug reporting > malformed descriptions and invalid response ids fail closed"
         ]
       },
       "ts.retained_action_lifecycle": {
@@ -486,6 +509,12 @@
           "color validates exact historical values before invoking its owner",
           "rename returns the exact state committed by the existing owner",
           "authority failures return a typed DTO without raw exception data"
+        ],
+        "testNames": [
+          "direct native TUI retained command actions > identity snapshot restores the exact existing standalone state without mutation",
+          "direct native TUI retained command actions > color validates exact historical values before invoking its owner",
+          "direct native TUI retained command actions > rename returns the exact state committed by the existing owner",
+          "direct native TUI retained command actions > authority failures return a typed DTO without raw exception data"
         ]
       },
       "ts.model_action_lifecycle": {
@@ -495,6 +524,11 @@
           "custom list and mutations never project API keys or credential handles",
           "local snapshot and lifecycle call the existing direct client without a second executor",
           "consent/runtime/login/remove map only to the existing account manager methods"
+        ],
+        "testNames": [
+          "direct TUI model-management actions > custom list and mutations never project API keys or credential handles",
+          "direct TUI model-management actions > local snapshot and lifecycle call the existing direct client without a second executor",
+          "direct TUI model-management actions > consent/runtime/login/remove map only to the existing account manager methods"
         ]
       },
       "ts.plugin_action_lifecycle": {
@@ -504,6 +538,11 @@
           "returns marketplace metadata without returning source URLs or paths",
           "commits marketplace add in the historical authority order without echoing source credentials",
           "normalizes thrown authority failures into typed non-fatal results"
+        ],
+        "testNames": [
+          "direct TUI plugin read adapters > returns marketplace metadata without returning source URLs or paths",
+          "direct TUI marketplace and validation mutation adapters > commits marketplace add in the historical authority order without echoing source credentials",
+          "direct TUI marketplace and validation mutation adapters > normalizes thrown authority failures into typed non-fatal results"
         ]
       },
       "ts.runtime_general_lifecycle": {
@@ -511,8 +550,35 @@
         "path": "tests/unit/direct-tui-runtime-command-lifecycle-matrix.test.ts",
         "markers": [
           "binds every audited token to one actual production execution kind",
-          "exercises success, failure, cancellation, terminal truth, and render input for all 19 tokens",
-          "round-trips every token-specific success projection through the physical transcript loader"
+          "exercises shared executor outcomes and terminal projection for all 19 real tokens",
+          "round-trips every shared executor token projection through the physical transcript loader"
+        ],
+        "testNames": [
+          "direct TUI runtime command token-complete lifecycle matrix > binds every audited token to one actual production execution kind",
+          "direct TUI runtime command token-complete lifecycle matrix > exercises shared executor outcomes and terminal projection for all 19 real tokens",
+          "direct TUI runtime command token-complete lifecycle matrix > round-trips every shared executor token projection through the physical transcript loader"
+        ]
+      },
+      "ts.runtime_production_smoke": {
+        "kind": "bun_test",
+        "path": "tests/unit/direct-tui-runtime-command-production-smoke.test.ts",
+        "markers": [
+          "loads every audited production definition and its real lazy handler",
+          "executes bounded safe handlers and prompt builders without substituting them",
+          "executes the real init builder across project-onboarding persistence success and failure",
+          "executes real side-effect handlers with only external authorities mocked",
+          "executes the real security-review builder across the shell authority seam",
+          "keeps advisor AppState behind successful persistence and projects write failure as terminal error",
+          "executes insights production phases and honors pre-phase and inter-phase cancellation"
+        ],
+        "testNames": [
+          "direct TUI runtime production command smoke > loads every audited production definition and its real lazy handler",
+          "direct TUI runtime production command smoke > executes bounded safe handlers and prompt builders without substituting them",
+          "direct TUI runtime production command smoke > executes the real init builder across project-onboarding persistence success and failure",
+          "direct TUI runtime production command smoke > executes real side-effect handlers with only external authorities mocked",
+          "direct TUI runtime production command smoke > executes the real security-review builder across the shell authority seam",
+          "direct TUI runtime production command smoke > keeps advisor AppState behind successful persistence and projects write failure as terminal error",
+          "direct TUI runtime production command smoke > executes insights production phases and honors pre-phase and inter-phase cancellation"
         ]
       },
       "ts.command_terminal_gaps": {
@@ -523,6 +589,12 @@
           "compact-history physical I/O failure and cancellation produce distinct stderr terminals",
           "clear/new/reset QueryEngine success commits durable new sessions recoverable in a fresh process",
           "clear/new/reset preflight failure and cancellation preserve the old session and render error terminals"
+        ],
+        "testNames": [
+          "direct TUI compact-history and clear alias terminal truth > compact-history QueryEngine preserves malformed JSONL, renders one valid boundary, and resumes it in a fresh process",
+          "direct TUI compact-history and clear alias terminal truth > compact-history physical I/O failure and cancellation produce distinct stderr terminals",
+          "direct TUI compact-history and clear alias terminal truth > clear/new/reset QueryEngine success commits durable new sessions recoverable in a fresh process",
+          "direct TUI compact-history and clear alias terminal truth > clear/new/reset preflight failure and cancellation preserve the old session and render error terminals"
         ]
       },
       "ts.catalog_projection": {
@@ -531,6 +603,10 @@
         "markers": [
           "preserves hidden dispatch and builtin help metadata per invocation token",
           "projects canonical names and aliases in backend first-wins order"
+        ],
+        "testNames": [
+          "slash-command control catalog projection > preserves hidden dispatch and builtin help metadata per invocation token",
+          "slash-command control catalog projection > projects canonical names and aliases in backend first-wins order"
         ]
       },
       "ts.catalog_refresh": {
@@ -539,6 +615,10 @@
         "markers": [
           "holds pre-initialize changes and coalesces in-flight updates latest-wins",
           "hidden-skill"
+        ],
+        "testNames": [
+          "direct TUI command catalog refresh private contract > holds pre-initialize changes and coalesces in-flight updates latest-wins",
+          "direct TUI command catalog refresh private contract > preserves dispatch and presentation metadata in one closed request"
         ]
       },
       "ts.slash_parser": {
@@ -547,6 +627,11 @@
         "markers": [
           "slash command parsing",
           "ECMAScript whitespace"
+        ],
+        "testNames": [
+          "slash command parsing > uses ECMAScript whitespace separators consistently with the direct TUI",
+          "slash command parsing > retains the historical MCP marker while accepting Unicode separators",
+          "slash command parsing > preserves the argument tail after consuming exactly one separator"
         ]
       },
       "ts.query_event_projection": {
@@ -555,6 +640,10 @@
         "markers": [
           "publishes one local-command batch exactly once",
           "passes local-command output and compact boundary as original internal objects"
+        ],
+        "testNames": [
+          "direct-TUI query event delivery > publishes one local-command batch exactly once and is inert without an observer",
+          "direct-TUI query event delivery > passes local-command output and compact boundary as original internal objects"
         ]
       },
       "ts.compact_terminal": {
@@ -565,6 +654,10 @@
           "expect(compactCommand.aliases).toEqual(['com'])",
           "const aliasSuccess = terminalResult(evidence['alias-success'])",
           "stop_reason: 'interrupted'"
+        ],
+        "testNames": [
+          "compact local-command terminal result contract > declares /com as an exact compact alias instead of a palette-only prefix",
+          "compact local-command terminal result contract > success, empty history, API error, and cancellation keep distinct terminal truth"
         ]
       },
       "ts.compact_recovery": {
@@ -573,6 +666,9 @@
         "markers": [
           "compact transcript persistence and cross-process resume",
           "compact-history scans the append-only physical transcript"
+        ],
+        "testNames": [
+          "compact transcript persistence and cross-process resume > flushes the logical compact sequence, resumes summary + preserved segment, retains raw history, and fails soft on every bad relink shape"
         ]
       },
       "ts.compact_history_terminal": {
@@ -583,6 +679,12 @@
           "projects pre-read cancellation as interrupted without touching disk",
           "projects in-flight read cancellation as interrupted",
           "projects the post-read abort race as interrupted before synchronous scanning"
+        ],
+        "testNames": [
+          "direct TUI compact-history terminal lifecycle > projects unreadable transcript failure through the real catalog and QueryEngine",
+          "direct TUI compact-history terminal lifecycle > projects pre-read cancellation as interrupted without touching disk",
+          "direct TUI compact-history terminal lifecycle > projects in-flight read cancellation as interrupted",
+          "direct TUI compact-history terminal lifecycle > projects the post-read abort race as interrupted before synchronous scanning"
         ]
       },
       "ts.clear_terminal": {
@@ -594,6 +696,14 @@
           "projects pre-commit clear cancellation as interrupted through the real catalog and QueryEngine",
           "pre-abort leaves clear session, messages, and persistence pointers untouched",
           "type: 'result'"
+        ],
+        "testNames": [
+          "direct TUI fixed local actions > QueryEngine emits the regenerated clear session id on the real local-command envelope path",
+          "direct TUI fixed local actions > projects clear transaction rejection as a terminal error through the real catalog and QueryEngine",
+          "direct TUI fixed local actions > projects pre-commit clear cancellation as interrupted through the real catalog and QueryEngine",
+          "direct TUI fixed local actions > pre-abort leaves clear session, messages, and persistence pointers untouched",
+          "direct TUI fixed local actions > preserves smallmodel display, set, reset, and telemetry behavior without JSX",
+          "direct TUI fixed local actions > preserves terminal-setup completion on the exact private worker adapter"
         ]
       }
     },
@@ -656,7 +766,7 @@
         "coverage": {
           "ownership": { "status": "verified", "evidence": ["rust.command_inventory", "rust.command_lifecycle_suite"] },
           "discovery": { "status": "verified", "evidence": ["rust.hidden_and_help"] },
-          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.slash_parser"] },
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_controls", "ts.slash_parser"] },
           "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"] },
           "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"] },
           "cancellation": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"], "note": "The atomic side-question control has no backend cancel phase; executable cancellation evidence covers dismissal of the correlated renderer card without affecting the main turn." },
@@ -689,7 +799,7 @@
           "ownership": { "status": "verified", "evidence": ["rust.command_inventory", "rust.command_lifecycle_suite"] },
           "discovery": { "status": "verified", "evidence": ["rust.hidden_and_help"] },
           "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.slash_parser"] },
-          "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.auth_control_lifecycle"] },
+          "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_controls", "ts.auth_control_lifecycle"] },
           "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.auth_control_lifecycle"] },
           "cancellation": { "status": "not_applicable", "evidence": [], "note": "Authentication controls are atomic after dispatch; credential authority exposes no renderer-owned per-request cancel message." },
           "terminalState": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.auth_control_lifecycle"] },
@@ -704,7 +814,7 @@
         "coverage": {
           "ownership": { "status": "verified", "evidence": ["rust.command_inventory", "rust.command_lifecycle_suite"] },
           "discovery": { "status": "verified", "evidence": ["rust.hidden_and_help"] },
-          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.slash_parser"] },
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_controls", "ts.slash_parser"] },
           "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"] },
           "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"] },
           "cancellation": { "status": "not_applicable", "evidence": [], "note": "MCP mutation controls are atomic after dispatch; closing the resulting panel is view dismissal, not transaction cancellation." },
@@ -720,7 +830,7 @@
         "coverage": {
           "ownership": { "status": "verified", "evidence": ["rust.command_inventory", "rust.command_lifecycle_suite"] },
           "discovery": { "status": "verified", "evidence": ["rust.hidden_and_help"] },
-          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.slash_parser"] },
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_controls", "ts.slash_parser"] },
           "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.catalog_refresh"] },
           "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.catalog_refresh"] },
           "cancellation": { "status": "not_applicable", "evidence": [], "note": "Reload is one atomic catalog snapshot request and exposes no cancellable renderer-owned in-flight phase." },
@@ -738,7 +848,7 @@
           "discovery": { "status": "verified", "evidence": ["rust.hidden_and_help"] },
           "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.slash_parser"] },
           "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.bug_action_lifecycle"] },
-          "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.bug_action_lifecycle"] },
+          "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_private_actions", "ts.bug_action_lifecycle"] },
           "cancellation": { "status": "not_applicable", "evidence": [], "note": "A submitted report is one bounded authority request with no renderer-owned cancellation message." },
           "terminalState": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.bug_action_lifecycle"] },
           "rendering": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"] },
@@ -752,9 +862,9 @@
         "coverage": {
           "ownership": { "status": "verified", "evidence": ["rust.command_inventory", "rust.command_lifecycle_suite"] },
           "discovery": { "status": "verified", "evidence": ["rust.hidden_and_help"] },
-          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.slash_parser"] },
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_private_actions", "ts.slash_parser"] },
           "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.retained_action_lifecycle"] },
-          "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.retained_action_lifecycle"] },
+          "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_private_actions", "ts.retained_action_lifecycle"] },
           "cancellation": { "status": "not_applicable", "evidence": [], "note": "Each retained identity update is an atomic request with no intermediate renderer-owned cancellation phase." },
           "terminalState": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.retained_action_lifecycle"] },
           "rendering": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"] },
@@ -768,7 +878,7 @@
         "coverage": {
           "ownership": { "status": "verified", "evidence": ["rust.command_inventory", "rust.command_lifecycle_suite"] },
           "discovery": { "status": "verified", "evidence": ["rust.hidden_and_help"] },
-          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.slash_parser"] },
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_private_actions", "ts.slash_parser"] },
           "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.model_action_lifecycle"] },
           "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.model_action_lifecycle"] },
           "cancellation": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"] },
@@ -784,7 +894,7 @@
         "coverage": {
           "ownership": { "status": "verified", "evidence": ["rust.command_inventory", "rust.command_lifecycle_suite"] },
           "discovery": { "status": "verified", "evidence": ["rust.hidden_and_help"] },
-          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.slash_parser"] },
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_private_actions", "ts.slash_parser"] },
           "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.plugin_action_lifecycle"] },
           "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.plugin_action_lifecycle"] },
           "cancellation": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"], "note": "For each plugin alias, Esc dismisses the correlated busy panel while admitted authority work remains atomic; the late result is consumed without reopening the panel or altering the main TUI." },
@@ -800,7 +910,7 @@
         "coverage": {
           "ownership": { "status": "verified", "evidence": ["rust.command_inventory", "rust.command_lifecycle_suite"] },
           "discovery": { "status": "verified", "evidence": ["rust.hidden_and_help"] },
-          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.slash_parser"] },
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "rust.renderer_private_actions", "ts.slash_parser"] },
           "success": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.plugin_action_lifecycle"] },
           "failure": { "status": "verified", "evidence": ["rust.command_lifecycle_suite", "ts.plugin_action_lifecycle"] },
           "cancellation": { "status": "verified", "evidence": ["rust.command_lifecycle_suite"] },
@@ -867,39 +977,73 @@
         }
       },
       {
-        "id": "runtime_catalog_general",
+        "id": "runtime_catalog_atomic_pure",
+        "ownerClass": "runtimeCatalog",
+        "invocationTokens": [
+          "cost",
+          "files",
+          "output-style",
+          "pr-comments",
+          "review",
+          "statusline"
+        ],
+        "coverage": {
+          "ownership": { "status": "verified", "evidence": ["rust.catalog_dispatch", "ts.catalog_projection", "ts.runtime_production_smoke"] },
+          "discovery": { "status": "verified", "evidence": ["ts.catalog_projection", "ts.catalog_refresh", "rust.hidden_and_help"] },
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.catalog_dispatch", "rust.disable_slash_cli", "ts.slash_parser", "ts.runtime_general_lifecycle"] },
+          "success": { "status": "verified", "evidence": ["ts.runtime_production_smoke"], "note": "Each real handler or prompt builder executes in the production smoke; no handler body is replaced." },
+          "failure": { "status": "not_applicable", "evidence": [], "note": "These bounded read or prompt-building paths expose no fallible external authority after successful module loading." },
+          "cancellation": { "status": "not_applicable", "evidence": [], "note": "These handlers are bounded atomic builders with no admitted in-flight cancellation phase." },
+          "terminalState": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle"], "note": "Actual handler success and the shared production terminal projector are exercised separately and both must pass." },
+          "rendering": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle"], "note": "Actual handler output is verified before the shared renderer-input projection; no external UI is inferred." },
+          "persistenceRecovery": { "status": "verified", "evidence": ["ts.runtime_general_lifecycle"], "note": "The shared TUI transcript projection is physically reloaded; these commands own no separate durable business state." }
+        }
+      },
+      {
+        "id": "runtime_catalog_atomic_authority",
         "ownerClass": "runtimeCatalog",
         "invocationTokens": [
           "advisor",
-          "cost",
           "extra-usage",
-          "files",
           "heapdump",
           "init",
-          "insights",
           "install-slack-app",
           "local-models",
-          "output-style",
-          "pr-comments",
           "proxy",
           "release-notes",
-          "review",
-          "security-review",
           "smallmodel",
-          "statusline",
           "terminal-setup",
           "vision"
         ],
         "coverage": {
-          "ownership": { "status": "verified", "evidence": ["rust.catalog_dispatch", "ts.catalog_projection"] },
+          "ownership": { "status": "verified", "evidence": ["rust.catalog_dispatch", "ts.catalog_projection", "ts.runtime_production_smoke"] },
           "discovery": { "status": "verified", "evidence": ["ts.catalog_projection", "ts.catalog_refresh", "rust.hidden_and_help"] },
-          "parsingDispatch": { "status": "verified", "evidence": ["rust.catalog_dispatch", "ts.slash_parser"] },
-          "success": { "status": "verified", "evidence": ["ts.runtime_general_lifecycle"], "note": "Verified at the admitted production handler boundary; external service business effects remain outside the direct TUI owner lifecycle." },
-          "failure": { "status": "verified", "evidence": ["ts.runtime_general_lifecycle"], "note": "Every real token and production execution kind projects an injected handler rejection without claiming coverage of external authority internals." },
-          "cancellation": { "status": "verified", "evidence": ["ts.runtime_general_lifecycle"], "note": "Every real token and production execution kind preserves cancellation truth at the admitted handler boundary." },
-          "terminalState": { "status": "verified", "evidence": ["ts.runtime_general_lifecycle"], "note": "Terminal status is verified for the direct TUI command transaction, not for downstream network or operating-system work." },
-          "rendering": { "status": "verified", "evidence": ["ts.runtime_general_lifecycle"], "note": "The token-specific stdout, stderr, or interruption projection entering the renderer is executable evidence; external UI is not inferred." },
-          "persistenceRecovery": { "status": "verified", "evidence": ["ts.runtime_general_lifecycle"], "note": "The token-specific TUI transcript projection is physically reloaded; external service state recovery is owned and tested by those services." }
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.catalog_dispatch", "rust.disable_slash_cli", "ts.slash_parser", "ts.runtime_general_lifecycle"] },
+          "success": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.clear_terminal"], "note": "Every actual command handler is loaded and invoked; external network, OS, and storage authorities are replaced only at their boundary." },
+          "failure": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.clear_terminal"], "note": "Actual handler fallback or thrown persistence/authority failure is exercised, including advisor no-split-brain, init onboarding-config rejection, and smallmodel write rejection." },
+          "cancellation": { "status": "not_applicable", "evidence": [], "note": "Each admitted operation is atomic at this command boundary and its underlying authority exposes no renderer-owned cancellation phase." },
+          "terminalState": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle", "ts.clear_terminal"], "note": "Actual success and failure truth is combined with the shared production terminal projection, not inferred from a fake business handler." },
+          "rendering": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle"], "note": "Actual bounded result text and the shared renderer-input mapping are both executable evidence." },
+          "persistenceRecovery": { "status": "verified", "evidence": ["ts.runtime_general_lifecycle"], "note": "The TUI transcript projection is physically reloaded; external authority state and recovery remain outside the renderer owner boundary." }
+        }
+      },
+      {
+        "id": "runtime_catalog_cancellable_builders",
+        "ownerClass": "runtimeCatalog",
+        "invocationTokens": [
+          "insights",
+          "security-review"
+        ],
+        "coverage": {
+          "ownership": { "status": "verified", "evidence": ["rust.catalog_dispatch", "ts.catalog_projection", "ts.runtime_production_smoke"] },
+          "discovery": { "status": "verified", "evidence": ["ts.catalog_projection", "ts.catalog_refresh", "rust.hidden_and_help"] },
+          "parsingDispatch": { "status": "verified", "evidence": ["rust.catalog_dispatch", "rust.disable_slash_cli", "ts.slash_parser", "ts.runtime_general_lifecycle"] },
+          "success": { "status": "verified", "evidence": ["ts.runtime_production_smoke"], "note": "The real builders execute through isolated filesystem/model or shell authority seams." },
+          "failure": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle"], "note": "Actual model/shell authority rejection reaches the production builder and shared terminal error mapping." },
+          "cancellation": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle"], "note": "Insights checks pre-phase and inter-phase abort boundaries; security-review propagates an authority AbortError into the production cancelled terminal." },
+          "terminalState": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle"] },
+          "rendering": { "status": "verified", "evidence": ["ts.runtime_production_smoke", "ts.runtime_general_lifecycle"] },
+          "persistenceRecovery": { "status": "verified", "evidence": ["ts.runtime_general_lifecycle"], "note": "The TUI transcript projection is physically reloaded; generated report files and shell effects belong to their external authorities." }
         }
       },
       {

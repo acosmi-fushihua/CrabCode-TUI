@@ -43,11 +43,18 @@ const call: LocalCommandCall = async (args, context) => {
 
   if (arg === 'unset' || arg === 'off') {
     const prev = context.getAppState().advisorModel
+    const { error } = updateSettingsForSource('userSettings', {
+      advisorModel: undefined,
+    })
+    if (error) {
+      throw new Error(`Failed to disable advisor: ${error.message}`, {
+        cause: error,
+      })
+    }
     context.setAppState(s => {
       if (s.advisorModel === undefined) return s
       return { ...s, advisorModel: undefined }
     })
-    updateSettingsForSource('userSettings', { advisorModel: undefined })
     return {
       type: 'text',
       value: prev
@@ -75,11 +82,18 @@ const call: LocalCommandCall = async (args, context) => {
     }
   }
 
+  const { error: settingsError } = updateSettingsForSource('userSettings', {
+    advisorModel: normalizedModel,
+  })
+  if (settingsError) {
+    throw new Error(`Failed to set advisor: ${settingsError.message}`, {
+      cause: settingsError,
+    })
+  }
   context.setAppState(s => {
     if (s.advisorModel === normalizedModel) return s
     return { ...s, advisorModel: normalizedModel }
   })
-  updateSettingsForSource('userSettings', { advisorModel: normalizedModel })
 
   if (!modelSupportsAdvisor(baseModel)) {
     return {

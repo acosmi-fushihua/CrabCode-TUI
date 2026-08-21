@@ -1,7 +1,14 @@
 import { describe, expect, setDefaultTimeout, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
 const FIXTURE = join(
@@ -27,6 +34,8 @@ async function runFixture(mode: string): Promise<FixtureEvidence> {
   const auditRoot = mkdtempSync(join(tmpdir(), 'crabcode-compact-history-'))
   const configDir = join(auditRoot, 'config')
   const homeDir = join(auditRoot, 'home')
+  const outputPath = join(auditRoot, 'evidence.json')
+  const errorPath = join(auditRoot, 'fixture.stderr')
   mkdirSync(configDir, { recursive: true })
   mkdirSync(homeDir, { recursive: true })
   writeFileSync(
@@ -52,18 +61,13 @@ async function runFixture(mode: string): Promise<FixtureEvidence> {
         DISABLE_BACKGROUND_TASKS: '1',
         DIRECT_TUI_COMPACT_HISTORY_MODE: mode,
       },
-      stdout: 'pipe',
-      stderr: 'pipe',
+      stdout: Bun.file(outputPath),
+      stderr: Bun.file(errorPath),
     })
-    const [exitCode, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ])
+    const exitCode = await child.exited
+    const stderr = readFileSync(errorPath, 'utf8')
     expect(exitCode, stderr).toBe(0)
-    return JSON.parse(
-      stdout.trim().split('\n').at(-1) ?? '',
-    ) as FixtureEvidence
+    return await readLastJsonEvidence<FixtureEvidence>(outputPath)
   } finally {
     rmSync(auditRoot, { recursive: true, force: true })
   }

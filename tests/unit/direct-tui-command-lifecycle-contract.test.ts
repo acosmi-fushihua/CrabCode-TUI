@@ -1,4 +1,6 @@
 import { describe, expect, setDefaultTimeout, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
@@ -50,17 +52,78 @@ type AuditReport = {
   status: 'verified' | 'incomplete' | 'unverified'
 }
 
-function runVerifier(...args: string[]): ReturnType<typeof Bun.spawnSync> {
-  return Bun.spawnSync({
-    cmd: [process.execPath, VERIFIER, ...args],
-    cwd: REPO_ROOT,
-    env: process.env,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
+type VerifierResult = Omit<
+  ReturnType<typeof Bun.spawnSync>,
+  'stdout' | 'stderr'
+> & {
+  stdout: Buffer
+  stderr: Buffer
+}
+
+function runVerifier(...args: string[]): VerifierResult {
+  return runVerifierWithEnv({}, ...args)
+}
+
+function runVerifierWithEnv(
+  environment: Record<string, string>,
+  ...args: string[]
+): VerifierResult {
+  const childEnvironment = {
+    ...process.env,
+  }
+  delete childEnvironment.CRABCODE_COMMAND_REFERENCE_REQUIRED
+  delete childEnvironment.CRABCODE_COMMAND_REFERENCE_TEST_REPOSITORY
+  Object.assign(childEnvironment, environment)
+
+  const outputRoot = mkdtempSync(join(tmpdir(), 'crabcode-verifier-output-'))
+  const stdoutPath = join(outputRoot, 'stdout')
+  const stderrPath = join(outputRoot, 'stderr')
+  try {
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, VERIFIER, ...args],
+      cwd: REPO_ROOT,
+      env: childEnvironment,
+      stdout: Bun.file(stdoutPath),
+      stderr: Bun.file(stderrPath),
+    })
+    return {
+      ...result,
+      stdout: readFileSync(stdoutPath),
+      stderr: readFileSync(stderrPath),
+    }
+  } finally {
+    rmSync(outputRoot, { recursive: true, force: true })
+  }
 }
 
 describe('direct TUI command full-lifecycle capability contract', () => {
+  test('keeps optional reference checks hermetic and explicit live checks fail-closed', () => {
+    const testReferenceEnvironment = {
+      NODE_ENV: 'test',
+      CRABCODE_COMMAND_REFERENCE_TEST_REPOSITORY: REPO_ROOT,
+    }
+    const ordinary = runVerifierWithEnv(
+      testReferenceEnvironment,
+      '--report',
+    )
+    expect(ordinary.exitCode, ordinary.stderr.toString()).toBe(0)
+    expect(JSON.parse(ordinary.stdout.toString()).referenceStatus).toBe(
+      'snapshot_only',
+    )
+
+    const required = runVerifierWithEnv(
+      {
+        ...testReferenceEnvironment,
+        CRABCODE_COMMAND_REFERENCE_REQUIRED: '1',
+      },
+      '--report',
+    )
+    expect(required.exitCode).not.toBe(0)
+    expect(required.stderr.toString()).toContain(
+      'required pinned reference source is unavailable',
+    )
+  })
+
   test('expands every reference and extension token to one owner and nine lifecycle statuses', () => {
     const result = runVerifier('--report')
     expect(result.exitCode, result.stderr.toString()).toBe(0)
@@ -73,7 +136,7 @@ describe('direct TUI command full-lifecycle capability contract', () => {
       status: 'verified',
       lifecycle: {
         knownTokens: 104,
-        profiles: 19,
+        profiles: 21,
         dimensions: 9,
         coverageCells: 936,
       },
@@ -194,6 +257,42 @@ describe('direct TUI command full-lifecycle capability contract', () => {
     expect(rejected.exitCode).not.toBe(0)
     expect(rejected.stderr.toString()).toContain(
       'does not execute referenced marker',
+    )
+
+    const missingAggregate = runVerifier(
+      '--require-complete',
+      '--test-inject-missing-rust-aggregate-test',
+    )
+    expect(missingAggregate.exitCode).not.toBe(0)
+    expect(missingAggregate.stderr.toString()).toContain(
+      'did not execute exactly once',
+    )
+
+    const missingTerminal = runVerifier(
+      '--require-complete',
+      '--test-inject-missing-terminal-test',
+    )
+    expect(missingTerminal.exitCode).not.toBe(0)
+    expect(missingTerminal.stderr.toString()).toContain(
+      'did not execute exactly once',
+    )
+
+    const missingBunTest = runVerifier(
+      '--require-complete',
+      '--test-inject-missing-bun-test',
+    )
+    expect(missingBunTest.exitCode).not.toBe(0)
+    expect(missingBunTest.stderr.toString()).toContain(
+      'did not execute exactly once as a passing test',
+    )
+
+    const skippedBunTest = runVerifier(
+      '--require-complete',
+      '--test-inject-skipped-bun-result',
+    )
+    expect(skippedBunTest.exitCode).not.toBe(0)
+    expect(skippedBunTest.stderr.toString()).toContain(
+      'passes=0 skipped=true',
     )
 
     const result = runVerifier('--require-complete')

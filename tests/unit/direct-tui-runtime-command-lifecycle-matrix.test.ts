@@ -71,6 +71,10 @@ function commandForOutcome(
   token: string,
   outcome: LifecycleOutcome,
 ): Command {
+  // Deliberately replace only the admitted handler. This matrix proves the
+  // shared production dispatcher/terminal/transcript machinery for each real
+  // token and execution kind; command-specific business execution is owned by
+  // direct-tui-runtime-command-production-smoke.test.ts.
   const marker = `${outcome}:${token}`
   if (definition.type === 'local') {
     return cloneCommand(definition, {
@@ -191,7 +195,7 @@ describe('direct TUI runtime command token-complete lifecycle matrix', () => {
     ).toBe(true)
   })
 
-  test('exercises success, failure, cancellation, terminal truth, and render input for all 19 tokens', async () => {
+  test('exercises shared executor outcomes and terminal projection for all 19 real tokens', async () => {
     for (const token of RUNTIME_GENERAL_TOKENS) {
       const definition = byToken.get(token)
       if (!definition) throw new Error(`missing production owner for /${token}`)
@@ -241,7 +245,7 @@ describe('direct TUI runtime command token-complete lifecycle matrix', () => {
     }
   })
 
-  test('round-trips every token-specific success projection through the physical transcript loader', async () => {
+  test('round-trips every shared executor token projection through the physical transcript loader', async () => {
     const auditRoot = mkdtempSync(join(tmpdir(), 'direct-tui-lifecycle-'))
     const transcript = join(auditRoot, 'lifecycle.jsonl')
     const sessionId = '11111111-1111-4111-8111-111111111111'

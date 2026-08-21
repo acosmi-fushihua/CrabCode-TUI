@@ -31,14 +31,28 @@ export function executeSmallModelCommand(
   }
 
   if (model === 'default' || model === 'reset' || model === 'clear') {
-    updateSettingsForSource('userSettings', { smallModel: undefined })
+    const { error } = updateSettingsForSource('userSettings', {
+      smallModel: undefined,
+    })
+    if (error) {
+      throw new Error(`Failed to reset small model: ${error.message}`, {
+        cause: error,
+      })
+    }
     return {
       type: 'text',
       value: `Small model reset to SDK default (${chalk.bold(getSmallFastModel() || 'auto')})`,
     }
   }
 
-  updateSettingsForSource('userSettings', { smallModel: model })
+  const { error } = updateSettingsForSource('userSettings', {
+    smallModel: model,
+  })
+  if (error) {
+    throw new Error(`Failed to set small model: ${error.message}`, {
+      cause: error,
+    })
+  }
   logEvent('tengu_smallmodel_set', {})
   return {
     type: 'text',

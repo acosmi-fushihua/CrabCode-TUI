@@ -21,7 +21,10 @@ import {
   installDirectTuiCommandSurface,
   installHeadlessCommandSurface,
 } from 'src/cli/headlessCommands.js'
-import { projectCommandCatalogEntries } from 'src/cli/commandCatalogProjection.js'
+import {
+  projectCommandCatalogEntries,
+  projectDirectTuiCommandCatalogEntries,
+} from 'src/cli/commandCatalogProjection.js'
 import {
   DirectTuiCommandCatalogLifecycle,
   DirectTuiCommandCatalogPublisher,
@@ -31,6 +34,11 @@ import {
   shouldRegisterSdkHookEventHandler,
   shouldTransformStreamOutput,
 } from 'src/cli/print/streamOutputPolicy.js'
+import {
+  commandInventoryForRoute,
+  commandLoaderForRoute,
+  executableCommandInventoryForRoute,
+} from './slashCommandRoutePolicy.js'
 import { installStreamJsonStdoutGuard } from 'src/utils/streamJsonStdoutGuard.js'
 import type { ToolPermissionContext } from 'src/Tool.js'
 import type { ThinkingConfig } from 'src/utils/thinking.js'
@@ -261,6 +269,8 @@ import {
   connectToServer,
   clearServerCache,
   clearMcpAuthCache,
+  evictExistingServerCache,
+  getServerCacheKey,
   fetchToolsForClient,
   areMcpConfigsEqual,
   reconnectMcpServerImpl,
@@ -276,7 +286,10 @@ import {
   isMcpServerDisabled,
   setMcpServerEnabled,
 } from 'src/services/mcp/config.js'
-import { performMCPOAuthFlow } from 'src/services/mcp/auth.js'
+import {
+  getServerKey,
+  performMCPOAuthFlow,
+} from 'src/services/mcp/auth.js'
 import { clearMcpAuthenticationRuntime } from 'src/services/mcp/mcpAuthClearRuntime.js'
 import {
   runElicitationHooks,
@@ -409,9 +422,22 @@ import { isExtractModeActive } from '../../memdir/paths.js'
 // Sub-module imports (refactored from this file)
 import {
   type DynamicMcpState,
+  createMcpMutationLane,
   handleMcpSetServers,
-  reconcileMcpServers,
+  partitionStartupProcessMcpState,
+  toScopedConfig,
 } from './mcpServerManagement.js'
+import {
+  DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+  canCommitDirectMcpOAuthGeneration,
+  type McpProcessOwner,
+  filterMcpServersForOwner,
+  isDirectTuiSdkMcpInventoryRecord,
+  orderMcpServersByPrecedence,
+  planCapturedMcpPolicyTransitions,
+  preservePublicProcessDesiredAcrossSdkRejections,
+  prepareMcpServersForOwner,
+} from './mcpServerOwnership.js'
 import {
   createCanUseToolWithPermissionPrompt,
   getCanUseToolFn,
@@ -432,6 +458,7 @@ import {
   handleInitializeRequest,
   handleRewindFiles,
   refreshControlAuthCatalog,
+  withCurrentControlAuthCommandCatalog,
   handleSetPermissionMode,
   handleChannelEnable,
   reregisterChannelHandlerAfterReconnect,
@@ -560,6 +587,21 @@ export interface RunHeadlessOptions {
   enableAuthStatus: boolean | undefined
   agent: string | undefined
   workload: string | undefined
+  /** Persistently disables direct-TUI slash discovery and dispatch. */
+  disableSlashCommands?: boolean
+  /** Direct runtime AppState subscription used for live MCP command catalogs. */
+  subscribeAppState?: (listener: () => void) => () => void
+  /** Names sourced only from this direct TUI's --mcp-config arguments. */
+  startupSessionMcpServerNames?: readonly string[]
+  /** Raw process configs from --mcp-config, retained for policy revalidation. */
+  startupSessionMcpServers?: Readonly<Record<string, ScopedMcpServerConfig>>
+  /** Fixed session configs initially inactive by policy or disabled settings. */
+  startupPolicyBlockedMcpServerNames?: ReadonlySet<string> | readonly string[]
+  /** Late fixed-owner discovery is admitted inside the direct MCP mutation lane. */
+  lateFixedMcpConfig?: Promise<{
+    name: string
+    config: ScopedMcpServerConfig
+  } | null>
   /** Direct TUI tasks mode; storage and locking remain owned by tasks.ts. */
   taskListId?: string | undefined
   setupTrigger?: 'init' | 'maintenance' | undefined
@@ -612,6 +654,7 @@ export async function runHeadlessDirectTui(
     sessionTitleGenerator: generateSessionTitleDirect,
   }
   const directArgs = [...args.slice(0, 7), options] as RunHeadlessArguments
+  const slashCommandsEnabled = options.disableSlashCommands !== true
   await runHeadlessCore(...directArgs, {
     processOwnedAccountBridge: true,
     tasksMode: true,
@@ -619,7 +662,11 @@ export async function runHeadlessDirectTui(
     allowDirectTuiBashContentBlocks: true,
     querySource: getQuerySourceForREPL(),
     directQueryEventDelivery: true,
-    commandLoader: getDirectTuiCommands,
+    slashCommandsEnabled,
+    commandLoader: commandLoaderForRoute(
+      slashCommandsEnabled,
+      getDirectTuiCommands,
+    ),
   })
 }
 
@@ -634,6 +681,7 @@ export async function runHeadlessStandardRoute(
     allowDirectTuiBashContentBlocks: false,
     querySource: 'sdk',
     directQueryEventDelivery: false,
+    slashCommandsEnabled: true,
     commandLoader: getHeadlessCommands,
   })
 }
@@ -645,6 +693,7 @@ type HeadlessRoutePolicy = {
   allowDirectTuiBashContentBlocks: boolean
   querySource: QuerySource
   directQueryEventDelivery: boolean
+  slashCommandsEnabled: boolean
   commandLoader: (cwd: string) => Promise<Command[]>
 }
 
@@ -681,25 +730,63 @@ async function runHeadlessCore(
     feature('DOWNLOAD_USER_SETTINGS') &&
     isEnvTruthy(process.env.CRABCODE_REMOTE)
   ) {
-    void downloadUserSettings()
+    const startupUserSettings = downloadUserSettings()
+    if (routePolicy.directQueryEventDelivery) {
+      void startupUserSettings
+        .then(applied => {
+          // Startup download writes are intentionally hidden from filesystem
+          // watchers. Direct mode still needs the normal settings authority to
+          // reset caches/AppState and either mark an early catalog catch-up or
+          // publish a late reverse refresh. Standard keeps its old behavior.
+          if (applied) settingsChangeDetector.notifyChange('userSettings')
+        })
+        .catch(error => logError(error))
+    } else {
+      void startupUserSettings
+    }
   }
 
   // In headless mode there is no React tree, so the useSettingsChange hook
   // never runs. Subscribe directly so that settings changes (including
   // managed-settings / policy updates) are fully applied.
-  settingsChangeDetector.subscribe(source => {
-    applySettingsChange(source, setAppState)
+  let headlessSettingsClosed = false
+  let pendingSettingsMcpReconcile = false
+  let queueSettingsMcpReconcile: (() => void) | undefined
+  const unsubscribeHeadlessSettingsChanges = settingsChangeDetector.subscribe(
+    source => {
+      if (headlessSettingsClosed) return
+      applySettingsChange(source, setAppState)
 
-    // In headless mode, also sync the denormalized fastMode field from
-    // settings. The TUI manages fastMode via the UI so it skips this.
-    if (isFastModeEnabled()) {
-      setAppState(prev => {
-        const s = prev.settings as Record<string, unknown>
-        const fastMode = s.fastMode === true && !s.fastModePerSessionOptIn
-        return { ...prev, fastMode }
-      })
+      if (routePolicy.directQueryEventDelivery) {
+        if (queueSettingsMcpReconcile) queueSettingsMcpReconcile()
+        else pendingSettingsMcpReconcile = true
+      }
+
+      // In headless mode, also sync the denormalized fastMode field from
+      // settings. The TUI manages fastMode via the UI so it skips this.
+      if (isFastModeEnabled()) {
+        setAppState(prev => {
+          const s = prev.settings as Record<string, unknown>
+          const fastMode = s.fastMode === true && !s.fastModePerSessionOptIn
+          return { ...prev, fastMode }
+        })
+      }
+    },
+  )
+  const installSettingsMcpReconcile = (listener: () => void): void => {
+    if (headlessSettingsClosed) return
+    queueSettingsMcpReconcile = listener
+    if (pendingSettingsMcpReconcile) {
+      pendingSettingsMcpReconcile = false
+      listener()
     }
-  })
+  }
+  const closeHeadlessSettings = (): void => {
+    if (headlessSettingsClosed) return
+    headlessSettingsClosed = true
+    queueSettingsMcpReconcile = undefined
+    unsubscribeHeadlessSettingsChanges()
+  }
 
   // Proactive activation is now handled in main.tsx before getTools() so
   // SleepTool passes isEnabled() filtering. This fallback covers the case
@@ -1046,10 +1133,21 @@ async function runHeadlessCore(
       : null
 
   headlessProfilerCheckpoint('before_runHeadlessStreaming')
+  // Keep the direct runtime registry free of MCP commands. MCP is live
+  // AppState data and is combined at the catalog/dispatch read boundary below;
+  // retaining an initial MCP snapshot here would make later disconnects stale.
+  // The standard SDK route keeps its established initial merged registry.
+  const initialStreamingCommands = routePolicy.directQueryEventDelivery
+    ? commandInventoryForRoute(routePolicy.slashCommandsEnabled, commands)
+    : commandInventoryForRoute(
+        routePolicy.slashCommandsEnabled,
+        commands,
+        appState.mcp.commands,
+      )
   for await (const message of runHeadlessStreaming(
     structuredIO,
     appState.mcp.clients,
-    [...commands, ...appState.mcp.commands],
+    initialStreamingCommands,
     filteredTools,
     initialMessages,
     canUseTool,
@@ -1058,7 +1156,11 @@ async function runHeadlessCore(
     getAppState,
     setAppState,
     agents,
-    options,
+    {
+      ...options,
+      installSettingsMcpReconcile,
+      closeHeadlessSettings,
+    },
     generateSessionTitle,
     routePolicy,
     turnInterruptionState,
@@ -1207,6 +1309,16 @@ function runHeadlessStreaming(
     promptSuggestions?: boolean | undefined
     workload?: string | undefined
     taskListId?: string | undefined
+    subscribeAppState?: (listener: () => void) => () => void
+    startupSessionMcpServerNames?: readonly string[]
+    startupSessionMcpServers?: Readonly<Record<string, ScopedMcpServerConfig>>
+    startupPolicyBlockedMcpServerNames?: ReadonlySet<string> | readonly string[]
+    lateFixedMcpConfig?: Promise<{
+      name: string
+      config: ScopedMcpServerConfig
+    } | null>
+    installSettingsMcpReconcile?: (listener: () => void) => void
+    closeHeadlessSettings?: () => void
   },
   generateSessionTitle: NonNullable<
     RunHeadlessOptions['sessionTitleGenerator']
@@ -1512,6 +1624,17 @@ function runHeadlessStreaming(
     }
   }
 
+  const separateProcessMcpOwners = routePolicy.directQueryEventDelivery
+  const startupSessionMcpServerNames = separateProcessMcpOwners
+    ? new Set<string>(options.startupSessionMcpServerNames ?? [])
+    : new Set<string>()
+  const startupSessionMcpServers = separateProcessMcpOwners
+    ? (options.startupSessionMcpServers ?? {})
+    : {}
+  const startupPolicyBlockedMcpServerNames = separateProcessMcpOwners
+    ? (options.startupPolicyBlockedMcpServerNames ?? [])
+    : ([] as const)
+
   // Cache SDK MCP clients to avoid reconnecting on each run
   let sdkClients: MCPServerConnection[] = []
   let sdkTools: Tools = []
@@ -1675,7 +1798,6 @@ function runHeadlessStreaming(
     // a WS reconnect race) stays failed forever — its name satisfies the
     // connectedServerNames diff but it contributes zero tools.
     const hasFailedSdkClients = sdkClients.some(c => c.type === 'failed')
-
     const haveServersChanged =
       hasNewServers ||
       hasRemovedServers ||
@@ -1683,16 +1805,17 @@ function runHeadlessStreaming(
       hasFailedSdkClients
 
     if (haveServersChanged) {
-      // Clean up removed servers
+      // Clean up clients for removed SDK MCP servers
       for (const client of sdkClients) {
-        if (!currentServerNames.has(client.name)) {
-          if (client.type === 'connected') {
-            await client.cleanup()
-          }
+        if (
+          !currentServerNames.has(client.name) &&
+          client.type === 'connected'
+        ) {
+          await client.cleanup()
         }
       }
 
-      // Re-initialize all SDK MCP servers with current config
+      // Recreate SDK MCP clients with the current config
       const sdkSetup = await setupSdkMcpClients(
         sdkMcpConfigs,
         (serverName, message) =>
@@ -1704,9 +1827,12 @@ function runHeadlessStreaming(
       // Store SDK MCP tools in appState so subagents can access them via
       // assembleToolPool. Only tools are stored here — SDK clients are already
       // merged separately in the query loop (allMcpClients) and mcp_status handler.
-      // Use both old (connectedServerNames) and new (currentServerNames) to remove
-      // stale SDK tools when servers are added or removed.
-      const allSdkNames = uniq([...connectedServerNames, ...currentServerNames])
+      // Use both old (connectedServerNames) and new (currentServerNames) to
+      // remove stale SDK tools when servers are added or removed.
+      const allSdkNames = uniq([
+        ...connectedServerNames,
+        ...currentServerNames,
+      ])
       setAppState(prev => ({
         ...prev,
         mcp: {
@@ -1730,17 +1856,61 @@ function runHeadlessStreaming(
 
   void updateSdkMcp()
 
-  // State for dynamically added MCP servers (via mcp_set_servers control message)
-  // These are separate from SDK MCP servers and support all transport types
-  let dynamicMcpState: DynamicMcpState = {
+  const emptyProcessMcpState = (): DynamicMcpState => ({
     clients: [],
     tools: [],
     configs: {},
+  })
+  const startupProcessMcp = routePolicy.directQueryEventDelivery
+    ? partitionStartupProcessMcpState(
+        mcpClients,
+        tools,
+        startupSessionMcpServerNames,
+      )
+    : null
+  let pluginProcessMcpState =
+    startupProcessMcp?.dynamicState ?? emptyProcessMcpState()
+  let dynamicMcpState = emptyProcessMcpState()
+  let publicProcessMcpDesired: Record<
+    string,
+    McpServerConfigForProcessTransport
+  > = {}
+  const directControlDisabledMcpNames = new Set<string>()
+  const startupSessionProcessMcpNames = new Set([
+    ...startupSessionMcpServerNames,
+    ...startupPolicyBlockedMcpServerNames,
+  ])
+  const startupSessionProcessMcpConfigs: Record<
+    string,
+    ScopedMcpServerConfig
+  > = { ...startupSessionMcpServers }
+  const policyBlockedSessionMcpNames = new Set<string>()
+  const observedStartupInactiveMcpNames = new Set<string>()
+  const syncCapturedFixedMcpConfigs = (): void => {
+    for (const [name, config] of Object.entries(startupSessionMcpServers)) {
+      startupSessionProcessMcpConfigs[name] = config
+      startupSessionProcessMcpNames.add(name)
+    }
+    for (const name of startupPolicyBlockedMcpServerNames) {
+      if (observedStartupInactiveMcpNames.has(name)) continue
+      observedStartupInactiveMcpNames.add(name)
+      policyBlockedSessionMcpNames.add(name)
+      startupSessionProcessMcpNames.add(name)
+    }
+  }
+  syncCapturedFixedMcpConfigs()
+  for (const name of Object.keys(startupSessionProcessMcpConfigs)) {
+    if (isMcpServerDisabled(name)) {
+      directControlDisabledMcpNames.add(name)
+    }
+  }
+  if (startupProcessMcp) {
+    mcpClients = startupProcessMcp.remainingClients
   }
   // The original tool argument may already contain MCP tools. Keep a mutable
   // headless pool so a later control-plane disable removes them from the next
   // model turn instead of leaving an immutable first-wins copy behind.
-  let headlessTools = tools
+  let headlessTools = startupProcessMcp?.remainingTools ?? tools
 
   const upsertConnection = (
     clients: MCPServerConnection[],
@@ -1756,14 +1926,21 @@ function runHeadlessStreaming(
     nextTools: Tools = [],
   ): void => {
     const prefix = getMcpPrefix(serverName)
-    headlessTools = [
-      ...headlessTools.filter(tool => !tool.name?.startsWith(prefix)),
-      ...nextTools,
-    ]
-    const isSdk = sdkClients.some(existing => existing.name === serverName)
-    const isDynamic =
-      dynamicMcpState.clients.some(existing => existing.name === serverName) ||
-      serverName in dynamicMcpState.configs
+    const isSdk = separateProcessMcpOwners
+      ? serverName in sdkMcpConfigs
+      : sdkClients.some(existing => existing.name === serverName)
+    const isDynamic = serverName in dynamicMcpState.configs
+    const isPluginProcess = serverName in pluginProcessMcpState.configs
+    const updateOwnedState = (state: DynamicMcpState): DynamicMcpState => ({
+      ...state,
+      clients: client
+        ? upsertConnection(state.clients, client)
+        : state.clients.filter(existing => existing.name !== serverName),
+      tools: [
+        ...state.tools.filter(tool => !tool.name?.startsWith(prefix)),
+        ...nextTools,
+      ],
+    })
     if (isSdk) {
       sdkClients = client
         ? upsertConnection(sdkClients, client)
@@ -1773,30 +1950,95 @@ function runHeadlessStreaming(
         ...nextTools,
       ]
     } else if (isDynamic) {
-      dynamicMcpState = {
-        ...dynamicMcpState,
-        clients: client
-          ? upsertConnection(dynamicMcpState.clients, client)
-          : dynamicMcpState.clients.filter(
-              existing => existing.name !== serverName,
-            ),
-        tools: [
-          ...dynamicMcpState.tools.filter(
-            tool => !tool.name?.startsWith(prefix),
-          ),
-          ...nextTools,
-        ],
-      }
+      dynamicMcpState = updateOwnedState(dynamicMcpState)
+    } else if (isPluginProcess) {
+      pluginProcessMcpState = updateOwnedState(pluginProcessMcpState)
     } else {
+      headlessTools = [
+        ...headlessTools.filter(tool => !tool.name?.startsWith(prefix)),
+        ...nextTools,
+      ]
       mcpClients = client
         ? upsertConnection(mcpClients, client)
         : mcpClients.filter(existing => existing.name !== serverName)
     }
   }
 
+  const commandOwnedByMcpServer = (
+    command: Command,
+    serverName: string,
+  ): boolean =>
+    (command.isMcp === true ||
+      (command.type === 'prompt' && command.loadedFrom === 'mcp')) &&
+    commandBelongsToServer(command, serverName)
+
+  const clearDirectMcpProjection = (serverName: string): void => {
+    const prefix = getMcpPrefix(serverName)
+    syncHeadlessMcpRuntime(serverName, null)
+    setAppState(prev => ({
+      ...prev,
+      mcp: {
+        ...prev.mcp,
+        clients: prev.mcp.clients.filter(client => client.name !== serverName),
+        tools: reject(prev.mcp.tools, tool => tool.name?.startsWith(prefix)),
+        commands: reject(prev.mcp.commands, command =>
+          commandOwnedByMcpServer(command, serverName),
+        ),
+        resources: omit(prev.mcp.resources, serverName),
+      },
+    }))
+  }
+
+  const commitDirectMcpReconnect = (
+    serverName: string,
+    result: Awaited<ReturnType<typeof reconnectMcpServerImpl>>,
+    ownedConfig?: DirectOwnedMcpTarget,
+  ): void => {
+    const prefix = getMcpPrefix(serverName)
+    if (ownedConfig?.owner === 'public') {
+      dynamicMcpState = {
+        ...dynamicMcpState,
+        configs: {
+          ...dynamicMcpState.configs,
+          [serverName]: ownedConfig.config,
+        },
+      }
+    } else if (ownedConfig?.owner === 'plugin') {
+      pluginProcessMcpState = {
+        ...pluginProcessMcpState,
+        configs: {
+          ...pluginProcessMcpState.configs,
+          [serverName]: ownedConfig.config,
+        },
+      }
+    }
+    syncHeadlessMcpRuntime(serverName, result.client, result.tools)
+    setAppState(prev => ({
+      ...prev,
+      mcp: {
+        ...prev.mcp,
+        clients: upsertConnection(prev.mcp.clients, result.client),
+        tools: [
+          ...reject(prev.mcp.tools, tool => tool.name?.startsWith(prefix)),
+          ...result.tools,
+        ],
+        commands: [
+          ...reject(prev.mcp.commands, command =>
+            commandOwnedByMcpServer(command, serverName),
+          ),
+          ...result.commands,
+        ],
+        resources:
+          result.resources && result.resources.length > 0
+            ? { ...prev.mcp.resources, [serverName]: result.resources }
+            : omit(prev.mcp.resources, serverName),
+      },
+    }))
+  }
+
   // Shared tool assembly for ask() and the get_context_usage control request.
-  // Closes over the mutable sdkTools/dynamicMcpState bindings so both call
-  // sites see late-connecting servers.
+  // Closes over every mutable MCP owner so both call sites see late-connecting
+  // servers without letting one desired-set lifecycle erase another.
   const buildAllTools = (appState: AppState): Tools => {
     const assembledTools = assembleToolPool(
       appState.toolPermissionContext,
@@ -1804,7 +2046,12 @@ function runHeadlessStreaming(
     )
     let allTools = uniqBy(
       mergeAndFilterTools(
-        [...headlessTools, ...sdkTools, ...dynamicMcpState.tools],
+        [
+          ...headlessTools,
+          ...sdkTools,
+          ...dynamicMcpState.tools,
+          ...pluginProcessMcpState.tools,
+        ],
         assembledTools,
         appState.toolPermissionContext.mode,
       ),
@@ -1825,42 +2072,191 @@ function runHeadlessStreaming(
     return allTools
   }
 
-  // Helper to apply MCP server changes - used by both mcp_set_servers control message
-  // and background plugin installation.
-  // NOTE: Nested function required - mutates closure state (sdkMcpConfigs, sdkClients, etc.)
-  let mcpChangesPromise: Promise<{
-    response: SDKControlMcpSetServersResponse
-    sdkServersChanged: boolean
-  }> = Promise.resolve({
-    response: {
-      added: [] as string[],
-      removed: [] as string[],
-      errors: {} as Record<string, string>,
-    },
-    sdkServersChanged: false,
-  })
+  // Helper to apply MCP server changes for one explicit process-server owner.
+  // Direct TUI separates public and plugin process ownership; the standard SDK
+  // route retains its historical shared desired set.
+  const activeOAuthFlows = new Map<string, AbortController>()
+  const oauthCallbackSubmitters = new Map<
+    string,
+    (callbackUrl: string) => void
+  >()
+  const oauthManualCallbackUsed = new Set<string>()
+  const oauthAuthPromises = new Map<string, Promise<void>>()
+  const invalidateActiveMcpOAuthFlow = (serverName: string): void => {
+    activeOAuthFlows.get(serverName)?.abort()
+    activeOAuthFlows.delete(serverName)
+    oauthCallbackSubmitters.delete(serverName)
+    oauthManualCallbackUsed.delete(serverName)
+    oauthAuthPromises.delete(serverName)
+  }
+  const serializeMcpMutation = createMcpMutationLane()
+  const runDirectMcpMutation = <T>(work: () => Promise<T>): Promise<T> =>
+    separateProcessMcpOwners ? serializeMcpMutation(work) : work()
 
   function applyMcpServerChanges(
+    owner: McpProcessOwner,
     servers: Record<string, McpServerConfigForProcessTransport>,
+    alreadySerialized = false,
+    commitPublicDesired = owner === 'public',
   ): Promise<{
     response: SDKControlMcpSetServersResponse
     sdkServersChanged: boolean
   }> {
+    const requestedServers = separateProcessMcpOwners
+      ? structuredClone(servers)
+      : servers
     // Serialize calls to prevent race conditions between concurrent callers
     // (background plugin install and mcp_set_servers control messages)
     const doWork = async (): Promise<{
       response: SDKControlMcpSetServersResponse
       sdkServersChanged: boolean
     }> => {
+      const activeRequestedServers = separateProcessMcpOwners
+        ? Object.fromEntries(
+            Object.entries(requestedServers).filter(
+              ([name, config]) =>
+                config.type === 'sdk' ||
+                (owner === 'public' && commitPublicDesired) ||
+                !directControlDisabledMcpNames.has(name),
+            ),
+          )
+        : requestedServers
       const oldSdkClientNames = new Set(sdkClients.map(c => c.name))
+      const effectiveOwner = separateProcessMcpOwners ? owner : 'public'
+      const ownerState =
+        effectiveOwner === 'public' ? dynamicMcpState : pluginProcessMcpState
+      const otherOwnerState =
+        effectiveOwner === 'public' ? pluginProcessMcpState : dynamicMcpState
+      const publicSdkPreservation =
+        separateProcessMcpOwners && owner === 'public'
+          ? preservePublicProcessDesiredAcrossSdkRejections(
+              requestedServers,
+              publicProcessMcpDesired,
+              ownerState.configs,
+            )
+          : null
+      const managedOwnerNames = new Set([
+        ...Object.keys(dynamicMcpState.configs),
+        ...Object.keys(pluginProcessMcpState.configs),
+        ...Object.keys(sdkMcpConfigs),
+      ])
+      const fixedProcessOwnerNames = new Set(
+        [...mcpClients, ...getAppState().mcp.clients]
+          .map(client => client.name)
+          .filter(name => !managedOwnerNames.has(name)),
+      )
+      const ownership = separateProcessMcpOwners
+        ? prepareMcpServersForOwner(
+            owner,
+            activeRequestedServers,
+            new Set([
+              ...Object.keys(otherOwnerState.configs),
+              ...(owner === 'plugin'
+                ? Object.keys(publicProcessMcpDesired)
+                : []),
+            ]),
+            new Set([
+              ...startupSessionProcessMcpNames,
+              ...fixedProcessOwnerNames,
+            ]),
+          )
+        : {
+            reconciliationServers: activeRequestedServers,
+            errors: {},
+          }
+
+      // Public desired state and public executable state are different
+      // authorities. A disabled row remains a logical owner (so a later
+      // toggle-on can use the latest requested config and other owners cannot
+      // claim its namespace), but it must never reach the connector while the
+      // persisted disabled setting is authoritative.
+      const admittedPublicProcessServers =
+        separateProcessMcpOwners && owner === 'public'
+          ? { ...ownership.reconciliationServers }
+          : null
+
+      if (publicSdkPreservation) {
+        Object.assign(
+          ownership.reconciliationServers,
+          publicSdkPreservation.retained,
+        )
+      }
+      if (separateProcessMcpOwners && owner === 'public') {
+        for (const name of Object.keys(ownership.reconciliationServers)) {
+          if (
+            directControlDisabledMcpNames.has(name) ||
+            isMcpServerDisabled(name)
+          ) {
+            delete ownership.reconciliationServers[name]
+          }
+        }
+      }
+
+      if (separateProcessMcpOwners) {
+        for (const [name, currentConfig] of Object.entries(
+          ownerState.configs,
+        )) {
+          const desiredConfig = ownership.reconciliationServers[name]
+          const scopedDesired = desiredConfig
+            ? toScopedConfig(
+                desiredConfig,
+                owner === 'plugin',
+              )
+            : null
+          if (
+            !scopedDesired ||
+            !areMcpConfigsEqual(currentConfig, scopedDesired) ||
+            currentConfig.scope !== scopedDesired.scope
+          ) {
+            invalidateActiveMcpOAuthFlow(name)
+          }
+        }
+      }
 
       const result = await handleMcpSetServers(
-        servers,
+        ownership.reconciliationServers,
         { configs: sdkMcpConfigs, clients: sdkClients, tools: sdkTools },
-        dynamicMcpState,
+        ownerState,
         setAppState,
+        {
+          syncPromptCommands:
+            routePolicy.directQueryEventDelivery &&
+            routePolicy.slashCommandsEnabled,
+          syncResourceCleanup: routePolicy.directQueryEventDelivery,
+          strictWireNamespaceCleanup:
+            routePolicy.directQueryEventDelivery,
+          preserveDesiredScopes:
+            separateProcessMcpOwners && owner === 'plugin',
+        },
       )
-
+      if (publicSdkPreservation) {
+        if (commitPublicDesired) {
+          publicProcessMcpDesired = structuredClone(
+            Object.fromEntries(
+              Object.entries(publicSdkPreservation.desired).filter(
+                ([name]) =>
+                  (admittedPublicProcessServers !== null &&
+                    name in admittedPublicProcessServers) ||
+                  (requestedServers[name]?.type === 'sdk' &&
+                    name in publicSdkPreservation.desired) ||
+                  ownership.errors[name]?.startsWith(
+                    'Blocked by enterprise policy',
+                  ),
+              ),
+            ),
+          )
+          for (const name of Object.keys(admittedPublicProcessServers ?? {})) {
+            if (requestedServers[name]?.type === 'sdk') continue
+            if (isMcpServerDisabled(name)) {
+              // A public desired row submitted after startup can encounter a
+              // persisted disabled setting before any in-session toggle has
+              // seeded the marker. Preserve that authority so reconnect and
+              // OAuth cannot bypass the inert executable projection.
+              directControlDisabledMcpNames.add(name)
+            } else directControlDisabledMcpNames.delete(name)
+          }
+        }
+      }
       // Update SDK state (need to mutate sdkMcpConfigs since it's shared)
       for (const key of Object.keys(sdkMcpConfigs)) {
         delete sdkMcpConfigs[key]
@@ -1868,13 +2264,20 @@ function runHeadlessStreaming(
       Object.assign(sdkMcpConfigs, result.newSdkState.configs)
       sdkClients = result.newSdkState.clients
       sdkTools = result.newSdkState.tools
-      dynamicMcpState = result.newDynamicState
+      if (effectiveOwner === 'public') {
+        dynamicMcpState = result.newDynamicState
+      } else {
+        pluginProcessMcpState = result.newDynamicState
+      }
 
       // Keep appState.mcp.tools in sync so subagents can see SDK MCP tools.
       // Use both old and new SDK client names to remove stale tools.
       if (result.sdkServersChanged) {
         const newSdkClientNames = new Set(sdkClients.map(c => c.name))
-        const allSdkNames = uniq([...oldSdkClientNames, ...newSdkClientNames])
+        const allSdkNames = uniq([
+          ...oldSdkClientNames,
+          ...newSdkClientNames,
+        ])
         setAppState(prev => ({
           ...prev,
           mcp: {
@@ -1893,33 +2296,671 @@ function runHeadlessStreaming(
       }
 
       return {
-        response: result.response,
+        response: {
+          ...result.response,
+          errors: { ...result.response.errors, ...ownership.errors },
+        },
         sdkServersChanged: result.sdkServersChanged,
       }
     }
 
-    mcpChangesPromise = mcpChangesPromise.then(doWork, doWork)
-    return mcpChangesPromise
+    return alreadySerialized ? doWork() : serializeMcpMutation(doWork)
+  }
+
+  type DirectOwnedMcpTarget = {
+    owner: 'public' | 'plugin' | 'fixed'
+    config: ScopedMcpServerConfig
+  }
+  const getDirectOwnedMcpTarget = (
+    serverName: string,
+  ): DirectOwnedMcpTarget | null => {
+    if (!separateProcessMcpOwners) return null
+    const currentAppState = getAppState()
+    const publicConfig = dynamicMcpState.configs[serverName]
+    if (publicConfig) return { owner: 'public', config: publicConfig }
+    const pluginConfig = pluginProcessMcpState.configs[serverName]
+    if (pluginConfig) return { owner: 'plugin', config: pluginConfig }
+    const fixedConfig =
+      mcpClients.find(client => client.name === serverName)?.config ??
+      currentAppState.mcp.clients.find(client => client.name === serverName)
+        ?.config
+    if (fixedConfig) return { owner: 'fixed', config: fixedConfig }
+    const publicDesiredConfig = publicProcessMcpDesired[serverName]
+    if (publicDesiredConfig) {
+      return {
+        owner: 'public',
+        config: toScopedConfig(publicDesiredConfig),
+      }
+    }
+    const capturedFixedConfig = startupSessionProcessMcpConfigs[serverName]
+    return capturedFixedConfig
+      ? { owner: 'fixed', config: capturedFixedConfig }
+      : null
+  }
+
+  const directMcpTargetIsOwned = (serverName: string): boolean =>
+    getDirectOwnedMcpTarget(serverName) !== null
+
+  const directMcpTargetIsLive = (serverName: string): boolean => {
+    const currentAppState = getAppState()
+    return (
+      serverName in dynamicMcpState.configs ||
+      serverName in pluginProcessMcpState.configs ||
+      mcpClients.some(client => client.name === serverName) ||
+      currentAppState.mcp.clients.some(client => client.name === serverName)
+    )
+  }
+
+  const directMcpNameOwnershipError = (
+    serverName: string,
+    allowCapturedFixedSelf = false,
+  ): string | null => {
+    if (!separateProcessMcpOwners || directMcpTargetIsLive(serverName)) return null
+    const logicalTarget = getDirectOwnedMcpTarget(serverName)
+    const currentAppState = getAppState()
+    const liveOwnerNames = new Set([
+      ...Object.keys(dynamicMcpState.configs),
+      ...Object.keys(pluginProcessMcpState.configs),
+      ...Object.keys(publicProcessMcpDesired),
+      ...startupSessionProcessMcpNames,
+      ...mcpClients.map(client => client.name),
+      ...currentAppState.mcp.clients.map(client => client.name),
+    ])
+    if (allowCapturedFixedSelf || logicalTarget) {
+      liveOwnerNames.delete(serverName)
+    }
+    return (
+      filterMcpServersForOwner(
+        'plugin',
+        { [serverName]: true },
+        liveOwnerNames,
+      ).errors[serverName] ?? null
+    )
+  }
+
+  const directMcpControlAdmissionError = (
+    serverName: string,
+    config: ScopedMcpServerConfig,
+  ): string | null => {
+    if (!separateProcessMcpOwners) return null
+    if (config.type === 'sdk') return DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR
+
+    const policy = filterMcpServersByPolicy({ [serverName]: config })
+    if (policy.blocked.includes(serverName)) {
+      return 'Blocked by enterprise policy (allowedMcpServers/deniedMcpServers)'
+    }
+
+    // An already-live raw owner is reconnecting its own namespace. A static
+    // inventory row has no such authority and must be checked against every
+    // live owner before it may persist, authenticate, or connect.
+    return directMcpNameOwnershipError(serverName)
+  }
+
+  async function reconcileDirectSessionMcpPolicy(): Promise<void> {
+    if (!separateProcessMcpOwners || inputClosed) return
+    await runDirectMcpMutation(async () => {
+      if (inputClosed) return
+      syncCapturedFixedMcpConfigs()
+      const settingsControlledNames = new Set([
+        ...Object.keys(startupSessionProcessMcpConfigs),
+        ...Object.keys(publicProcessMcpDesired),
+      ])
+      for (const name of settingsControlledNames) {
+        if (isMcpServerDisabled(name)) {
+          directControlDisabledMcpNames.add(name)
+        } else {
+          directControlDisabledMcpNames.delete(name)
+        }
+      }
+      const { allowed } = filterMcpServersByPolicy(
+        startupSessionProcessMcpConfigs,
+      )
+      const runtimeAllowedNames = new Set(
+        Object.keys(allowed).filter(name => !isMcpServerDisabled(name)),
+      )
+      const transitions = planCapturedMcpPolicyTransitions(
+        startupSessionProcessMcpConfigs,
+        runtimeAllowedNames,
+        policyBlockedSessionMcpNames,
+        directControlDisabledMcpNames,
+      )
+
+      for (const serverName of transitions.toBlock) {
+        const config = startupSessionProcessMcpConfigs[serverName]
+        if (!config) continue
+        invalidateActiveMcpOAuthFlow(serverName)
+        await evictExistingServerCache(serverName, config)
+        clearDirectMcpProjection(serverName)
+        policyBlockedSessionMcpNames.add(serverName)
+      }
+
+      for (const serverName of transitions.toRestore) {
+        const config = startupSessionProcessMcpConfigs[serverName]
+        if (!config) continue
+
+        // A policy-blocked startup entry did not claim a wire namespace.
+        // Re-check the live namespace before restoring so a late allow cannot
+        // erase a server that legitimately occupied it in the meantime.
+        const ownershipError = directMcpNameOwnershipError(serverName, true)
+        if (ownershipError) {
+          logForDebugging(
+            `Refusing MCP restore after policy update for "${serverName}": ${ownershipError}`,
+            { level: 'warn' },
+          )
+          continue
+        }
+
+        const result = await reconnectMcpServerImpl(serverName, config)
+        commitDirectMcpReconnect(serverName, result)
+        policyBlockedSessionMcpNames.delete(serverName)
+        if (result.client.type === 'connected') {
+          registerElicitationHandlers([result.client])
+          reregisterChannelHandlerAfterReconnect(result.client)
+        }
+      }
+    })
+  }
+
+  async function admitLateFixedMcpConfig(candidate: {
+    name: string
+    config: ScopedMcpServerConfig
+  }): Promise<void> {
+    if (!separateProcessMcpOwners || inputClosed) return
+    await runDirectMcpMutation(async () => {
+      if (inputClosed) return
+      const { name, config } = candidate
+      if (config.type === 'sdk') {
+        logForDebugging(
+          `Ignoring late fixed MCP server "${name}": ${DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR}`,
+          { level: 'warn' },
+        )
+        return
+      }
+      const existingTarget = getDirectOwnedMcpTarget(name)
+      if (existingTarget) {
+        logForDebugging(
+          `Ignoring late fixed MCP server "${name}": already owned by the ${existingTarget.owner} lifecycle`,
+          { level: 'warn' },
+        )
+        return
+      }
+      const currentAppState = getAppState()
+      const ownership = filterMcpServersForOwner(
+        'plugin',
+        { [name]: config },
+        new Set([
+          ...Object.keys(dynamicMcpState.configs),
+          ...Object.keys(pluginProcessMcpState.configs),
+          ...Object.keys(publicProcessMcpDesired),
+          ...startupSessionProcessMcpNames,
+          ...mcpClients.map(client => client.name),
+          ...currentAppState.mcp.clients.map(client => client.name),
+        ]),
+      )
+      if (ownership.errors[name]) {
+        logForDebugging(
+          `Ignoring late fixed MCP server "${name}": ${ownership.errors[name]}`,
+          { level: 'warn' },
+        )
+        return
+      }
+
+      startupSessionProcessMcpConfigs[name] = config
+      startupSessionProcessMcpNames.add(name)
+      const policy = filterMcpServersByPolicy({ [name]: config })
+      if (policy.blocked.includes(name) || isMcpServerDisabled(name)) {
+        policyBlockedSessionMcpNames.add(name)
+        observedStartupInactiveMcpNames.add(name)
+        if (isMcpServerDisabled(name)) {
+          directControlDisabledMcpNames.add(name)
+        }
+        return
+      }
+
+      const result = await reconnectMcpServerImpl(name, config)
+      commitDirectMcpReconnect(name, result)
+      if (result.client.type === 'connected') {
+        registerElicitationHandlers([result.client])
+        reregisterChannelHandlerAfterReconnect(result.client)
+      }
+    })
+  }
+
+  async function claimDirectPluginMcpOwner(
+    serverName: string,
+  ): Promise<string | null> {
+    if (!separateProcessMcpOwners) return null
+    const existingTarget = getDirectOwnedMcpTarget(serverName)
+    if (existingTarget) {
+      return existingTarget.owner === 'plugin'
+        ? null
+        : `MCP server is already owned by the ${existingTarget.owner} lifecycle: ${serverName}`
+    }
+    await applyPluginMcpDiff()
+    return getDirectOwnedMcpTarget(serverName)?.owner === 'plugin'
+      ? null
+      : `MCP server was not admitted by the direct TUI ownership lifecycle: ${serverName}`
+  }
+
+  type DirectMcpActionResult =
+    | { ok: true; client?: MCPServerConnection }
+    | { ok: false; error: string }
+
+  async function reconnectDirectMcpServer(
+    serverName: string,
+  ): Promise<DirectMcpActionResult> {
+    const preparation = await runDirectMcpMutation(async (): Promise<
+      | { claimPlugin: true }
+      | { claimPlugin: false; result: DirectMcpActionResult }
+    > => {
+      if (directControlDisabledMcpNames.has(serverName)) {
+        return {
+          claimPlugin: false,
+          result: {
+            ok: false,
+            error: `MCP server "${serverName}" is disabled`,
+          },
+        }
+      }
+      const target = getDirectOwnedMcpTarget(serverName)
+      if (!target) {
+        const ownershipError = directMcpNameOwnershipError(serverName)
+        if (ownershipError) {
+          return {
+            claimPlugin: false,
+            result: { ok: false, error: ownershipError },
+          }
+        }
+        const inventoryRecord = isPluginMcpRuntimeName(serverName)
+          ? (await getCrabCodeMcpConfigs()).pluginInventory.find(
+              record => record.runtimeName === serverName,
+            )
+          : undefined
+        if (isDirectTuiSdkMcpInventoryRecord(inventoryRecord)) {
+          return {
+            claimPlugin: false,
+            result: {
+              ok: false,
+              error: DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+            },
+          }
+        }
+        const candidate = await getActiveMcpConfigByName(serverName)
+        if (!candidate) {
+          return {
+            claimPlugin: false,
+            result: {
+              ok: false,
+              error: `Server not found: ${serverName}`,
+            },
+          }
+        }
+        const admissionError = directMcpControlAdmissionError(
+          serverName,
+          candidate,
+        )
+        return admissionError
+          ? {
+              claimPlugin: false,
+              result: { ok: false, error: admissionError },
+            }
+          : { claimPlugin: true }
+      }
+      if (target.owner === 'plugin') {
+        const inventoryRecord = (
+          await getCrabCodeMcpConfigs()
+        ).pluginInventory.find(record => record.runtimeName === serverName)
+        if (isDirectTuiSdkMcpInventoryRecord(inventoryRecord)) {
+          return {
+            claimPlugin: false,
+            result: {
+              ok: false,
+              error: DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+            },
+          }
+        }
+      }
+      const config =
+        target.owner === 'plugin'
+          ? await getActiveMcpConfigByName(serverName)
+          : target.config
+      if (!config) {
+        return {
+          claimPlugin: false,
+          result: { ok: false, error: `Server not found: ${serverName}` },
+        }
+      }
+      const admissionError = directMcpControlAdmissionError(
+        serverName,
+        config,
+      )
+      if (admissionError) {
+        return {
+          claimPlugin: false,
+          result: { ok: false, error: admissionError },
+        }
+      }
+
+      elicitationRegistered.delete(serverName)
+      if (
+        target.owner === 'plugin' &&
+        getServerCacheKey(serverName, target.config) !==
+          getServerCacheKey(serverName, config)
+      ) {
+        await evictExistingServerCache(serverName, target.config)
+      }
+      const result = await reconnectMcpServerImpl(serverName, config)
+      commitDirectMcpReconnect(
+        serverName,
+        result,
+        { owner: target.owner, config },
+      )
+      if (result.client.type === 'connected') {
+        registerElicitationHandlers([result.client])
+        reregisterChannelHandlerAfterReconnect(result.client)
+        return {
+          claimPlugin: false,
+          result: { ok: true, client: result.client },
+        }
+      }
+      return {
+        claimPlugin: false,
+        result: {
+          ok: false,
+          error:
+            result.client.type === 'failed'
+              ? (result.client.error ?? 'Connection failed')
+              : `Server status: ${result.client.type}`,
+        },
+      }
+    })
+    if (!preparation.claimPlugin) return preparation.result
+
+    const claimError = await claimDirectPluginMcpOwner(serverName)
+    if (claimError) return { ok: false, error: claimError }
+    return runDirectMcpMutation(async () => {
+      if (getDirectOwnedMcpTarget(serverName)?.owner !== 'plugin') {
+        return {
+          ok: false,
+          error: `MCP server was not admitted by the direct TUI ownership lifecycle: ${serverName}`,
+        }
+      }
+      const claimedClient = pluginProcessMcpState.clients.find(
+        client => client.name === serverName,
+      )
+      if (claimedClient?.type === 'connected') {
+        registerElicitationHandlers([claimedClient])
+        reregisterChannelHandlerAfterReconnect(claimedClient)
+        return { ok: true, client: claimedClient }
+      }
+      return {
+        ok: false,
+        error:
+          claimedClient?.type === 'failed'
+            ? (claimedClient.error ?? 'Connection failed')
+            : `Server status: ${claimedClient?.type ?? 'unavailable'}`,
+      }
+    })
+  }
+
+  async function toggleDirectMcpServer(
+    serverName: string,
+    enabled: boolean,
+  ): Promise<DirectMcpActionResult> {
+    const preparation = await runDirectMcpMutation(async (): Promise<
+      | { claimPlugin: true }
+      | { claimPlugin: false; result: DirectMcpActionResult }
+    > => {
+      const target = getDirectOwnedMcpTarget(serverName)
+      if (!target) {
+        const ownershipError = directMcpNameOwnershipError(serverName)
+        if (ownershipError) {
+          return {
+            claimPlugin: false,
+            result: { ok: false, error: ownershipError },
+          }
+        }
+
+        const activeConfig = await getActiveMcpConfigByName(serverName)
+        const inventoryRecord = isPluginMcpRuntimeName(serverName)
+          ? (await getCrabCodeMcpConfigs()).pluginInventory.find(
+              record => record.runtimeName === serverName,
+            )
+          : undefined
+        if (isDirectTuiSdkMcpInventoryRecord(inventoryRecord)) {
+          return {
+            claimPlugin: false,
+            result: {
+              ok: false,
+              error: DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+            },
+          }
+        }
+        const candidate = activeConfig ?? inventoryRecord?.config ?? null
+        if (!candidate) {
+          return {
+            claimPlugin: false,
+            result: {
+              ok: false,
+              error: `Direct TUI cannot activate an MCP server before its process transport configuration is available: ${serverName}`,
+            },
+          }
+        }
+        const admissionError = directMcpControlAdmissionError(
+          serverName,
+          candidate,
+        )
+        if (admissionError) {
+          return {
+            claimPlugin: false,
+            result: { ok: false, error: admissionError },
+          }
+        }
+
+        if (!enabled) await cancelActiveMcpOAuthFlow(serverName)
+        await setMcpServerEnabled(serverName, enabled)
+        if (enabled) directControlDisabledMcpNames.delete(serverName)
+        else directControlDisabledMcpNames.add(serverName)
+        return enabled
+          ? { claimPlugin: true }
+          : { claimPlugin: false, result: { ok: true } }
+      }
+      if (target.owner === 'plugin') {
+        const inventoryRecord = (
+          await getCrabCodeMcpConfigs()
+        ).pluginInventory.find(record => record.runtimeName === serverName)
+        if (isDirectTuiSdkMcpInventoryRecord(inventoryRecord)) {
+          return {
+            claimPlugin: false,
+            result: {
+              ok: false,
+              error: DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+            },
+          }
+        }
+      }
+      let config =
+        enabled &&
+        target.owner === 'plugin' &&
+        !directControlDisabledMcpNames.has(serverName)
+          ? await getActiveMcpConfigByName(serverName)
+          : target.config
+      if (!config) {
+        return {
+          claimPlugin: false,
+          result: { ok: false, error: `Server not found: ${serverName}` },
+        }
+      }
+      const admissionError = directMcpControlAdmissionError(
+        serverName,
+        config,
+      )
+      if (admissionError) {
+        return {
+          claimPlugin: false,
+          result: { ok: false, error: admissionError },
+        }
+      }
+
+      if (!enabled) await cancelActiveMcpOAuthFlow(serverName)
+      elicitationRegistered.delete(serverName)
+      await setMcpServerEnabled(serverName, enabled)
+      if (!enabled) {
+        directControlDisabledMcpNames.add(serverName)
+        await evictExistingServerCache(serverName, config)
+        const disabledClient: MCPServerConnection = {
+          name: serverName,
+          type: 'disabled',
+          config,
+        }
+        const prefix = getMcpPrefix(serverName)
+        syncHeadlessMcpRuntime(serverName, disabledClient)
+        setAppState(prev => ({
+          ...prev,
+          mcp: {
+            ...prev.mcp,
+            clients: upsertConnection(prev.mcp.clients, disabledClient),
+            tools: reject(prev.mcp.tools, tool =>
+              tool.name?.startsWith(prefix),
+            ),
+            commands: reject(prev.mcp.commands, command =>
+              commandOwnedByMcpServer(command, serverName),
+            ),
+            resources: omit(prev.mcp.resources, serverName),
+          },
+        }))
+        return {
+          claimPlugin: false,
+          result: { ok: true, client: disabledClient },
+        }
+      }
+
+      directControlDisabledMcpNames.delete(serverName)
+      if (target.owner === 'plugin') {
+        const freshConfig = await getActiveMcpConfigByName(serverName)
+        if (!freshConfig) {
+          return {
+            claimPlugin: false,
+            result: { ok: false, error: `Server not found: ${serverName}` },
+          }
+        }
+        config = freshConfig
+        const refreshedAdmissionError = directMcpControlAdmissionError(
+          serverName,
+          config,
+        )
+        if (refreshedAdmissionError) {
+          return {
+            claimPlugin: false,
+            result: { ok: false, error: refreshedAdmissionError },
+          }
+        }
+      }
+
+      if (
+        target.owner === 'plugin' &&
+        getServerCacheKey(serverName, target.config) !==
+          getServerCacheKey(serverName, config)
+      ) {
+        await evictExistingServerCache(serverName, target.config)
+      }
+      const result = await reconnectMcpServerImpl(serverName, config)
+      commitDirectMcpReconnect(serverName, result, {
+        owner: target.owner,
+        config,
+      })
+      if (result.client.type === 'connected') {
+        registerElicitationHandlers([result.client])
+        reregisterChannelHandlerAfterReconnect(result.client)
+        return {
+          claimPlugin: false,
+          result: { ok: true, client: result.client },
+        }
+      }
+      return {
+        claimPlugin: false,
+        result: {
+          ok: false,
+          error:
+            result.client.type === 'failed'
+              ? (result.client.error ?? 'Connection failed')
+              : `Server status: ${result.client.type}`,
+        },
+      }
+    })
+
+    if (!preparation.claimPlugin) return preparation.result
+
+    const claimError = await claimDirectPluginMcpOwner(serverName)
+    return runDirectMcpMutation(async () => {
+      const claimedTarget = getDirectOwnedMcpTarget(serverName)
+      if (claimError) {
+        const latestRecord = (
+          await getCrabCodeMcpConfigs()
+        ).pluginInventory.find(record => record.runtimeName === serverName)
+        if (!claimedTarget && latestRecord?.reasonCode === 'requires-login') {
+          return { ok: true }
+        }
+        return { ok: false, error: claimError }
+      }
+      if (claimedTarget?.owner !== 'plugin') {
+        return {
+          ok: false,
+          error: `MCP server was not admitted by the direct TUI plugin lifecycle: ${serverName}`,
+        }
+      }
+      const claimedClient = pluginProcessMcpState.clients.find(
+        client => client.name === serverName,
+      )
+      if (claimedClient?.type === 'connected') {
+        registerElicitationHandlers([claimedClient])
+        reregisterChannelHandlerAfterReconnect(claimedClient)
+      }
+      return claimedClient?.type === 'failed'
+        ? {
+            ok: false,
+            error: claimedClient.error ?? 'Connection failed',
+          }
+        : { ok: true, client: claimedClient }
+    })
   }
 
   // Build McpServerStatus[] for control responses. Shared by mcp_status and
-  // reload_plugins handlers. Reads closure state: sdkClients, dynamicMcpState.
+  // reload_plugins handlers. Reads every live owner and deduplicates AppState's
+  // projection of those same connections by stable server name.
   async function buildMcpServerStatuses(): Promise<McpServerStatus[]> {
     const currentAppState = getAppState()
     const currentMcpClients = currentAppState.mcp.clients
     const allMcpTools = uniqBy(
-      [...currentAppState.mcp.tools, ...dynamicMcpState.tools],
+      [
+        ...currentAppState.mcp.tools,
+        ...dynamicMcpState.tools,
+        ...pluginProcessMcpState.tools,
+      ],
       'name',
     )
-    const existingNames = new Set([
-      ...currentMcpClients.map(c => c.name),
-      ...sdkClients.map(c => c.name),
-    ])
-    const connections = [
-      ...currentMcpClients,
-      ...sdkClients,
-      ...dynamicMcpState.clients.filter(c => !existingNames.has(c.name)),
-    ]
+    let connections: MCPServerConnection[]
+    if (separateProcessMcpOwners) {
+      connections = uniqBy(
+        [
+          ...currentMcpClients,
+          ...sdkClients,
+          ...dynamicMcpState.clients,
+          ...pluginProcessMcpState.clients,
+        ] as MCPServerConnection[],
+        'name',
+      )
+    } else {
+      const existingNames = new Set([
+        ...currentMcpClients.map(c => c.name),
+        ...sdkClients.map(c => c.name),
+      ])
+      connections = [
+        ...currentMcpClients,
+        ...sdkClients,
+        ...dynamicMcpState.clients.filter(c => !existingNames.has(c.name)),
+      ]
+    }
     const liveStatuses = connections.map(connection => {
       let config
       if (
@@ -2004,9 +3045,14 @@ function runHeadlessStreaming(
     })
     const { pluginInventory } = await getAllMcpConfigs()
     const liveNames = new Set(connections.map(connection => connection.name))
+    const managementInventory = separateProcessMcpOwners
+      ? pluginInventory.filter(
+          record => !isDirectTuiSdkMcpInventoryRecord(record),
+        )
+      : pluginInventory
     return [
       ...liveStatuses,
-      ...buildPluginMcpManagementStatuses(pluginInventory, liveNames),
+      ...buildPluginMcpManagementStatuses(managementInventory, liveNames),
     ]
   }
 
@@ -2030,7 +3076,9 @@ function runHeadlessStreaming(
 
       const pluginsInstalled = await installPluginsForHeadless()
 
-      if (pluginsInstalled) {
+      if (routePolicy.directQueryEventDelivery) {
+        await reconcileDirectMcpSettings()
+      } else if (pluginsInstalled) {
         await applyPluginMcpDiff()
       }
     } catch (error) {
@@ -2075,18 +3123,74 @@ function runHeadlessStreaming(
         },
       )
     : null
+  const currentExecutableCommands = (
+    mcpCommands: readonly Command[] = getAppState().mcp.commands,
+  ): Command[] => {
+    return executableCommandInventoryForRoute(
+      routePolicy.slashCommandsEnabled,
+      routePolicy.directQueryEventDelivery,
+      currentCommands,
+      mcpCommands,
+    )
+  }
+  // Only the direct route publishes a private Rust catalog. Standard SDK
+  // responses retain their established currentCommands projection.
+  const currentCatalogCommands = (): Command[] =>
+    routePolicy.directQueryEventDelivery
+      ? currentExecutableCommands()
+      : currentCommands
+  const projectCurrentCommandCatalog = (
+    commandsToProject: readonly Command[],
+  ) =>
+    routePolicy.directQueryEventDelivery
+      ? projectDirectTuiCommandCatalogEntries(
+          commandsToProject,
+          formatHeadlessCommandDescription,
+        )
+      : projectCommandCatalogEntries(
+          commandsToProject,
+          formatHeadlessCommandDescription,
+        )
+  const publishCurrentCommandCatalog = (): void => {
+    commandCatalogPublisher?.update(
+      projectCurrentCommandCatalog(currentCatalogCommands()),
+    )
+  }
   const commandCatalogLifecycle = new DirectTuiCommandCatalogLifecycle(
     currentCommands,
     refreshedCommands => {
       currentCommands = [...refreshedCommands]
-      commandCatalogPublisher?.update(
-        projectCommandCatalogEntries(
-          currentCommands,
-          formatHeadlessCommandDescription,
-        ),
-      )
+      publishCurrentCommandCatalog()
     },
   )
+  let observedMcpCommands = getAppState().mcp.commands
+  const unsubscribeAppStateCommandCatalog =
+    routePolicy.directQueryEventDelivery &&
+    routePolicy.slashCommandsEnabled
+      ? options.subscribeAppState?.(() => {
+          const nextMcpCommands = getAppState().mcp.commands
+          if (Object.is(nextMcpCommands, observedMcpCommands)) return
+          observedMcpCommands = nextMcpCommands
+          publishCurrentCommandCatalog()
+        })
+      : undefined
+  const refreshSettingsCommandCatalog = (): Promise<readonly Command[]> => {
+    // The earlier headless settings subscriber has already reset the settings
+    // cache and applied the new AppState snapshot. Rebuild from that same
+    // authority so load-time eligibility cannot remain executable.
+    clearHeadlessCommandMemoizationCaches()
+    return commandCatalogLifecycle.refresh(() =>
+      routePolicy.commandLoader(cwd()),
+    )
+  }
+  const queueSettingsCommandCatalogRefresh = (): void => {
+    void refreshSettingsCommandCatalog().catch(error => logError(error))
+  }
+  const commandRefreshEnabled =
+    routePolicy.directQueryEventDelivery && routePolicy.slashCommandsEnabled
+  const unsubscribeSettingsCommandCatalog = commandRefreshEnabled
+    ? settingsChangeDetector.subscribe(queueSettingsCommandCatalogRefresh)
+    : undefined
 
   // Clear all plugin-related caches, reload commands/agents/hooks.
   // Called after CRABCODE_SYNC_PLUGIN_INSTALL completes (before first query)
@@ -2129,43 +3233,122 @@ function runHeadlessStreaming(
   // so applyMcpServerChanges' diff doesn't close their transports.
   // Nested: needs closure access to sdkMcpConfigs, applyMcpServerChanges,
   // updateSdkMcp.
-  async function applyPluginMcpDiff(): Promise<void> {
-    const { servers: newConfigs } = await getActiveMcpConfigs()
-    const supportedConfigs: Record<string, McpServerConfigForProcessTransport> =
-      {}
-    for (const [name, config] of Object.entries(newConfigs)) {
-      const type = config.type
-      if (
-        type === undefined ||
-        type === 'stdio' ||
-        type === 'sse' ||
-        type === 'http' ||
-        type === 'sdk'
-      ) {
-        supportedConfigs[name] = config
+  let pluginMcpDiffPromise: Promise<void> = Promise.resolve()
+  function applyPluginMcpDiff(): Promise<void> {
+    const doWork = async (): Promise<void> => {
+      if (inputClosed) return
+      const { servers: newConfigs } = await getActiveMcpConfigs()
+      if (inputClosed) return
+      const orderedConfigs = separateProcessMcpOwners
+        ? orderMcpServersByPrecedence(newConfigs)
+        : newConfigs
+      const supportedConfigs: Record<
+        string,
+        McpServerConfigForProcessTransport
+      > = {}
+      for (const [name, config] of Object.entries(orderedConfigs)) {
+        const type = config.type
+        if (
+          type === undefined ||
+          type === 'stdio' ||
+          type === 'sse' ||
+          type === 'http' ||
+          type === 'sdk'
+        ) {
+          supportedConfigs[name] = config
+        }
       }
-    }
-    for (const [name, config] of Object.entries(sdkMcpConfigs)) {
-      if (config.type === 'sdk' && !(name in supportedConfigs)) {
-        supportedConfigs[name] = config
+      // Standard retains the historical shared SDK carry-forward.
+      if (!separateProcessMcpOwners) {
+        for (const [name, config] of Object.entries(sdkMcpConfigs)) {
+          if (config.type === 'sdk' && !(name in supportedConfigs)) {
+            supportedConfigs[name] = config
+          }
+        }
       }
+      const { response, sdkServersChanged } =
+        await applyMcpServerChanges(
+          'plugin',
+          supportedConfigs,
+          separateProcessMcpOwners,
+        )
+      if (sdkServersChanged) {
+        void updateSdkMcp()
+      }
+      for (const [name, reason] of Object.entries(response.errors)) {
+        logForDebugging(
+          `Ignoring MCP server "${name}" during plugin refresh: ${reason}`,
+          { level: 'warn' },
+        )
+      }
+      logForDebugging(
+        `Headless MCP refresh: added=${response.added.length}, removed=${response.removed.length}`,
+      )
     }
-    const { response, sdkServersChanged } =
-      await applyMcpServerChanges(supportedConfigs)
-    if (sdkServersChanged) {
-      void updateSdkMcp()
-    }
-    logForDebugging(
-      `Headless MCP refresh: added=${response.added.length}, removed=${response.removed.length}`,
+    const serializedWork = () =>
+      separateProcessMcpOwners ? serializeMcpMutation(doWork) : doWork()
+    pluginMcpDiffPromise = pluginMcpDiffPromise.then(
+      serializedWork,
+      serializedWork,
     )
+    return pluginMcpDiffPromise
+  }
+
+  async function reconcileDirectMcpSettings(): Promise<void> {
+    if (!separateProcessMcpOwners || inputClosed) return
+    await reconcileDirectSessionMcpPolicy()
+    if (inputClosed) return
+    await serializeMcpMutation(async () => {
+      if (inputClosed) return
+      // Read both the committed public desired set and the current disabled
+      // authority only after this settings task owns the mutation lane. A
+      // queued toggle or mcp_set request may have changed either while the
+      // fixed-owner policy pass above was awaiting transport cleanup.
+      const settingsActivePublicDesired = Object.fromEntries(
+        Object.entries(publicProcessMcpDesired).filter(
+          ([name]) => !isMcpServerDisabled(name),
+        ),
+      )
+      await applyMcpServerChanges(
+        'public',
+        settingsActivePublicDesired,
+        true,
+        false,
+      )
+    })
+    if (inputClosed) return
+    if (isBareMode()) return
+    await applyPluginMcpDiff()
+  }
+
+  options.installSettingsMcpReconcile?.(() => {
+    if (!inputClosed) {
+      void reconcileDirectMcpSettings().catch(error => logError(error))
+    }
+  })
+  if (separateProcessMcpOwners && options.lateFixedMcpConfig) {
+    void options.lateFixedMcpConfig
+      .then(candidate =>
+        candidate ? admitLateFixedMcpConfig(candidate) : undefined,
+      )
+      .catch(error => logError(error))
   }
 
   // Subscribe to skill changes for hot reloading
-  const unsubscribeSkillChanges = skillChangeDetector.subscribe(() => {
+  const refreshSkillCommandCatalog = (): void => {
     void commandCatalogLifecycle
       .refresh(() => routePolicy.commandLoader(cwd()))
       .catch(error => logError(error))
-  })
+  }
+  const unsubscribeSkillChanges = skillChangeDetector.subscribe(
+    refreshSkillCommandCatalog,
+  )
+  // Both detectors are edge-only. One current-state rebuild after both
+  // subscriptions closes the bootstrap window without changing their shared
+  // process-global semantics; later edges use the listeners above.
+  if (commandRefreshEnabled) {
+    queueSettingsCommandCatalogRefresh()
+  }
 
   // Proactive mode: schedule a tick to keep the model looping autonomously.
   // setTimeout(0) yields to the event loop so pending stdin messages
@@ -2526,11 +3709,21 @@ function runHeadlessStreaming(
           // fresh per-command means late-connecting servers are visible on the
           // next turn. registerElicitationHandlers is idempotent (tracking set).
           const appState = getAppState()
-          const allMcpClients = [
-            ...appState.mcp.clients,
-            ...sdkClients,
-            ...dynamicMcpState.clients,
-          ]
+          const allMcpClients = separateProcessMcpOwners
+            ? uniqBy(
+                [
+                  ...appState.mcp.clients,
+                  ...sdkClients,
+                  ...dynamicMcpState.clients,
+                  ...pluginProcessMcpState.clients,
+                ],
+                'name',
+              )
+            : [
+                ...appState.mcp.clients,
+                ...sdkClients,
+                ...dynamicMcpState.clients,
+              ]
           registerElicitationHandlers(allMcpClients)
           // Channel handlers for servers allowlisted via --channels at
           // construction time (or enableChannel() mid-session). Runs every
@@ -2732,7 +3925,7 @@ function runHeadlessStreaming(
                     preparedCrabCodeThinking.selection
                   for await (const message of ask({
                 commands: uniqBy(
-                  [...currentCommands, ...appState.mcp.commands],
+                  currentExecutableCommands(appState.mcp.commands),
                   'name',
                 ),
                 prompt: input,
@@ -2799,6 +3992,8 @@ function runHeadlessStreaming(
                 interactive: routePolicy.interactiveProductSession,
                 allowDirectTuiBashContentBlocks:
                   routePolicy.allowDirectTuiBashContentBlocks,
+                failClosedUnknownMcp:
+                  routePolicy.directQueryEventDelivery,
                 querySource: routePolicy.querySource,
                 onQueryEvent: directQueryEventSink,
                 // Fixed historical direct-TUI behavior:
@@ -3205,6 +4400,9 @@ function runHeadlessStreaming(
         commandCatalogLifecycle.close()
         commandCatalogPublisher?.close()
         unsubscribeSkillChanges()
+        unsubscribeAppStateCommandCatalog?.()
+        unsubscribeSettingsCommandCatalog?.()
+        options.closeHeadlessSettings?.()
         unsubscribeAuthStatus?.()
         statusListeners.delete(rateLimitListener)
         output.done()
@@ -3355,22 +4553,85 @@ function runHeadlessStreaming(
     })
   })
 
-  // Track active OAuth flows per server so we can abort a previous flow
-  // when a new mcp_authenticate request arrives for the same server.
-  const activeOAuthFlows = new Map<string, AbortController>()
-  // Track manual callback URL submit functions for active OAuth flows.
-  // Used when localhost is not reachable (e.g., browser-based IDEs).
-  const oauthCallbackSubmitters = new Map<
-    string,
-    (callbackUrl: string) => void
-  >()
-  // Track servers where the manual callback was actually invoked (so the
-  // automatic reconnect path knows to skip — the extension will reconnect).
-  const oauthManualCallbackUsed = new Set<string>()
-  // Track OAuth auth-only promises so mcp_oauth_callback_url can await
-  // token exchange completion. Reconnect is handled separately by the
-  // extension via handleAuthDone → mcp_reconnect.
-  const oauthAuthPromises = new Map<string, Promise<void>>()
+  const cancelActiveMcpOAuthFlow = async (serverName: string): Promise<void> => {
+    const controller = activeOAuthFlows.get(serverName)
+    if (!controller) return
+    const authPromise = oauthAuthPromises.get(serverName)
+    controller.abort()
+    // Invalidate the generation before awaiting its token-exchange promise so
+    // its already-queued completion cannot reconnect while cancellation waits.
+    if (activeOAuthFlows.get(serverName) === controller) {
+      activeOAuthFlows.delete(serverName)
+      oauthCallbackSubmitters.delete(serverName)
+      oauthManualCallbackUsed.delete(serverName)
+      oauthAuthPromises.delete(serverName)
+    }
+    if (authPromise) {
+      await authPromise.catch(() => undefined)
+    }
+  }
+
+  const authorizeDirectMcpOAuth = async (serverName: string) => {
+    const target = getDirectOwnedMcpTarget(serverName)
+    if (target?.owner === 'public' || target?.owner === 'fixed') {
+      const { config } = target
+      if (config.type !== 'sse' && config.type !== 'http') {
+        return {
+          allowed: false as const,
+          message: `MCP server "${serverName}" transport "${config.type}" does not support OAuth`,
+        }
+      }
+      if (
+        directControlDisabledMcpNames.has(serverName)
+      ) {
+        return {
+          allowed: false as const,
+          message: `MCP server "${serverName}" is disabled`,
+        }
+      }
+      const admissionError = directMcpControlAdmissionError(
+        serverName,
+        config,
+      )
+      return admissionError
+        ? { allowed: false as const, message: admissionError }
+        : {
+            allowed: true as const,
+            config,
+            owner: target.owner,
+          }
+    }
+
+    const inventoryRecord = isPluginMcpRuntimeName(serverName)
+      ? (await getCrabCodeMcpConfigs()).pluginInventory.find(
+          record => record.runtimeName === serverName,
+        )
+      : undefined
+    if (isDirectTuiSdkMcpInventoryRecord(inventoryRecord)) {
+      return {
+        allowed: false as const,
+        message: DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+      }
+    }
+
+    const authorization = await authorizeMcpOAuthStart(serverName)
+    if (!authorization.allowed) return authorization
+    const ownershipError = directMcpNameOwnershipError(serverName)
+    const admissionError = directMcpControlAdmissionError(
+      serverName,
+      authorization.config,
+    )
+    return ownershipError || admissionError
+      ? {
+          allowed: false as const,
+          message: ownershipError ?? admissionError!,
+        }
+      : {
+          allowed: true as const,
+          config: authorization.config,
+          owner: 'plugin' as const,
+        }
+  }
 
   // In-flight Acosmi OAuth flow (crabcode_authenticate). SDK handles the full
   // PKCE flow via IPC — no more localhost listener or manual code entry.
@@ -3445,6 +4706,13 @@ function runHeadlessStreaming(
             message.request.sdkMcpServers &&
             message.request.sdkMcpServers.length > 0
           ) {
+            if (routePolicy.directQueryEventDelivery) {
+              sendControlResponseError(
+                message,
+                `${DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR}: ${message.request.sdkMcpServers.join(', ')}`,
+              )
+              continue
+            }
             for (const serverName of message.request.sdkMcpServers) {
               // Create placeholder config for SDK MCP servers
               // The actual server connection is managed by the SDK Query class
@@ -3460,13 +4728,19 @@ function runHeadlessStreaming(
             message.request_id,
             runtimeInitialized,
             output,
-            currentCommands,
+            routePolicy.directQueryEventDelivery
+              ? async () => {
+                  await commandCatalogLifecycle.whenIdle()
+                  return currentCatalogCommands()
+                }
+              : currentCatalogCommands(),
             modelInfos,
             structuredIO,
             !!options.enableAuthStatus,
             options,
             currentAgents,
             getAppState,
+            routePolicy.directQueryEventDelivery,
           )
 
           // Enable prompt suggestions in AppState when SDK consumer opts in.
@@ -3530,21 +4804,27 @@ function runHeadlessStreaming(
           }
           sendControlResponseSuccess(message)
         } else if (req.subtype === 'crabcode_tui_logout') {
-          await handleDirectTuiLogoutRequest(
-            message.request_id,
-            output,
-            routePolicy.commandLoader,
-            cwd(),
-            routePolicy.interactiveProductSession,
-            undefined,
-            refreshedCommands => {
-              if (!commandCatalogLifecycle.replace(refreshedCommands)) {
-                throw new Error(
-                  'direct TUI command catalog lifecycle rejected the signed-out snapshot',
-                )
-              }
-            },
-          )
+          const releaseCatalog = commandCatalogPublisher?.hold() ?? (() => {})
+          try {
+            await handleDirectTuiLogoutRequest(
+              message.request_id,
+              output,
+              routePolicy.commandLoader,
+              cwd(),
+              routePolicy.interactiveProductSession,
+              undefined,
+              refreshedCommands => {
+                if (!commandCatalogLifecycle.replace(refreshedCommands)) {
+                  throw new Error(
+                    'direct TUI command catalog lifecycle rejected the signed-out snapshot',
+                  )
+                }
+              },
+              currentCatalogCommands,
+            )
+          } finally {
+            releaseCatalog()
+          }
         } else if (message.request.subtype === 'mcp_status') {
           sendControlResponseSuccess(message, {
             mcpServers: await buildMcpServerStatuses(),
@@ -3562,6 +4842,13 @@ function runHeadlessStreaming(
             }),
           )
         } else if (message.request.subtype === 'mcp_message') {
+          if (routePolicy.directQueryEventDelivery) {
+            sendControlResponseError(
+              message,
+              DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+            )
+            continue
+          }
           // Handle MCP notifications from SDK servers
           const mcpRequest = message.request
           const sdkClient = sdkClients.find(
@@ -3640,16 +4927,23 @@ function runHeadlessStreaming(
           }
           sendControlResponseSuccess(message)
         } else if (message.request.subtype === 'mcp_set_servers') {
-          const { response, sdkServersChanged } = await applyMcpServerChanges(
-            message.request.servers,
-          )
-          sendControlResponseSuccess(message, response)
+          const releaseCatalog = commandCatalogPublisher?.hold() ?? (() => {})
+          try {
+            const { response, sdkServersChanged } = await applyMcpServerChanges(
+              'public',
+              message.request.servers,
+            )
+            sendControlResponseSuccess(message, response)
 
-          // Connect SDK servers AFTER response to avoid deadlock
-          if (sdkServersChanged) {
-            void updateSdkMcp()
+            // Connect SDK servers AFTER response to avoid deadlock
+            if (sdkServersChanged) {
+              void updateSdkMcp()
+            }
+          } finally {
+            releaseCatalog()
           }
         } else if (message.request.subtype === 'reload_plugins') {
+          const releaseCatalog = commandCatalogPublisher?.hold() ?? (() => {})
           try {
             if (
               feature('DOWNLOAD_USER_SETTINGS') &&
@@ -3698,10 +4992,7 @@ function runHeadlessStreaming(
             }
 
             sendControlResponseSuccess(message, {
-              commands: projectCommandCatalogEntries(
-                currentCommands,
-                formatHeadlessCommandDescription,
-              ),
+              commands: projectCurrentCommandCatalog(currentCatalogCommands()),
               agents: currentAgents.map(a => ({
                 name: a.agentType,
                 description: a.whenToUse,
@@ -3713,31 +5004,79 @@ function runHeadlessStreaming(
             } satisfies SDKControlReloadPluginsResponse)
           } catch (error) {
             sendControlResponseError(message, errorMessage(error))
+          } finally {
+            releaseCatalog()
           }
         } else if (message.request.subtype === 'mcp_reconnect') {
-          const currentAppState = getAppState()
           const { serverName } = message.request
-          elicitationRegistered.delete(serverName)
+          if (separateProcessMcpOwners) {
+            const releaseCatalog = commandCatalogPublisher?.hold() ?? (() => {})
+            try {
+              const outcome = await reconnectDirectMcpServer(serverName)
+              if (outcome.ok) sendControlResponseSuccess(message)
+              else sendControlResponseError(message, outcome.error)
+            } finally {
+              releaseCatalog()
+            }
+            continue
+          }
+          const currentAppState = getAppState()
           // Config-existence gate must cover the SAME sources as the
           // operations below. SDK-injected servers (query({mcpServers:{...}}))
           // and dynamically-added servers were missing here, so
           // toggleMcpServer/reconnect returned "Server not found" even though
           // the disconnect/reconnect would have worked (gh-31339 / CC-314).
-          const fallbackConfig =
-            getMcpConfigByName(serverName) ??
-            mcpClients.find(c => c.name === serverName)?.config ??
-            sdkClients.find(c => c.name === serverName)?.config ??
-            dynamicMcpState.clients.find(c => c.name === serverName)?.config ??
-            currentAppState.mcp.clients.find(c => c.name === serverName)
-              ?.config ??
-            null
+          const directOwnedTarget = getDirectOwnedMcpTarget(serverName)
+          const fallbackConfig = separateProcessMcpOwners
+            ? (directOwnedTarget?.config ?? getMcpConfigByName(serverName))
+            : (getMcpConfigByName(serverName) ??
+              mcpClients.find(c => c.name === serverName)?.config ??
+              sdkClients.find(c => c.name === serverName)?.config ??
+              dynamicMcpState.clients.find(c => c.name === serverName)
+                ?.config ??
+              currentAppState.mcp.clients.find(c => c.name === serverName)
+                ?.config ??
+              null)
           const freshConfigured = await getActiveMcpConfigByName(serverName)
-          const config =
-            freshConfigured ??
-            (fallbackConfig?.pluginMcp ? null : fallbackConfig)
+          const config = separateProcessMcpOwners
+            ? directOwnedTarget?.owner === 'plugin'
+              ? freshConfigured
+              : (directOwnedTarget?.config ??
+                freshConfigured ??
+                fallbackConfig)
+            : (freshConfigured ??
+              (fallbackConfig?.pluginMcp ? null : fallbackConfig))
+          const admissionError = config
+            ? directMcpControlAdmissionError(serverName, config)
+            : null
           if (!config) {
             sendControlResponseError(message, `Server not found: ${serverName}`)
+          } else if (admissionError) {
+            sendControlResponseError(message, admissionError)
+          } else if (
+            separateProcessMcpOwners &&
+            !directMcpTargetIsOwned(serverName)
+          ) {
+            const claimError = await claimDirectPluginMcpOwner(serverName)
+            const claimedClient = pluginProcessMcpState.clients.find(
+              client => client.name === serverName,
+            )
+            if (claimError) {
+              sendControlResponseError(message, claimError)
+            } else if (claimedClient?.type === 'connected') {
+              registerElicitationHandlers([claimedClient])
+              reregisterChannelHandlerAfterReconnect(claimedClient)
+              sendControlResponseSuccess(message)
+            } else {
+              sendControlResponseError(
+                message,
+                claimedClient?.type === 'failed'
+                  ? (claimedClient.error ?? 'Connection failed')
+                  : `Server status: ${claimedClient?.type ?? 'unavailable'}`,
+              )
+            }
           } else {
+            elicitationRegistered.delete(serverName)
             const result = await reconnectMcpServerImpl(serverName, config)
             // Update appState.mcp with the new client, tools, commands, and resources
             const prefix = getMcpPrefix(serverName)
@@ -3764,21 +5103,7 @@ function runHeadlessStreaming(
                     : omit(prev.mcp.resources, serverName),
               },
             }))
-            // Also update dynamicMcpState so run() picks up the new tools
-            // on the next turn (run() reads dynamicMcpState, not appState)
-            dynamicMcpState = {
-              ...dynamicMcpState,
-              clients: [
-                ...dynamicMcpState.clients.filter(c => c.name !== serverName),
-                result.client,
-              ],
-              tools: [
-                ...dynamicMcpState.tools.filter(
-                  t => !t.name?.startsWith(prefix),
-                ),
-                ...result.tools,
-              ],
-            }
+            syncHeadlessMcpRuntime(serverName, result.client, result.tools)
             if (result.client.type === 'connected') {
               registerElicitationHandlers([result.client])
               reregisterChannelHandlerAfterReconnect(result.client)
@@ -3792,41 +5117,97 @@ function runHeadlessStreaming(
             }
           }
         } else if (message.request.subtype === 'mcp_toggle') {
-          const currentAppState = getAppState()
           const { serverName, enabled } = message.request
-          elicitationRegistered.delete(serverName)
+          if (separateProcessMcpOwners) {
+            const releaseCatalog = commandCatalogPublisher?.hold() ?? (() => {})
+            try {
+              const outcome = await toggleDirectMcpServer(serverName, enabled)
+              if (outcome.ok) sendControlResponseSuccess(message)
+              else sendControlResponseError(message, outcome.error)
+            } finally {
+              releaseCatalog()
+            }
+            continue
+          }
+          const currentAppState = getAppState()
           // Gate must match the client-lookup spread below (which
           // includes sdkClients and dynamicMcpState.clients). Same fix as
           // mcp_reconnect above (gh-31339 / CC-314).
-          let config =
-            getMcpConfigByName(serverName) ??
-            mcpClients.find(c => c.name === serverName)?.config ??
-            sdkClients.find(c => c.name === serverName)?.config ??
-            dynamicMcpState.clients.find(c => c.name === serverName)?.config ??
-            currentAppState.mcp.clients.find(c => c.name === serverName)
-              ?.config ??
-            null
+          const directOwnedTarget = getDirectOwnedMcpTarget(serverName)
+          const freshPluginOwnerConfig =
+            separateProcessMcpOwners &&
+            directOwnedTarget?.owner === 'plugin'
+              ? await getActiveMcpConfigByName(serverName)
+              : null
+          let config = separateProcessMcpOwners
+            ? directOwnedTarget?.owner === 'plugin'
+              ? freshPluginOwnerConfig
+              : (directOwnedTarget?.config ?? getMcpConfigByName(serverName))
+            : (getMcpConfigByName(serverName) ??
+              mcpClients.find(c => c.name === serverName)?.config ??
+              sdkClients.find(c => c.name === serverName)?.config ??
+              dynamicMcpState.clients.find(c => c.name === serverName)
+                ?.config ??
+              currentAppState.mcp.clients.find(c => c.name === serverName)
+                ?.config ??
+              null)
           let activationAlreadyPersisted = false
           let refreshedAfterActivation:
             | Awaited<ReturnType<typeof getCrabCodeMcpConfigs>>
             | undefined
+          let inactivePluginInventoryFound = false
 
           // A deferred remote MCPB intentionally has an inventory row but no
-          // config until explicit activation authorizes the download. Resolve
-          // that row by exact opaque identity, persist once, then rebuild.
+          // live config until explicit activation authorizes the download.
+          // Resolve its static candidate before any persistence so SDK and
+          // namespace-invalid rows fail closed with zero side effects.
           if (!config && isPluginMcpRuntimeName(serverName)) {
             const inventory = await getCrabCodeMcpConfigs()
             const record = inventory.pluginInventory.find(
               item => item.runtimeName === serverName,
             )
             if (record) {
-              await setMcpServerEnabled(serverName, enabled)
-              activationAlreadyPersisted = true
-              if (enabled) {
-                refreshedAfterActivation = await getCrabCodeMcpConfigs()
-                config = refreshedAfterActivation.servers[serverName] ?? null
+              // Inventory deliberately omits transport when no executable
+              // config exists. Direct mode cannot prove SDK support, policy,
+              // or namespace safety after a side-effecting activation, so the
+              // only sound boundary is to reject before persistence.
+              const inventoryAdmissionError =
+                separateProcessMcpOwners && !record.config
+                  ? 'Direct TUI cannot activate an MCP server before its process transport configuration is available'
+                  : directMcpNameOwnershipError(serverName)
+              if (inventoryAdmissionError) {
+                sendControlResponseError(message, inventoryAdmissionError)
+                continue
               }
+              inactivePluginInventoryFound = true
+              config = record.config ?? null
             }
+          }
+
+          const admissionError = config
+            ? directMcpControlAdmissionError(serverName, config)
+            : null
+          if (admissionError) {
+            sendControlResponseError(message, admissionError)
+            continue
+          }
+          elicitationRegistered.delete(serverName)
+
+          if (inactivePluginInventoryFound) {
+            await setMcpServerEnabled(serverName, enabled)
+            activationAlreadyPersisted = true
+            if (enabled) {
+              refreshedAfterActivation = await getCrabCodeMcpConfigs()
+              config = refreshedAfterActivation.servers[serverName] ?? null
+            }
+          }
+
+          const refreshedAdmissionError = config
+            ? directMcpControlAdmissionError(serverName, config)
+            : null
+          if (refreshedAdmissionError) {
+            sendControlResponseError(message, refreshedAdmissionError)
+            continue
           }
 
           if (!config) {
@@ -3861,14 +5242,25 @@ function runHeadlessStreaming(
             if (!activationAlreadyPersisted) {
               await setMcpServerEnabled(serverName, false)
             }
-            const client = [
+            const clientPool = [
               ...mcpClients,
               ...sdkClients,
               ...dynamicMcpState.clients,
+              ...(separateProcessMcpOwners
+                ? pluginProcessMcpState.clients
+                : []),
               ...currentAppState.mcp.clients,
-            ].find(c => c.name === serverName)
+            ]
+            const client = (separateProcessMcpOwners
+              ? uniqBy(clientPool, 'name')
+              : clientPool
+            ).find(c => c.name === serverName)
             if (client && client.type === 'connected') {
-              await clearServerCache(serverName, config)
+              if (separateProcessMcpOwners) {
+                await evictExistingServerCache(serverName, config)
+              } else {
+                await clearServerCache(serverName, config)
+              }
             }
             // Update appState.mcp to reflect disabled status and remove tools/commands/resources
             const prefix = getMcpPrefix(serverName)
@@ -3895,6 +5287,30 @@ function runHeadlessStreaming(
             // Enabling: persist + reconnect
             if (!activationAlreadyPersisted) {
               await setMcpServerEnabled(serverName, true)
+            }
+            if (
+              separateProcessMcpOwners &&
+              !directMcpTargetIsOwned(serverName)
+            ) {
+              const claimError = await claimDirectPluginMcpOwner(serverName)
+              const claimedClient = pluginProcessMcpState.clients.find(
+                client => client.name === serverName,
+              )
+              if (claimError) {
+                sendControlResponseError(message, claimError)
+              } else if (claimedClient?.type === 'failed') {
+                sendControlResponseError(
+                  message,
+                  claimedClient.error ?? 'Connection failed',
+                )
+              } else {
+                if (claimedClient?.type === 'connected') {
+                  registerElicitationHandlers([claimedClient])
+                  reregisterChannelHandlerAfterReconnect(claimedClient)
+                }
+                sendControlResponseSuccess(message)
+              }
+              continue
             }
             let reconnectConfig = config
             let pluginLifecycle = config.pluginMcp
@@ -4009,16 +5425,28 @@ function runHeadlessStreaming(
             message.request_id,
             req.serverName,
             // Pool spread matches mcp_status — all three client sources.
-            [
-              ...currentAppState.mcp.clients,
-              ...sdkClients,
-              ...dynamicMcpState.clients,
-            ],
+            separateProcessMcpOwners
+              ? uniqBy(
+                  [
+                    ...currentAppState.mcp.clients,
+                    ...sdkClients,
+                    ...dynamicMcpState.clients,
+                    ...pluginProcessMcpState.clients,
+                  ],
+                  'name',
+                )
+              : [
+                  ...currentAppState.mcp.clients,
+                  ...sdkClients,
+                  ...dynamicMcpState.clients,
+                ],
             output,
           )
         } else if (req.subtype === 'mcp_authenticate') {
           const { serverName } = req
-          const authorization = await authorizeMcpOAuthStart(serverName)
+          const authorization = separateProcessMcpOwners
+            ? await authorizeDirectMcpOAuth(serverName)
+            : await authorizeMcpOAuthStart(serverName)
           if (!authorization.allowed) {
             sendControlResponseError(
               message,
@@ -4026,30 +5454,86 @@ function runHeadlessStreaming(
             )
           } else {
             const config = authorization.config
+            const admissionError = directMcpControlAdmissionError(
+              serverName,
+              config,
+            )
+            if (admissionError) {
+              sendControlResponseError(message, admissionError)
+              continue
+            }
             try {
-              // Abort any previous in-flight OAuth flow for this server
-              activeOAuthFlows.get(serverName)?.abort()
-              const controller = new AbortController()
-              activeOAuthFlows.set(serverName, controller)
-
+              // A superseded generation must settle before the next one can
+              // begin writing credentials for the same server.
+              await cancelActiveMcpOAuthFlow(serverName)
               // Capture the auth URL from the callback
               let resolveAuthUrl: (url: string) => void
               const authUrlPromise = new Promise<string>(resolve => {
                 resolveAuthUrl = resolve
               })
-
-              // Start the OAuth flow in the background
-              const oauthPromise = performMCPOAuthFlow(
-                serverName,
-                config,
-                url => resolveAuthUrl!(url),
-                controller.signal,
-                {
-                  skipBrowserOpen: true,
-                  onWaitingForCallback: submit => {
-                    oauthCallbackSubmitters.set(serverName, submit)
+              const launch = (
+                currentConfig: typeof config,
+                controller: AbortController,
+              ) =>
+                performMCPOAuthFlow(
+                  serverName,
+                  currentConfig,
+                  url => resolveAuthUrl!(url),
+                  controller.signal,
+                  {
+                    skipBrowserOpen: true,
+                    onWaitingForCallback: submit => {
+                      if (activeOAuthFlows.get(serverName) === controller) {
+                        oauthCallbackSubmitters.set(serverName, submit)
+                      }
+                    },
                   },
-                },
+                )
+
+              let effectiveAuthorization = authorization
+              let directAuthorizationOwner:
+                | DirectOwnedMcpTarget['owner']
+                | null = null
+              let controller: AbortController
+              let oauthPromise: Promise<void>
+              if (separateProcessMcpOwners) {
+                const started = await runDirectMcpMutation(async () => {
+                  const latestAuthorization =
+                    await authorizeDirectMcpOAuth(serverName)
+                  if (!latestAuthorization.allowed) {
+                    return latestAuthorization
+                  }
+                  const nextController = new AbortController()
+                  activeOAuthFlows.set(serverName, nextController)
+                  return {
+                    allowed: true as const,
+                    authorization: latestAuthorization,
+                    controller: nextController,
+                    oauthPromise: launch(
+                      latestAuthorization.config,
+                      nextController,
+                    ),
+                  }
+                })
+                if (!started.allowed) {
+                  sendControlResponseError(
+                    message,
+                    `MCP OAuth is not authorized for ${serverName}: ${started.message}`,
+                  )
+                  continue
+                }
+                effectiveAuthorization = started.authorization
+                directAuthorizationOwner = started.authorization.owner
+                controller = started.controller
+                oauthPromise = started.oauthPromise
+              } else {
+                controller = new AbortController()
+                activeOAuthFlows.set(serverName, controller)
+                oauthPromise = launch(config, controller)
+              }
+              const authorizedServerKey = getServerKey(
+                serverName,
+                effectiveAuthorization.config,
               )
 
               // Wait for the auth URL (or the flow to complete without needing redirect)
@@ -4089,59 +5573,127 @@ function runHeadlessStreaming(
                   // The OAuth flow may outlive the activation/config snapshot
                   // that authorized it. Rebuild after tokens land and refuse
                   // reconnect if the server was disabled or gained a blocker.
+                  if (activeOAuthFlows.get(serverName) !== controller) return
                   clearMcpAuthCache()
-                  const freshConfig = await getActiveMcpConfigByName(serverName)
-                  if (!freshConfig) return
-                  const result = await reconnectMcpServerImpl(
-                    serverName,
-                    freshConfig,
-                  )
-                  const prefix = getMcpPrefix(serverName)
-                  setAppState(prev => ({
-                    ...prev,
-                    mcp: {
-                      ...prev.mcp,
-                      clients: prev.mcp.clients.map(c =>
-                        c.name === serverName ? result.client : c,
-                      ),
-                      tools: [
-                        ...reject(prev.mcp.tools, t =>
-                          t.name?.startsWith(prefix),
+                  if (!separateProcessMcpOwners) {
+                    const freshConfig =
+                      await getActiveMcpConfigByName(serverName)
+                    if (!freshConfig) return
+                    const result = await reconnectMcpServerImpl(
+                      serverName,
+                      freshConfig,
+                    )
+                    const prefix = getMcpPrefix(serverName)
+                    setAppState(prev => ({
+                      ...prev,
+                      mcp: {
+                        ...prev.mcp,
+                        clients: prev.mcp.clients.map(client =>
+                          client.name === serverName ? result.client : client,
                         ),
-                        ...result.tools,
-                      ],
-                      commands: [
-                        ...reject(prev.mcp.commands, c =>
-                          commandBelongsToServer(c, serverName),
-                        ),
-                        ...result.commands,
-                      ],
-                      resources:
-                        result.resources && result.resources.length > 0
-                          ? {
-                              ...prev.mcp.resources,
-                              [serverName]: result.resources,
-                            }
-                          : omit(prev.mcp.resources, serverName),
-                    },
-                  }))
-                  // Also update dynamicMcpState so run() picks up the new tools
-                  // on the next turn (run() reads dynamicMcpState, not appState)
-                  dynamicMcpState = {
-                    ...dynamicMcpState,
-                    clients: [
-                      ...dynamicMcpState.clients.filter(
-                        c => c.name !== serverName,
-                      ),
+                        tools: [
+                          ...reject(prev.mcp.tools, tool =>
+                            tool.name?.startsWith(prefix),
+                          ),
+                          ...result.tools,
+                        ],
+                        commands: [
+                          ...reject(prev.mcp.commands, command =>
+                            commandBelongsToServer(command, serverName),
+                          ),
+                          ...result.commands,
+                        ],
+                        resources:
+                          result.resources && result.resources.length > 0
+                            ? {
+                                ...prev.mcp.resources,
+                                [serverName]: result.resources,
+                              }
+                            : omit(prev.mcp.resources, serverName),
+                      },
+                    }))
+                    syncHeadlessMcpRuntime(
+                      serverName,
                       result.client,
-                    ],
-                    tools: [
-                      ...dynamicMcpState.tools.filter(
-                        t => !t.name?.startsWith(prefix),
-                      ),
-                      ...result.tools,
-                    ],
+                      result.tools,
+                    )
+                    return
                   }
+
+                  if (!directAuthorizationOwner) return
+                  await runDirectMcpMutation(async () => {
+                    if (activeOAuthFlows.get(serverName) !== controller) {
+                      return
+                    }
+                    const target = getDirectOwnedMcpTarget(serverName)
+                    const freshConfig =
+                      directAuthorizationOwner === 'plugin'
+                        ? await getActiveMcpConfigByName(serverName)
+                        : target &&
+                            target.owner === directAuthorizationOwner
+                          ? target.config
+                          : null
+                    if (
+                      !freshConfig ||
+                      (freshConfig.type !== 'sse' &&
+                        freshConfig.type !== 'http')
+                    ) {
+                      return
+                    }
+                    if (
+                      !canCommitDirectMcpOAuthGeneration({
+                        sameGeneration:
+                          activeOAuthFlows.get(serverName) === controller,
+                        expectedOwner: directAuthorizationOwner,
+                        currentOwner: target?.owner ?? null,
+                        authorizedServerKey,
+                        currentServerKey: getServerKey(
+                          serverName,
+                          freshConfig,
+                        ),
+                        disabled:
+                          directControlDisabledMcpNames.has(serverName),
+                      })
+                    ) {
+                      return
+                    }
+                    const admissionError = directMcpControlAdmissionError(
+                      serverName,
+                      freshConfig,
+                    )
+                    if (admissionError) {
+                      logForDebugging(
+                        `Refusing MCP reconnect after OAuth for "${serverName}": ${admissionError}`,
+                        { level: 'warn' },
+                      )
+                      return
+                    }
+                    if (
+                      target?.owner === 'plugin' &&
+                      getServerCacheKey(serverName, target.config) !==
+                        getServerCacheKey(serverName, freshConfig)
+                    ) {
+                      await evictExistingServerCache(
+                        serverName,
+                        target.config,
+                      )
+                    }
+                    const result = await reconnectMcpServerImpl(
+                      serverName,
+                      freshConfig,
+                    )
+                    if (activeOAuthFlows.get(serverName) !== controller) {
+                      await evictExistingServerCache(
+                        serverName,
+                        freshConfig,
+                      )
+                      return
+                    }
+                    commitDirectMcpReconnect(serverName, result, {
+                      owner: directAuthorizationOwner,
+                      config: freshConfig,
+                    })
+                  })
                 })
                 .catch(error => {
                   logForDebugging(
@@ -4348,50 +5900,240 @@ function runHeadlessStreaming(
                 return
               }
 
-              // Token installation is now committed. Discovery and account
-              // projection failures must degrade to a closed empty snapshot,
-              // not report a false login failure while leaving stale UI and
-              // TypeScript command state behind.
-              let refreshed
+              const releaseCatalog =
+                commandCatalogPublisher?.hold() ?? (() => {})
               try {
-                refreshed = await refreshControlAuthCatalog(
-                  routePolicy.commandLoader,
-                  cwd(),
-                )
-              } catch (error) {
-                refreshed = conservativeControlAuthCatalog()
-                logForDebugging(
-                  `[direct-tui] login credentials were committed but the auth/catalog refresh degraded safely: ${errorMessage(error)}`,
-                  { level: 'warn' },
-                )
-              }
-              if (!commandCatalogLifecycle.replace(refreshed.commands)) {
-                logForDebugging(
-                  '[direct-tui] login credentials were committed after the command catalog lifecycle closed; refusing a stale completion acknowledgement',
-                  { level: 'warn' },
-                )
-                return
-              }
-              try {
-                sendControlResponseSuccess(
-                  message,
-                  refreshed.response,
-                )
-              } catch (error) {
-                logForDebugging(
-                  `[direct-tui] login credentials were committed but the completion response could not be queued: ${errorMessage(error)}`,
-                  { level: 'warn' },
-                )
+
+                // Token installation is now committed. Discovery and account
+                // projection failures must degrade to a closed empty snapshot,
+                // not report a false login failure while leaving stale UI and
+                // TypeScript command state behind.
+                let refreshed
+                try {
+                  refreshed = await refreshControlAuthCatalog(
+                    routePolicy.commandLoader,
+                    cwd(),
+                    undefined,
+                    routePolicy.directQueryEventDelivery,
+                  )
+                } catch (error) {
+                  refreshed = conservativeControlAuthCatalog()
+                  logForDebugging(
+                    `[direct-tui] login credentials were committed but the auth/catalog refresh degraded safely: ${errorMessage(error)}`,
+                    { level: 'warn' },
+                  )
+                }
+                if (!commandCatalogLifecycle.replace(refreshed.commands)) {
+                  logForDebugging(
+                    '[direct-tui] login credentials were committed after the command catalog lifecycle closed; refusing a stale completion acknowledgement',
+                    { level: 'warn' },
+                  )
+                  return
+                }
+                try {
+                  sendControlResponseSuccess(
+                    message,
+                    withCurrentControlAuthCommandCatalog(
+                      refreshed.response,
+                      currentCatalogCommands(),
+                      routePolicy.directQueryEventDelivery,
+                    ),
+                  )
+                } catch (error) {
+                  logForDebugging(
+                    `[direct-tui] login credentials were committed but the completion response could not be queued: ${errorMessage(error)}`,
+                    { level: 'warn' },
+                  )
+                }
+              } finally {
+                releaseCatalog()
               }
             })()
           }
         } else if (req.subtype === 'mcp_clear_auth') {
           const { serverName } = req
+          if (separateProcessMcpOwners) {
+            const initialTarget = getDirectOwnedMcpTarget(serverName)
+            const inventoryRecord =
+              (!initialTarget || initialTarget.owner === 'plugin') &&
+              isPluginMcpRuntimeName(serverName)
+                ? (await getCrabCodeMcpConfigs()).pluginInventory.find(
+                    record => record.runtimeName === serverName,
+                  )
+                : undefined
+            if (isDirectTuiSdkMcpInventoryRecord(inventoryRecord)) {
+              sendControlResponseError(
+                message,
+                DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+              )
+              continue
+            }
+            const initialConfig =
+              initialTarget?.config ?? getMcpConfigByName(serverName)
+            if (!initialConfig) {
+              sendControlResponseError(
+                message,
+                `Server not found: ${serverName}`,
+              )
+              continue
+            }
+            if (initialConfig.type === 'sdk') {
+              sendControlResponseError(
+                message,
+                DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+              )
+              continue
+            }
+            if (
+              initialConfig.type !== 'sse' &&
+              initialConfig.type !== 'http'
+            ) {
+              sendControlResponseError(
+                message,
+                `Cannot clear auth for server type "${initialConfig.type}"`,
+              )
+              continue
+            }
+
+            const releaseCatalog = commandCatalogPublisher?.hold() ?? (() => {})
+            try {
+              const outcome = await runDirectMcpMutation(async () => {
+                const target = getDirectOwnedMcpTarget(serverName)
+                const config = target?.config
+                if (!target || !config) {
+                  return {
+                    ok: false as const,
+                    error: `Server not found: ${serverName}`,
+                  }
+                }
+                if (config.type !== 'sse' && config.type !== 'http') {
+                  return {
+                    ok: false as const,
+                    error: `Cannot clear auth for server type "${config.type}"`,
+                  }
+                }
+                if (target.owner === 'plugin') {
+                  const latestInventoryRecord = (
+                    await getCrabCodeMcpConfigs()
+                  ).pluginInventory.find(
+                    record => record.runtimeName === serverName,
+                  )
+                  if (
+                    isDirectTuiSdkMcpInventoryRecord(latestInventoryRecord)
+                  ) {
+                    return {
+                      ok: false as const,
+                      error: DIRECT_TUI_SDK_MCP_UNSUPPORTED_ERROR,
+                    }
+                  }
+                }
+                await cancelActiveMcpOAuthFlow(serverName)
+                const retainedConfig = await clearMcpAuthenticationRuntime(
+                  serverName,
+                  config,
+                  {
+                    retainUnpersistedDynamic:
+                      target.owner === 'public' || target.owner === 'fixed',
+                    resolveFreshConfig: async () => {
+                      const currentTarget =
+                        getDirectOwnedMcpTarget(serverName)
+                      if (currentTarget?.owner !== target.owner) return null
+                      if (target.owner !== 'plugin') {
+                        return getServerCacheKey(
+                          serverName,
+                          currentTarget.config,
+                        ) === getServerCacheKey(serverName, config)
+                          ? currentTarget.config
+                          : null
+                      }
+                      const freshPluginConfig =
+                        await getActiveMcpConfigByName(serverName)
+                      return freshPluginConfig &&
+                        getServerCacheKey(serverName, freshPluginConfig) ===
+                          getServerCacheKey(serverName, config)
+                        ? freshPluginConfig
+                        : null
+                    },
+                  },
+                )
+                const needsAuthClient = retainedConfig
+                  ? ({
+                      name: serverName,
+                      type: 'needs-auth' as const,
+                      config: retainedConfig,
+                    } satisfies MCPServerConnection)
+                  : null
+                if (needsAuthClient) {
+                  const prefix = getMcpPrefix(serverName)
+                  if (target.owner === 'public') {
+                    dynamicMcpState = {
+                      ...dynamicMcpState,
+                      configs: {
+                        ...dynamicMcpState.configs,
+                        [serverName]: retainedConfig,
+                      },
+                    }
+                  } else if (target.owner === 'plugin') {
+                    pluginProcessMcpState = {
+                      ...pluginProcessMcpState,
+                      configs: {
+                        ...pluginProcessMcpState.configs,
+                        [serverName]: retainedConfig,
+                      },
+                    }
+                  }
+                  syncHeadlessMcpRuntime(serverName, needsAuthClient, [])
+                  setAppState(prev => ({
+                    ...prev,
+                    mcp: {
+                      ...prev.mcp,
+                      clients: upsertConnection(
+                        prev.mcp.clients,
+                        needsAuthClient,
+                      ),
+                      tools: reject(prev.mcp.tools, tool =>
+                        tool.name?.startsWith(prefix),
+                      ),
+                      commands: reject(prev.mcp.commands, command =>
+                        commandOwnedByMcpServer(command, serverName),
+                      ),
+                      resources: omit(prev.mcp.resources, serverName),
+                    },
+                  }))
+                } else {
+                  clearDirectMcpProjection(serverName)
+                  if (target.owner === 'plugin') {
+                    const { [serverName]: _removed, ...configs } =
+                      pluginProcessMcpState.configs
+                    pluginProcessMcpState = {
+                      ...pluginProcessMcpState,
+                      clients: pluginProcessMcpState.clients.filter(
+                        client => client.name !== serverName,
+                      ),
+                      tools: pluginProcessMcpState.tools.filter(
+                        tool =>
+                          !tool.name?.startsWith(getMcpPrefix(serverName)),
+                      ),
+                      configs,
+                    }
+                  }
+                }
+                return { ok: true as const }
+              })
+              if (outcome.ok) sendControlResponseSuccess(message, {})
+              else sendControlResponseError(message, outcome.error)
+            } finally {
+              releaseCatalog()
+            }
+            continue
+          }
           const currentAppState = getAppState()
           const config =
             mcpClients.find(c => c.name === serverName)?.config ??
             sdkClients.find(c => c.name === serverName)?.config ??
             dynamicMcpState.clients.find(c => c.name === serverName)?.config ??
+            pluginProcessMcpState.clients.find(c => c.name === serverName)
+              ?.config ??
             currentAppState.mcp.clients.find(c => c.name === serverName)
               ?.config ??
             getMcpConfigByName(serverName) ??
@@ -4411,7 +6153,7 @@ function runHeadlessStreaming(
                 retainUnpersistedDynamic: Object.prototype.hasOwnProperty.call(
                   dynamicMcpState.configs,
                   serverName,
-                ),
+                ) || startupSessionProcessMcpNames.has(serverName),
               },
             )
             const prefix = getMcpPrefix(serverName)
@@ -4590,12 +6332,22 @@ function runHeadlessStreaming(
                   }
                 : await buildSideQuestionFallbackParams({
                     tools: buildAllTools(getAppState()),
-                    commands: currentCommands,
-                    mcpClients: [
-                      ...getAppState().mcp.clients,
-                      ...sdkClients,
-                      ...dynamicMcpState.clients,
-                    ],
+                    commands: currentCatalogCommands(),
+                    mcpClients: separateProcessMcpOwners
+                      ? uniqBy(
+                          [
+                            ...getAppState().mcp.clients,
+                            ...sdkClients,
+                            ...dynamicMcpState.clients,
+                            ...pluginProcessMcpState.clients,
+                          ],
+                          'name',
+                        )
+                      : [
+                          ...getAppState().mcp.clients,
+                          ...sdkClients,
+                          ...dynamicMcpState.clients,
+                        ],
                     messages: mutableMessages,
                     readFileState,
                     getAppState,
@@ -4766,6 +6518,9 @@ function runHeadlessStreaming(
       commandCatalogLifecycle.close()
       commandCatalogPublisher?.close()
       unsubscribeSkillChanges()
+      unsubscribeAppStateCommandCatalog?.()
+      unsubscribeSettingsCommandCatalog?.()
+      options.closeHeadlessSettings?.()
       unsubscribeAuthStatus?.()
       statusListeners.delete(rateLimitListener)
       output.done()

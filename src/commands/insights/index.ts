@@ -20,6 +20,7 @@ import {
   loadAllLogsFromSessionFile,
 } from '../../utils/sessionStorage.js'
 import { jsonParse, jsonStringify } from '../../utils/slowOperations.js'
+import { AbortError } from '../../utils/errors.js'
 import { localExecBridge } from 'src/runtime/localProcess.js'
 import {
   extractFacetsFromAPI,
@@ -340,8 +341,15 @@ export function buildExportData(
 // Main Function
 // ============================================================================
 
+function throwIfInsightsAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new AbortError('Insights generation cancelled')
+  }
+}
+
 export async function generateUsageReport(options?: {
   collectRemote?: boolean
+  signal?: AbortSignal
 }): Promise<{
   insights: InsightResults
   htmlPath: string
@@ -349,6 +357,8 @@ export async function generateUsageReport(options?: {
   remoteStats?: { hosts: RemoteHostInfo[]; totalCopied: number }
   facets: Map<string, SessionFacets>
 }> {
+  const signal = options?.signal
+  throwIfInsightsAborted(signal)
   let remoteStats: { hosts: RemoteHostInfo[]; totalCopied: number } | undefined
 
   // Optionally collect data from remote hosts first (ant-only)
@@ -356,10 +366,12 @@ export async function generateUsageReport(options?: {
     const destDir = join(getCrabCodeConfigHomeDir(), 'projects')
     const { hosts, totalCopied } = await collectAllRemoteHostData(destDir)
     remoteStats = { hosts, totalCopied }
+    throwIfInsightsAborted(signal)
   }
 
   // Phase 1: Lite scan — filesystem metadata only (no JSONL parsing)
   const allScannedSessions = await scanAllSessions()
+  throwIfInsightsAborted(signal)
   const totalSessionsScanned = allScannedSessions.length
 
   // Phase 2: Load SessionMeta — use cache where available, parse only uncached
@@ -370,6 +382,7 @@ export async function generateUsageReport(options?: {
   const uncachedSessions: LiteSessionInfo[] = []
 
   for (let i = 0; i < allScannedSessions.length; i += META_BATCH_SIZE) {
+    throwIfInsightsAborted(signal)
     const batch = allScannedSessions.slice(i, i + META_BATCH_SIZE)
     const results = await Promise.all(
       batch.map(async sessionInfo => ({
@@ -384,6 +397,7 @@ export async function generateUsageReport(options?: {
         uncachedSessions.push(sessionInfo)
       }
     }
+    throwIfInsightsAborted(signal)
   }
 
   // Load full message data only for uncached sessions and compute SessionMeta
@@ -410,6 +424,7 @@ export async function generateUsageReport(options?: {
   // Load uncached sessions in batches to yield to event loop between batches
   const LOAD_BATCH_SIZE = 10
   for (let i = 0; i < uncachedSessions.length; i += LOAD_BATCH_SIZE) {
+    throwIfInsightsAborted(signal)
     const batch = uncachedSessions.slice(i, i + LOAD_BATCH_SIZE)
     const batchResults = await Promise.all(
       batch.map(async sessionInfo => {
@@ -433,6 +448,7 @@ export async function generateUsageReport(options?: {
       }
     }
     await Promise.all(metasToSave.map(meta => saveSessionMeta(meta)))
+    throwIfInsightsAborted(signal)
   }
 
   // Deduplicate session branches (keep the one with most user messages per session_id)
@@ -485,6 +501,7 @@ export async function generateUsageReport(options?: {
       cached: await loadCachedFacets(meta.session_id),
     })),
   )
+  throwIfInsightsAborted(signal)
   for (const { sessionId, cached } of cachedFacetResults) {
     if (cached) {
       facets.set(sessionId, cached)
@@ -499,6 +516,7 @@ export async function generateUsageReport(options?: {
   // Extract facets for sessions that need them (50 concurrent)
   const CONCURRENCY = 50
   for (let i = 0; i < toExtract.length; i += CONCURRENCY) {
+    throwIfInsightsAborted(signal)
     const batch = toExtract.slice(i, i + CONCURRENCY)
     const results = await Promise.all(
       batch.map(async ({ log, sessionId }) => {
@@ -515,6 +533,7 @@ export async function generateUsageReport(options?: {
       }
     }
     await Promise.all(facetsToSave.map(f => saveFacets(f)))
+    throwIfInsightsAborted(signal)
   }
 
   // Filter out warmup/minimal sessions (matching Python's is_minimal)
@@ -542,12 +561,15 @@ export async function generateUsageReport(options?: {
   aggregated.total_sessions_scanned = totalSessionsScanned
 
   // Generate parallel insights from CrabCode (6 sections)
+  throwIfInsightsAborted(signal)
   const insights = await generateParallelInsights(aggregated, facets)
+  throwIfInsightsAborted(signal)
 
   // Generate HTML report
   const htmlReport = generateHtmlReport(aggregated, insights)
 
   // Save reports
+  throwIfInsightsAborted(signal)
   try {
     await mkdir(getDataDir(), { recursive: true })
   } catch {
@@ -559,6 +581,7 @@ export async function generateUsageReport(options?: {
     encoding: 'utf-8',
     mode: 0o600,
   })
+  throwIfInsightsAborted(signal)
 
   return {
     insights,
@@ -586,7 +609,9 @@ const usageReport: Command = {
     return t('cmd_insights_progress')
   },
   source: 'builtin',
-  async getPromptForCommand(args) {
+  async getPromptForCommand(args, context) {
+    const signal = context.abortController.signal
+    throwIfInsightsAborted(signal)
     let collectRemote = false
     let remoteHosts: string[] = []
     let hasRemoteHosts = false
@@ -608,8 +633,9 @@ const usageReport: Command = {
     }
 
     const { insights, htmlPath, data, remoteStats } = await generateUsageReport(
-      { collectRemote },
+      { collectRemote, signal },
     )
+    throwIfInsightsAborted(signal)
 
     let reportUrl = `file://${htmlPath}`
     let uploadHint = ''
@@ -695,6 +721,7 @@ ${remoteInfo}
 Your full shareable insights report is ready: ${reportUrl}${uploadHint}`
 
     // Return prompt for CrabCode to respond to
+    throwIfInsightsAborted(signal)
     return [
       {
         type: 'text',

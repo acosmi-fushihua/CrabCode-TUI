@@ -58,6 +58,7 @@ import { logError } from 'src/utils/log.js'
 import { logForDebugging } from 'src/utils/debug.js'
 import { toError } from 'src/utils/errors.js'
 import {
+  getRoutableCommandInvocationNames,
   type Command,
   isCommandEnabled,
 } from 'src/types/command.js'
@@ -230,19 +231,27 @@ const DIRECT_TUI_BUILTINS: readonly Command[] = [
 
 /**
  * These invocation names are owned by the Rust renderer in the direct TUI.
- * Exclude a discovered command that claims either canonical name or an alias
- * so runtime discovery cannot silently shadow the renderer's control-backed
- * lifecycle.
+ * Exclude a discovered command that claims any backend-routable name so
+ * runtime discovery cannot silently shadow the renderer's private lifecycle.
  */
 const DIRECT_TUI_RENDERER_OWNED_INVOCATIONS = new Set([
+  'bug',
+  'feedback',
   'logout',
   'reload-plugins',
 ])
 
 function claimsDirectTuiRendererOwnedInvocation(command: Command): boolean {
-  return [command.name, ...(command.aliases ?? [])].some(name =>
-    DIRECT_TUI_RENDERER_OWNED_INVOCATIONS.has(name),
-  )
+  try {
+    for (const name of getRoutableCommandInvocationNames(command)) {
+      if (DIRECT_TUI_RENDERER_OWNED_INVOCATIONS.has(name)) return true
+    }
+  } catch {
+    // A discovered callback has no static no-throw guarantee. Exclude that
+    // one command fail-closed instead of losing the entire direct registry.
+    return true
+  }
+  return false
 }
 
 const HEADLESS_BUILTIN_NAMES = new Set(

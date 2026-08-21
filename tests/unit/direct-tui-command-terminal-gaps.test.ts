@@ -5,9 +5,16 @@ import {
   setDefaultTimeout,
   test,
 } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { readLastJsonEvidence } from '../helpers/readLastJsonEvidence.js'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..')
 const FIXTURE = join(
@@ -111,9 +118,7 @@ function assistantText(scenario: Pick<Scenario, 'envelopes'>): string {
   )
 }
 
-function parseLastJson(stdout: string): unknown {
-  return JSON.parse(stdout.trim().split('\n').at(-1) ?? '')
-}
+let fixtureSequence = 0
 
 async function spawnFixture(options: {
   auditRoot: string
@@ -123,6 +128,11 @@ async function spawnFixture(options: {
   mode: 'matrix' | 'recover'
   recovery?: unknown
 }): Promise<unknown> {
+  const outputPath = join(
+    options.auditRoot,
+    `terminal-gaps-${options.mode}-${fixtureSequence++}.json`,
+  )
+  const errorPath = `${outputPath}.stderr`
   const child = Bun.spawn({
     cmd: [process.execPath, FIXTURE],
     cwd: REPO_ROOT,
@@ -142,16 +152,13 @@ async function spawnFixture(options: {
         ? {}
         : { TERMINAL_GAPS_RECOVERY: JSON.stringify(options.recovery) }),
     },
-    stdout: 'pipe',
-    stderr: 'pipe',
+    stdout: Bun.file(outputPath),
+    stderr: Bun.file(errorPath),
   })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
+  const exitCode = await child.exited
+  const stderr = readFileSync(errorPath, 'utf8')
   expect(exitCode, stderr).toBe(0)
-  return parseLastJson(stdout)
+  return readLastJsonEvidence(outputPath)
 }
 
 describe('direct TUI compact-history and clear alias terminal truth', () => {

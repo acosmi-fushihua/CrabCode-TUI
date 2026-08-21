@@ -224,6 +224,25 @@ export function getCommandName(cmd: CommandBase): string {
   return cmd.userFacingName?.() ?? cmd.name
 }
 
+/**
+ * Yield every token that the existing command dispatcher can route.
+ *
+ * Canonical names and declared aliases are always routable. Commands without
+ * the newer `skillInterface` metadata also retain the historical
+ * `userFacingName()` routing fallback used by user skills and MCP prompts.
+ * Keep this lazy so an exact canonical/alias match does not evaluate a
+ * presentation callback that the previous dispatcher would never call.
+ */
+export function* getRoutableCommandInvocationNames(
+  command: CommandBase,
+): Generator<string> {
+  yield command.name
+  yield* command.aliases ?? []
+  if (command.skillInterface === undefined) {
+    yield getCommandName(command)
+  }
+}
+
 /** Resolves whether the command is enabled, defaulting to true. */
 export function isCommandEnabled(cmd: CommandBase): boolean {
   return cmd.isEnabled?.() ?? true
@@ -255,12 +274,10 @@ export function matchesCommandInvocation(
   command: Command,
   commandName: string,
 ): boolean {
-  return (
-    command.name === commandName ||
-    command.aliases?.includes(commandName) === true ||
-    (command.skillInterface === undefined &&
-      getCommandName(command) === commandName)
-  )
+  for (const invocationName of getRoutableCommandInvocationNames(command)) {
+    if (invocationName === commandName) return true
+  }
+  return false
 }
 
 export function findCommand(

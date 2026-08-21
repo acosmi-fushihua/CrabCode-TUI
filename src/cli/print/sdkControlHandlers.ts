@@ -5,7 +5,10 @@ import {
   clearHeadlessCommandMemoizationCaches,
   formatHeadlessCommandDescription,
 } from 'src/cli/headlessCommands.js'
-import { projectCommandCatalogEntries } from 'src/cli/commandCatalogProjection.js'
+import {
+  projectCommandCatalogEntries,
+  projectDirectTuiCommandCatalogEntries,
+} from 'src/cli/commandCatalogProjection.js'
 import type { ToolPermissionContext } from 'src/Tool.js'
 import {
   type AgentDefinition,
@@ -101,10 +104,41 @@ type StdoutMessageSink = {
   enqueue(message: StdoutMessage): void
 }
 
+export type InitializeCommandCatalog =
+  | readonly Command[]
+  | (() => Promise<readonly Command[]>)
+
 export type SDKControlAuthCatalogResponse = Pick<
   SDKControlInitializeResponse,
   'account' | 'commands'
 >
+
+/**
+ * Replace only the command half of an authentication snapshot.
+ *
+ * Direct TUI authentication commits the base registry first, then reads the
+ * live MCP inventory from AppState. Keeping this projection in the existing
+ * control shape lets the correlated response carry the exact executable
+ * catalog without changing the public authentication protocol.
+ */
+export function withCurrentControlAuthCommandCatalog(
+  response: SDKControlAuthCatalogResponse,
+  commands: readonly Command[],
+  strictDirectTuiCatalog = false,
+): SDKControlAuthCatalogResponse {
+  return {
+    ...response,
+    commands: strictDirectTuiCatalog
+      ? projectDirectTuiCommandCatalogEntries(
+          commands,
+          formatHeadlessCommandDescription,
+        )
+      : projectCommandCatalogEntries(
+          commands,
+          formatHeadlessCommandDescription,
+        ),
+  }
+}
 
 type AuthCatalogRefreshDependencies = {
   clearCommandCaches: () => void
@@ -145,6 +179,7 @@ export async function refreshControlAuthCatalog(
   currentCwd: string,
   dependencies: AuthCatalogRefreshDependencies =
     AUTH_CATALOG_REFRESH_DEPENDENCIES,
+  strictDirectTuiCatalog = false,
 ): Promise<AuthCatalogSnapshot> {
   dependencies.clearCommandCaches()
   const commands = await commandLoader(currentCwd)
@@ -152,10 +187,15 @@ export async function refreshControlAuthCatalog(
   return {
     commands,
     response: {
-      commands: projectCommandCatalogEntries(
-        commands,
-        formatHeadlessCommandDescription,
-      ),
+      commands: strictDirectTuiCatalog
+        ? projectDirectTuiCommandCatalogEntries(
+            commands,
+            formatHeadlessCommandDescription,
+          )
+        : projectCommandCatalogEntries(
+            commands,
+            formatHeadlessCommandDescription,
+          ),
       account: {
         email: accountInfo?.email,
         organization: accountInfo?.organization,
@@ -214,7 +254,7 @@ async function refreshSignedOutControlAuthCatalog(
   return {
     commands,
     response: {
-      commands: projectCommandCatalogEntries(
+      commands: projectDirectTuiCommandCatalogEntries(
         commands,
         formatHeadlessCommandDescription,
       ),
@@ -237,6 +277,7 @@ export async function handleDirectTuiLogoutRequest(
   dependencies: DirectTuiLogoutDependencies =
     DIRECT_TUI_LOGOUT_DEPENDENCIES,
   commitCommands?: (commands: readonly Command[]) => unknown,
+  getCommittedCatalogCommands?: () => readonly Command[],
 ): Promise<Command[] | null> {
   if (!interactiveProductSession) {
     output.enqueue({
@@ -307,12 +348,19 @@ export async function handleDirectTuiLogoutRequest(
   commitCommands?.(refreshed.commands)
 
   try {
+    const response = getCommittedCatalogCommands
+      ? withCurrentControlAuthCommandCatalog(
+          refreshed.response,
+          getCommittedCatalogCommands(),
+          true,
+        )
+      : refreshed.response
     output.enqueue({
       type: 'control_response',
       response: {
         subtype: 'success',
         request_id: requestId,
-        response: refreshed.response,
+        response,
       },
     })
   } catch (error) {
@@ -349,7 +397,7 @@ export async function handleInitializeRequest(
   requestId: string,
   initialized: boolean,
   output: StdoutMessageSink,
-  commands: Command[],
+  commands: InitializeCommandCatalog,
   modelInfos: ModelInfo[],
   structuredIO: StructuredIO,
   enableAuthStatus: boolean,
@@ -362,6 +410,7 @@ export async function handleInitializeRequest(
   },
   agents: AgentDefinition[],
   getAppState: () => AppState,
+  strictDirectTuiCatalog = false,
 ): Promise<void> {
   if (initialized) {
     output.enqueue({
@@ -468,11 +517,23 @@ export async function handleInitializeRequest(
   if (request.jsonSchema) {
     setInitJsonSchema(request.jsonSchema)
   }
+  // Resolve a direct runtime's catalog as the final asynchronous operation
+  // before constructing its correlated initialize response. The resolver can
+  // wait for every catalog refresh revision that appeared while earlier
+  // initialize work was in flight. Standard SDK callers retain the eager
+  // array path and its established timing.
+  const resolvedCommands =
+    typeof commands === 'function' ? await commands() : commands
   const initResponse: SDKControlInitializeResponse = {
-    commands: projectCommandCatalogEntries(
-      commands,
-      formatHeadlessCommandDescription,
-    ),
+    commands: strictDirectTuiCatalog
+      ? projectDirectTuiCommandCatalogEntries(
+          resolvedCommands,
+          formatHeadlessCommandDescription,
+        )
+      : projectCommandCatalogEntries(
+          resolvedCommands,
+          formatHeadlessCommandDescription,
+        ),
     agents: agents.map(agent => ({
       name: agent.agentType,
       description: agent.whenToUse,
