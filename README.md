@@ -14,6 +14,8 @@ CrabCode TUI 是 CrabCode 的纯终端开源版本。Rust 进程独占终端、�
 
 稳定版始终以 GitHub `latest` Release 的公开资产为准。普通安装只需要一条命令，不需要 GitHub CLI：
 
+> `latest` 会随新版本变化，并会先执行远程 bootstrap。需要固定版本时，请使用下方的 `CRABCODE_VERSION` 或离线资产模式。
+
 macOS：
 
 ```bash
@@ -26,7 +28,43 @@ Windows PowerShell：
 irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex
 ```
 
-安装器会校验发布级 SHA-256 和包内逐文件 manifest。需要额外验证 GitHub build provenance 的用户，可从 [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest) 下载对应资产后运行 `gh attestation verify`；该审计流程不再冒充普通安装入口。正式包仅提供 macOS arm64、macOS x64 和 Windows x64，并内含 `crabcode`、原生 TUI、Bun、Memory/cron 侧车、ripgrep、浏览器后端、图像原生库和 Account Bridge。Linux 用户仍可从源码构建。
+安装器会校验发布级 SHA-256 和包内逐文件 manifest。Windows ZIP 还可运行 `gh attestation verify <ZIP路径> --repo acosmi/CrabCode-TUI` 验证 GitHub build provenance；macOS 包使用 Release 中的 `macos-local-provenance.json` 及其 SSH 签名，不提供 GitHub attestation。正式包仅提供 macOS arm64、macOS x64 和 Windows x64，并内含 `crabcode`、原生 TUI、Bun、Memory/cron 侧车、ripgrep、浏览器后端、图像原生库和 Account Bridge。Linux 用户仍可从源码构建。
+
+### 安装变量
+
+macOS 的 `install.sh` 与 Windows 的 `install.ps1` 都支持以下环境变量：
+
+| 变量 | 作用 | 默认值 / 约束 |
+| --- | --- | --- |
+| `CRABCODE_VERSION` | 固定安装版本，可写 `1.0.35` 或 `v1.0.35` | 未设置时从 `latest` 的校验清单自动选择 |
+| `CRABCODE_ASSET_DIR` | 从已下载资产离线安装 | 必须是绝对路径，并同时设置 `CRABCODE_VERSION`；目录需包含对应平台归档和 `checksums-sha256.txt` |
+| `CRABCODE_BIN_DIR` | 放置稳定启动器 `crabcode` / `crabcode.exe` | macOS：`~/.local/bin`；Windows：`%USERPROFILE%\.crabcode\bin`；自定义时使用绝对路径 |
+| `XDG_DATA_HOME` | 保存不可变版本目录 | macOS：`$HOME/.local/share`；Windows：`%USERPROFILE%\.local\share`；自定义时使用绝对路径 |
+
+固定版本在线安装（以 `1.0.35` 为例）：
+
+```bash
+curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/download/v1.0.35/install.sh -o /tmp/crabcode-install.sh
+CRABCODE_VERSION=1.0.35 sh /tmp/crabcode-install.sh
+```
+
+```powershell
+$env:CRABCODE_VERSION = '1.0.35'
+irm https://github.com/acosmi/CrabCode-TUI/releases/download/v1.0.35/install.ps1 | iex
+Remove-Item Env:CRABCODE_VERSION
+```
+
+离线安装时，把安装器、对应平台归档和 `checksums-sha256.txt` 放进同一目录：
+
+```bash
+CRABCODE_VERSION=1.0.35 CRABCODE_ASSET_DIR=/绝对路径/CrabCode安装资产 sh /绝对路径/CrabCode安装资产/install.sh
+```
+
+```powershell
+$env:CRABCODE_VERSION='1.0.35'; $env:CRABCODE_ASSET_DIR='C:\CrabCode安装资产'; & "$env:CRABCODE_ASSET_DIR\install.ps1"
+```
+
+离线模式不会访问网络，CPU 架构由安装器自动识别。`CRABCODE_CONFIG_DIR` 不是安装位置变量，它只用于隔离安装后的运行时配置和会话。
 
 开源 TUI 与 GUI 的程序、安装目录和发布链完全分离。为避免同机测试或多产品复用默认 `~/.crabcode` 状态根，隔离运行时显式设置绝对路径 `CRABCODE_CONFIG_DIR`；该变量同时约束 Rust、TypeScript、memory、cron 与 renderer diagnostics。升级版继续保留默认状态位置，避免破坏既有 TUI 会话与配置。
 
@@ -185,7 +223,7 @@ bun run test:account-bridge
 bun run smoke:tui
 ```
 
-`bun run ci` 执行完整本地校验。发行工作流还会在 macOS arm64、macOS x64 与 Windows x64 三个原生平台构建、验证 Account Bridge 签名、生成逐文件清单、收集依赖许可、验证安装布局并为发布资产生成 SHA-256 与 GitHub 构建来源证明。
+`bun run ci` 执行完整本地校验。预发 CI 会在 macOS arm64、原生 macOS x64 与 Windows x64 构建并回放同一提交的候选包；签名 tag 工作流会重新构建 Windows x64 并生成 GitHub build provenance。正式 macOS 包使用独立的双次装配、回放与 SSH 签名本地构建来源证明；除 `checksums-sha256.txt` 本身外，公开资产均由该 SHA-256 清单约束。
 
 ## 开源与许可证
 

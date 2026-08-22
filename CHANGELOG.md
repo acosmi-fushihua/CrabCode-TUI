@@ -1,5 +1,46 @@
 # Changelog / 更新日志
 
+## v1.0.36 — 2026-08-21
+
+- Restores native TUI slash-command lifecycle: exact runtime tokens submit on
+  the first Enter, `--disable-slash-commands` stays closed after catalog
+  refresh, and the live catalog shares identity with first-wins slash routing.
+- Serializes MCP owner, policy, and live inventory mutations so public, plugin,
+  and startup-owned servers no longer replace each other or leave stale
+  tools/prompts after connect, disconnect, or refresh.
+- Splits fail-closed copy so unported tokens stay generic, while gated
+  runtime-catalog tokens report build, account, environment, or session
+  reasons. Stops advertising the `/proactive` stub, validates `/smallmodel`
+  names before persistence, and counts Slack app installs only after a
+  successful browser open.
+- Hides the Windows memory serving-child console with `CREATE_NO_WINDOW` only,
+  without detaching the foreground TUI console.
+- Documents installer pin and offline variables, and the split verification
+  story: Windows ZIPs keep GitHub build provenance, while macOS archives use
+  SSH-signed `macos-local-provenance.json`. The macOS bootstrap no longer
+  recommends `gh attestation verify`. Public scope remains macOS arm64,
+  macOS x64, and Windows x64.
+
+---
+
+- 修复原生 TUI 斜杠命令生命周期：精确输入的 runtime 命令第一次 Enter 即提交，
+  `--disable-slash-commands` 在目录刷新后仍保持关闭，实时目录与 first-wins
+  斜杠路由共用同一身份。
+- 串行化 MCP owner、策略与实时清单变更，避免 public / plugin / 启动固定
+  服务器互相覆盖，或在连接、断开、刷新后留下过期 tools/prompts。
+- 拆分 fail-closed 文案：未移植 token 保持通用不可用提示；被门控的 runtime
+  catalog token 按构建、账户、环境或会话原因说明。停止广告 `/proactive`
+  stub；写入 `/smallmodel` 前先校验名称；Slack 应用安装计数仅在浏览器成功
+  打开后增加。
+- Windows 记忆 serving 子进程仅使用 `CREATE_NO_WINDOW` 隐藏控制台，不拆离
+  前台 TUI 控制台。
+- 文档补充安装器的版本固定与离线变量，并写明核验分流：Windows ZIP 继续使用
+  GitHub build provenance，macOS 归档使用 SSH 签名的
+  `macos-local-provenance.json`。macOS bootstrap 不再推荐
+  `gh attestation verify`。公开范围仍为 macOS arm64、macOS x64 与 Windows x64。
+
+---
+
 ## v1.0.35 — 2026-08-14
 
 - Fixes the Windows one-line bootstrap for both Windows PowerShell 5.1 and

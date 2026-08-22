@@ -14,6 +14,8 @@ CrabCode TUI is CrabCode's terminal-only open-source edition. Rust owns the term
 
 The stable version is always the public GitHub `latest` Release. Ordinary installation is one command and does not require GitHub CLI:
 
+> `latest` moves when a new version is published and executes a remote bootstrap first. To pin a version, use `CRABCODE_VERSION` or the offline asset mode below.
+
 macOS:
 
 ```bash
@@ -26,7 +28,43 @@ Windows PowerShell:
 irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex
 ```
 
-The installer verifies the release SHA-256 and package per-file manifest. Users who require additional GitHub build-provenance verification can download the matching assets from [GitHub Releases](https://github.com/acosmi/CrabCode-TUI/releases/latest) and run `gh attestation verify`; that audit flow is no longer presented as the ordinary installer. Release archives are provided only for macOS arm64, macOS x64, and Windows x64, and bundle `crabcode`, the native TUI, Bun, memory/cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge. Linux users can still build from source.
+The installer verifies the release SHA-256 and package per-file manifest. A Windows ZIP can also be checked with `gh attestation verify <ZIP-path> --repo acosmi/CrabCode-TUI`; macOS archives use the Release's `macos-local-provenance.json` and SSH signature instead of GitHub attestation. Release archives are provided only for macOS arm64, macOS x64, and Windows x64, and bundle `crabcode`, the native TUI, Bun, memory/cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge. Linux users can still build from source.
+
+### Installer variables
+
+Both `install.sh` on macOS and `install.ps1` on Windows support these environment variables:
+
+| Variable | Purpose | Default / constraint |
+| --- | --- | --- |
+| `CRABCODE_VERSION` | Pin the version; accepts `1.0.35` or `v1.0.35` | When unset, the installer selects the version from the `latest` checksum manifest |
+| `CRABCODE_ASSET_DIR` | Install from downloaded assets | Must be an absolute path and used with `CRABCODE_VERSION`; the directory must contain the platform archive and `checksums-sha256.txt` |
+| `CRABCODE_BIN_DIR` | Location of the stable `crabcode` / `crabcode.exe` launcher | macOS: `~/.local/bin`; Windows: `%USERPROFILE%\.crabcode\bin`; use an absolute path when overriding |
+| `XDG_DATA_HOME` | Root for immutable installed versions | macOS: `$HOME/.local/share`; Windows: `%USERPROFILE%\.local\share`; use an absolute path when overriding |
+
+Pinned online install (using `1.0.35` as an example):
+
+```bash
+curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/download/v1.0.35/install.sh -o /tmp/crabcode-install.sh
+CRABCODE_VERSION=1.0.35 sh /tmp/crabcode-install.sh
+```
+
+```powershell
+$env:CRABCODE_VERSION = '1.0.35'
+irm https://github.com/acosmi/CrabCode-TUI/releases/download/v1.0.35/install.ps1 | iex
+Remove-Item Env:CRABCODE_VERSION
+```
+
+For an offline install, put the installer, platform archive, and `checksums-sha256.txt` in one directory:
+
+```bash
+CRABCODE_VERSION=1.0.35 CRABCODE_ASSET_DIR=/absolute/path/crabcode-assets sh /absolute/path/crabcode-assets/install.sh
+```
+
+```powershell
+$env:CRABCODE_VERSION='1.0.35'; $env:CRABCODE_ASSET_DIR='C:\crabcode-assets'; & "$env:CRABCODE_ASSET_DIR\install.ps1"
+```
+
+Offline mode makes no network requests, and the installer detects the CPU architecture automatically. `CRABCODE_CONFIG_DIR` is not an install-location variable; it isolates runtime configuration and sessions after installation.
 
 The open-source TUI and GUI have separate programs, installation roots, and release chains. For state isolation during same-machine testing or multi-product use, set `CRABCODE_CONFIG_DIR` to an absolute dedicated directory; the same authority covers Rust, TypeScript, memory, cron, and renderer diagnostics. Upgrades retain the historical default state location so existing TUI sessions and settings are not silently abandoned.
 
@@ -183,7 +221,7 @@ bun run test:account-bridge
 bun run smoke:tui
 ```
 
-`bun run ci` runs the full local validation. Release CI additionally builds on macOS arm64, macOS x64, and Windows x64, verifies Account Bridge signatures, writes a per-file manifest, collects dependency licenses, validates the install layout, and produces SHA-256 files plus GitHub build provenance for release assets.
+`bun run ci` runs the full local validation. Pre-release CI builds and replays same-commit candidates on macOS arm64, native macOS x64, and Windows x64. The signed-tag workflow rebuilds Windows x64 and produces its GitHub build provenance. Public macOS archives use a separate double-assembly, replay, and SSH-signed local provenance process; the Release checksum manifest covers every public asset except `checksums-sha256.txt` itself.
 
 ## Open source and licenses
 

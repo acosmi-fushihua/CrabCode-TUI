@@ -32,7 +32,7 @@ if [ -n "${CRABCODE_ASSET_DIR:-}" ] && [ -z "${CRABCODE_VERSION:-}" ]; then
 fi
 if [ -z "${CRABCODE_ASSET_DIR:-}" ]; then
   command -v curl >/dev/null 2>&1 || die "需要 curl 才能下载安装包"
-  info "安全提示：当前 bootstrap 本身未验证来源；推荐按 README 先用 gh attestation verify 校验固定版本资产"
+  info "安全提示：当前 bootstrap 本身未验证来源；推荐按 README 固定版本并核验 Release 校验清单与 macOS 构建来源材料"
 fi
 
 case "$(uname -s)" in
